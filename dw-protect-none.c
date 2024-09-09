@@ -14,6 +14,16 @@ const uintptr_t default_taint = (uintptr_t)0x0001000000000000;
 // Start without protecting objects, wait until libdw is fully initialized
 bool dw_protect_active = false;
 
+void dw_protect_init()
+{
+}
+
+void dw_check_access(const void *ptr, size_t size)
+{
+    if(ptr == NULL) dw_log(WARNING, PROTECT, "Null pointer access\n");
+    if(size == 0) dw_log(WARNING, PROTECT, "Zero size access\n");
+}
+
 // Add a taint
 void*
 dw_protect(const void *ptr)
@@ -56,6 +66,15 @@ dw_is_protected(const void *ptr)
     if(taint == 1) return 1;
     dw_log(WARNING, MAIN, "Taint should be 1, pointer %p\n", ptr);
     return 1;
+}
+
+// For now insure that it is the taint that we put, and not corruption
+int
+dw_is_protected_index(const void *ptr)
+{
+    uintptr_t taint = (uintptr_t)ptr >> 63;
+    if(taint == 0) return dw_is_protected(ptr);
+    else return 0; // negative index, not a taint
 }
 
 // Alloc and return the tainted pointer
