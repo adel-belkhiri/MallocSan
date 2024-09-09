@@ -8,20 +8,45 @@ is executed out of line such that the retainting code can be executed after.
 This is achieved using libolx.
 
 As an optimisation, the instructions accessing tainted registers car be patched to jump to
-a "pre" handler, execute the access instruction out of line, and then jump to a "post" handler
-before continuing with the instructions that follow the access. It is much faster because 
-it avoids the SIGSEGV. This is achieved with libpatch.
+a "pre" handler to check and untaint the tainted registers, execute the access instruction out of line, 
+and then jump to a "post" handler that retaints the tainted registers,before continuing 
+with the instructions that follow the access. It is much faster than hitting 
+a SIGSEGV. However, if only a small fraction of the pointers are tainted, saving registers
+and calling pre and post handlers every time for nothing may end up being longer. 
+This optimisation is achieved with libpatch.
 
 Currently, this library only taints pointers to assess the performance of the different
 approaches. It does not really check the accesses. This can easily be added.
 
-One problem is that the tainted pointers can eventually reach the kernel and the SIGSEGV
-handler will not get called there. One solution is to use a special version of the Linux
-kernel that checks and untaints pointers. Another solution is to wrap all the libc 
-functions that implement system calls to check and untaint pointers. A number of
-libc functions are wrapped in dw-wrap-glibc but there are cases that are difficult
-to handle, and currently only a subset of functions are wrapped.
-
 Here is a sample command line:
 
 time LD_PRELOAD=./libdatawatch.so DW_STATS_FILE=stats.txt DW_STRATEGY=1 DW_LOG_LEVEL=0 ./simple 10 1000000 2>out.txt
+
+There are currently a number of limitations. The current version of Libpatch does not handle 
+patching adjacent short (smaller than 5 bytes) instructions. When patching fails, the libolx method is used.
+In addition, when a short instruction is patched, two or more instructions are replaced 
+and executed out of line. However, the post handler is called after those instructions, instead
+of directly after the patched instruction. For this reason, the retainting may not work properly
+(retainting too late, missing a tainted access or corrupting a register that now contains
+something else).
+
+The pre and post handlers currently assume that memory accesses are performed using general 
+purpose registers for the base and index. However, VEX instructions can use VSIB memory accesses
+and use a vector register as index. When this is used without a base, the vector register
+index contains several pointers, depending on the mask register. This should be added to
+the pre and post handlers, untainting and retainting multiple pointers in a vector
+register.
+
+Another problem is that the tainted pointers can eventually reach the kernel and the SIGSEGV
+handler will not get called there. One solution is to use a special version of the Linux
+kernel that checks and untaints pointers. Another solution is to wrap all the libc 
+functions that implement system calls to check and untaint pointers. A number of
+libc functions are wrapped in dw-wrap-glibc, but there are cases that are difficult
+to handle, and currently only a subset of functions are wrapped.
+
+Retainting can be done in two different ways. The tainted register can be saved,
+untainted, accessed, and restored to its previous value after the access.
+Alternatively, the taint can be extracted and saved, the register untainted and then accessed,
+and finally the taint can be readded. This would be useful for example if the 
+instruction set contains instructions that auto-increment pointers.
+
