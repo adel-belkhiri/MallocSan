@@ -4,10 +4,561 @@
 #include "dw-disassembly.h"
 #include "dw-log.h"
 #include "dw-protect.h"
+#include "dw-registers.h"
 #include <capstone/capstone.h>
 #include <sys/mman.h>
 #include <sys/user.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <string.h>
+
+// When an instruction accesses a protected object, we need to create an entry to
+// tell us the affected registers, a buffer to emulate the instruction, and an
+// epilogue to reprotect the registers if needed.
+
+struct insn_table {
+    size_t size;
+    struct insn_entry *entries;
+    csh handle;
+    cs_insn *insn;
+};
+
+// Allocate the instruction hash table and initialize libcapstone
+
+instruction_table*
+dw_init_instruction_table(size_t size)
+{
+    instruction_table *table = malloc(sizeof(instruction_table));
+    table->size = 2 * size - 1; // have a hash table about twice as large, and a power of two -1 
+    table->entries = calloc(sizeof(struct insn_entry), table->size);
+
+    cs_err csres = cs_open(CS_ARCH_X86, CS_MODE_64, &(table->handle));
+    if(csres != CS_ERR_OK) dw_log(ERROR, DISASSEMBLY, "cs_open failed, returned %d\n", csres);
+    csres = cs_option(table->handle, CS_OPT_DETAIL, CS_OPT_ON);
+    table->insn = cs_malloc(table->handle);    
+    return table;
+}
+
+// Deallocate the instruction hash table and close libcapstone
+
+void
+dw_fini_instruction_table(instruction_table *table) {
+    free(table->entries);
+    cs_free(table->insn, 1);
+    cs_close(&(table->handle));
+    free(table);
+}
+
+// Get the entry for this instruction address
+
+struct insn_entry*
+dw_get_instruction_entry(instruction_table *table, uintptr_t fault)
+{
+    size_t hash = fault % table->size;
+    size_t cursor = hash;
+
+    while((void *)table->entries[cursor].insn != NULL) {
+        if(table->entries[cursor].insn == fault) return &(table->entries[cursor]);
+        cursor = (cursor + 1) % table->size;
+        if(cursor == hash) break;
+    }
+    return NULL;
+}
+
+static bool
+dw_reg_written(struct insn_entry *entry, unsigned reg)
+{
+  for(int i = 0; i < entry->gregs_write_count; i++) 
+      if(dw_get_reg_entry(entry->gregs_written[i])->ucontext_index == dw_get_reg_entry(reg)->ucontext_index) return true;
+  return false;
+}
+
+
+// Create a new entry for this instruction address
+
+#define UNW_LOCAL_ONLY
+#include <libunwind.h>
+
+struct insn_entry*
+dw_create_instruction_entry(instruction_table *table, uintptr_t fault, uintptr_t *next, ucontext_t *uctx)
+{
+    size_t hash = fault % table->size;
+    size_t cursor = hash;
+
+    while((void *)table->entries[cursor].insn != NULL) {
+        if(table->entries[cursor].insn == fault) dw_log(ERROR, DISASSEMBLY, "Trying to add existing instruction in hash table\n"); 
+        cursor = (cursor + 1) % table->size;
+        if(cursor == hash) dw_log(ERROR, DISASSEMBLY, "Instruction hash table full\n");
+    }
+
+    // We insert the new entry at the first empty location following the hash code index
+    table->entries[cursor].insn = fault;
+    struct insn_entry *entry = &(table->entries[cursor]);
+    
+    size_t sizeds = 100;
+    const uint8_t *code = (uint8_t *)fault;
+    uint64_t instr_addr = (uint64_t) fault;
+    unsigned reg, base, index;
+    uintptr_t addr, scale, displacement, base_addr = 0, index_addr = 0;
+    unsigned i, j;
+    unsigned arg_m = 0, arg_r = 0;
+    bool success;
+    int error_code;
+    struct reg_entry *re;
+    
+    success = cs_disasm_iter(table->handle, &code , &sizeds, &instr_addr, table->insn);
+    error_code = cs_errno(table->handle);
+    if(!success) dw_log(ERROR, DISASSEMBLY, "Capstone cannot decode instruction 0x%llx, error %d\n", fault, error_code);
+
+    unw_cursor_t cur;
+    unw_context_t context;
+    unw_getcontext(&context);
+    unw_init_local(&cur, &context);
+    unw_word_t offset, pc = fault;
+    unw_set_reg(&cur, UNW_REG_IP, pc);
+    char proc_name[256];
+    if (unw_get_proc_name(&cur, proc_name, sizeof(proc_name), &offset) != 0) {
+        strcpy(proc_name, "-- no symbol --");
+        offset = 0;
+    }
+
+    entry->insn_length = table->insn->size;
+    entry->next_insn = *next = instr_addr;
+    entry->post_handler = true;
+    snprintf(entry->disasm_insn, sizeof(entry->disasm_insn), "%.11s %.51s", table->insn->mnemonic, table->insn->op_str);
+    
+    code = (uint8_t *)fault;
+    char insn_code[256], *c = insn_code;
+    int ret, length = 256;
+    for(int i = 0; i < entry->insn_length; i++) { 
+        ret = snprintf(c, length, "%02x ", *code);
+        c += ret; length -= ret; code++;
+    }
+    
+    dw_log(INFO, DISASSEMBLY, "Instruction 0x%llx (%s+0x%lx), %d, %d, 0x%lx: %s %s, (%hu) %s\n", fault, proc_name, offset, success, 
+        error_code, table->insn->address, table->insn->mnemonic, table->insn->op_str, table->insn->size, insn_code);    
+
+    cs_detail *detail = table->insn->detail;
+    cs_x86 *x86 = &(detail->x86);
+
+    // On control transfer instructions, the post handler hooks do not work.
+    // Thus, the tainted pointer will not be retainted after the execution.
+    // This is not a problem if the register value is not reused. Otherwise,
+    // a subsequent access may not be checked, or the program logic may be
+    // compromised if the untainted pointer is compared with a tainted pointer.
+    if(detail->groups_count > 0) {
+            for(i = 0; i < detail->groups_count; i++) {
+            if(detail->groups[i] < X86_GRP_VM) {
+                dw_log(WARNING, DISASSEMBLY, "Trap on control transfer instruction, post handler cannot be used %llx\n", fault);
+                entry->post_handler = false;
+                break;
+            }
+        }
+    }
+        
+    cs_regs regs_read, regs_write;
+    uint8_t read_count, write_count;
+    read_count = write_count = 0;
+    error_code = cs_regs_access(table->handle, table->insn, regs_read, &read_count, regs_write, &write_count);
+    if(error_code != CS_ERR_OK) dw_log(ERROR, DISASSEMBLY, "Capstone cannot give register accesses\n");
+    if(read_count > MAX_MOD_REG) dw_log(ERROR, DISASSEMBLY, "More registers read %d than expected %d\n", read_count, MAX_MOD_REG);
+    if(write_count > MAX_MOD_REG) dw_log(ERROR, DISASSEMBLY, "More registers written %d than expected %d\n", write_count, MAX_MOD_REG);
+    entry->gregs_read_count = read_count;
+    entry->gregs_write_count = write_count;
+    
+    if(x86->prefix[0] == X86_PREFIX_REP || x86->prefix[0] == X86_PREFIX_REPE || x86->prefix[0] == X86_PREFIX_REPNE) 
+        entry->repeat = true;
+    else entry->repeat = false;
+
+    for (i = 0; i < min(read_count, MAX_MOD_REG); i++) {
+        reg = entry->gregs_read[i] = regs_read[i];
+        dw_log(INFO, DISASSEMBLY, "read: %s; (%d)\n", cs_reg_name(table->handle, reg), reg);
+    }
+
+    for (i = 0; i < min(write_count, MAX_MOD_REG); i++) {
+        reg = entry->gregs_written[i] = regs_write[i];
+        dw_log(INFO, DISASSEMBLY, "write: %s; (%d)\n", cs_reg_name(table->handle, reg), reg);
+    }
+
+    for (i = 0; i < x86->op_count; i++){
+        switch(x86->operands[i].type) {
+        
+            // We need to know the overwritten registers to avoid retainting them
+    	    case X86_OP_REG: 
+    	        reg = x86->operands[i].reg;
+    	        re = dw_get_reg_entry(reg);
+    	        if(re->ucontext_index >= 0) {
+    	            if(arg_r >= MAX_REG_ARG) dw_log(ERROR, DISASSEMBLY, "Too many destination register arguments\n");
+    	            entry->arg_r[arg_r].reg = reg;
+    	            entry->arg_r[arg_r].length = re->size;
+    	            entry->arg_r[arg_r].access = x86->operands[i].access;
+    	            arg_r++; 
+    	        }
+    	        dw_log(INFO, DISASSEMBLY, "Register operand %lu, reg %s, access %hhu\n", i, cs_reg_name(table->handle, x86->operands[i].reg), x86->operands[i].access);
+    	        break;
+    	        
+            // The memory address is given by base + (index * scale) + displacement
+            // Is the base (or even index with scale = 1) tainted? Mark it as protected
+            case X86_OP_MEM:
+    	        if(arg_m >= MAX_MEM_ARG) dw_log(ERROR, DISASSEMBLY, "Too many memory arguments\n");
+    	        
+                entry->arg_m[arg_m].base = base = x86->operands[i].mem.base;
+                re = dw_get_reg_entry(base);
+                if(base == X86_REG_INVALID) base_addr = 0; // no base register
+                else if(re->ucontext_index < 0)  dw_log(ERROR, DISASSEMBLY, "Base register not general register\n");
+                else base_addr = dw_get_register(uctx, re->ucontext_index);
+                
+                entry->arg_m[arg_m].index = index = x86->operands[i].mem.index;
+                re = dw_get_reg_entry(index);
+                if(index == X86_REG_INVALID) index_addr = 0;
+                else if(re->ucontext_index < 0) dw_log(ERROR, DISASSEMBLY, "Index register not general register\n");
+                else index_addr = dw_get_register(uctx, re->ucontext_index);
+                
+                entry->arg_m[arg_m].scale = scale = x86->operands[i].mem.scale;
+                entry->arg_m[arg_m].displacement = displacement = x86->operands[i].mem.disp;
+                entry->arg_m[arg_m].length = x86->operands[i].size;
+
+                addr = base_addr + (index_addr * scale) + displacement;                        
+                if(dw_is_protected((void *)base_addr)) {
+                    entry->arg_m[arg_m].is_protected = true;
+                    entry->arg_m[arg_m].protected_reg = entry->arg_m[arg_m].base;                    
+                } else if(dw_is_protected_index((void *)index_addr)) {
+                    entry->arg_m[arg_m].is_protected = true;
+                    entry->arg_m[arg_m].protected_reg = entry->arg_m[arg_m].index;
+                    dw_log(WARNING, DISASSEMBLY,"Index register is protected instead of base\n");
+                } else entry->arg_m[arg_m].is_protected = false;
+
+    	        dw_log(INFO, DISASSEMBLY, 
+    	            "Memory operand %lu, segment %d, base %s (0x%llx) + (index %s (0x%llx) x scale 0x%llx) + disp 0x%llx = 0x%llx, access %hhu\n", i, 
+    	            x86->operands[i].mem.segment, cs_reg_name(table->handle, base), base_addr, cs_reg_name(table->handle, index), index_addr, scale, displacement, addr, x86->operands[i].access);
+
+    	        if(dw_is_protected((void *)base_addr) && dw_is_protected_index((void *)index_addr)) 
+    	            dw_log(ERROR, DISASSEMBLY,"Both base and index registers are protected\n");
+    	            
+                arg_m++;
+                break;
+                
+            case X86_OP_IMM:
+                dw_log(INFO, DISASSEMBLY, "Immediate operand %lu, value %lu\n", i, x86->operands[i].imm);
+                break;
+            default:
+                dw_log(INFO, DISASSEMBLY, "Invalid operand %lu\n", i);
+                break;
+        }
+    }
+    
+    // We need to have at least one protected register as memory argument.
+    // Otherwise we should not have a segmentation violation.
+    entry->nb_arg_m = arg_m;
+    entry->nb_arg_r = arg_r;
+    unsigned nb_protected = 0;
+    unsigned nb_reprotect = 0;
+    
+    for(i = 0; i < arg_m; i++) {
+        if(entry->arg_m[i].is_protected) {
+            nb_protected++;
+            
+            // We need to retaint the register unless it is overwritten by the instruction
+            entry->arg_m[i].reprotect = true;
+            entry->arg_m[i].reprotect_mem = false;
+            
+            for(j = 0; j < arg_r; j++) {
+                if(dw_get_reg_entry(entry->arg_r[j].reg)->ucontext_index == dw_get_reg_entry(entry->arg_m[i].protected_reg)->ucontext_index) {
+                    if(entry->arg_r[j].access & CS_AC_WRITE) {
+                        entry->arg_m[i].reprotect = false;
+                        if(entry->arg_r[j].length < 4) 
+                            dw_log(ERROR, DISASSEMBLY, "Instruction 0x%llx, tainted register %s only partially overwritten\n", 
+                                entry->insn, dw_get_reg_entry(entry->arg_r[j].reg)->name);
+                    }
+                    if(entry->arg_r[j].access & CS_AC_READ) {
+                        entry->arg_m[i].reprotect_mem = true;
+                        dw_log(WARNING, DISASSEMBLY, "Source register is also address, stored value will be retainted %llx\n", fault);
+                        if(entry->arg_r[j].length != 8) dw_log(WARNING, DISASSEMBLY, "Tainted register not stored in full\n");
+                    }
+                }
+            }
+            if(entry->arg_m[i].reprotect) {
+                nb_reprotect++;
+                if(dw_reg_written(entry, entry->arg_m[i].protected_reg))
+                    dw_log(INFO, DISASSEMBLY, "Instruction 0x%llx, tainted register %s implicitly modified\n", 
+                        entry->insn, dw_get_reg_entry(entry->arg_m[i].protected_reg)->name);
+            }
+        }
+        else entry->arg_m[i].reprotect = false;
+    }
+    
+    if(nb_protected == 0) dw_log(ERROR, DISASSEMBLY,"No protected memory argument but generates a fault\n");
+    entry->nb_reprotect = nb_reprotect;
+    return entry;
+}
+
+static void
+check_patch(patch_status s, char *msg) 
+{
+    if(s == PATCH_OK) return;
+    struct patch_error e;
+    patch_last_error(&e);
+    dw_log(WARNING, DISASSEMBLY, "Patch lib return value not OK, %d, for %s, origin %s, irritant %s, message %s\n", s, msg, e.origin, e.irritant, e.message);
+}
+
+void
+dw_patch_init() 
+{
+    const struct patch_option options[] = {{.type = PATCH_OPT_ENABLE_WXE, .enable_wxe = 0}};
+    (void)patch_init(options, sizeof(options) / sizeof(struct patch_option));
+}
+
+// Patch the instruction accessing a protected object and attach a pre and post handler
+// to unprotect and reprotect the tainted registers
+
+bool
+dw_instruction_entry_patch(struct insn_entry *entry, enum dw_strategies strategy, dw_patch_probe patch_handler)
+{
+    struct patch_location location = {
+        .type = PATCH_LOCATION_ADDRESS,
+	.direction = PATCH_LOCATION_FORWARD,
+	.algorithm = PATCH_LOCATION_FIRST,
+	.address = entry->insn,
+    };
+
+    struct patch_exec_model exec_model = {
+        .type = PATCH_EXEC_MODEL_PROBE_AROUND_STEP,
+	.probe.read_registers = 0,
+	.probe.write_registers = 0,
+	.probe.clobber_registers = PATCH_REGS_ALL,
+	.probe.user_data = entry,
+	.probe.procedure = patch_handler,
+    };
+
+    patch_t patch;
+    patch_attr attr;
+    patch_status s;
+
+    // On control transfer instructions, post handlers are not available.
+    if(!(entry->post_handler)) exec_model.type = PATCH_EXEC_MODEL_PROBE;
+    
+    s = patch_attr_init(&attr); check_patch(s, "attr init");
+    if(strategy == DW_PATCH_TRAP) {
+        s= patch_attr_set_trap_policy(&attr, PATCH_TRAP_POLICY_FORCE); check_patch(s, "set policy FORCE");
+    } 
+    else if(strategy == DW_PATCH_JUMP) {
+        s= patch_attr_set_trap_policy(&attr, PATCH_TRAP_POLICY_FORBID); check_patch(s, "set policy FORBID");
+    } 
+    else dw_log(ERROR, DISASSEMBLY, "Unknown patching strategy\n");
+  
+    s = patch_attr_set_initial_state(&attr, PATCH_ENABLED); check_patch(s, "set enabled");
+    s = patch_make(&location, &exec_model, &attr, &patch, NULL); check_patch(s, "make"); if(s != PATCH_OK) return false;
+    s = patch_commit(); check_patch(s, "commit"); if(s != PATCH_OK) return false;
+    return true;
+}
+
+// With PATCH_EXEC_MODEL_AROUND_STEP_TRAP or PATCH_EXEC_MODEL_AROUND_STEP, the SIGSEGV handler will not
+// get called, the patch handler (pre and post) will be called instead. It will be called either through
+// the target instruction patched by a trap (int3), intercepted by libpatch with their own handler,
+// or through the target instruction patched by a jump.
+//
+// Eventually, to avoid the cost of saving a lot of registers and making a call, we may use PATCH_EXEC_MODEL_DIVERT
+// to jump to an OLX buffer that untaints, executes the relocated instruction, and retaints in assembly directly.
+//
+// We have the list of tainted registers. Save those registers and they will be restored in the
+// prologue or post handler. Some tainted registers may be vector registers.
+//
+// Some assumptions that we may want to check:
+// - registers expected to be tainted are indeed tainted
+// - only "written" registers are modified
+// - base or index tainted as expected
+// - number of vector registers tainted / accessed
+// - a register used as tainted address is not stored while temporarily untainted
+
+// We save all the relevant registers in a static structure to check if some
+// registers are unexpectedly modified by the stepped instruction. This
+// structure should be Thread Local Storage for multi-threaded programs.
+// Once the algorithm is well tested and debugged, this saving and comparison
+// step will be removed.
+
+void
+dw_print_regs(struct patch_exec_context *ctx)
+{
+    for(int i = 0; i < dw_nb_saved_registers; i++)
+        dw_log(INFO, DISASSEMBLY, "%s, %llx\n", dw_get_reg_entry(dw_saved_registers[i])->name, ctx->general_purpose_registers[i]);
+}
+
+// A potentially tainted pointer is accessed, unprotect it before the access
+
+/*
+rep movsq qword ptr [rdi], qword ptr [rsi], (3) f3 48 a5
+read: rdi, rsim rflags, rcx;
+write: rdi, rsi, rcx;
+Memory operand 0, segment 0, base rdi (0x2562ab2c8f4d8) + (index (null) (0x0) x scale 0x1) + disp 0x0 = 0x2562ab2c8f4d8, access 2
+Memory operand 1, segment 0, base rsi (0x7fffc9926478) + (index (null) (0x0) x scale 0x1) + disp 0x0 = 0x7fffc9926478, access 1
+*/
+
+static bool dw_check_handling = true;
+
+void dw_set_check_handling(bool f) { dw_check_handling = f; }
+
+// Check use of unprotect / retaint versus flavors other than OID (single unprotect / reprotect)
+
+void 
+dw_unprotect_context(struct patch_exec_context *ctx)
+{
+    struct insn_entry *entry = ctx->user_data;
+    struct reg_entry *re, *reb, *rei;
+    unsigned i, reg, regb, regi;
+    uintptr_t value, valueb, valuei, addr;
+
+    if(dw_check_handling) {
+        dw_log(INFO, DISASSEMBLY, "Unprotect instruction 0x%llx: %s\n", entry->insn, entry->disasm_insn);
+        dw_print_regs(ctx);
+    }
+    
+    // Untaint all possibly tainted memory arguments, save the tainted pointer to retaint afterwards   
+    for(i = 0; i < entry->nb_arg_m; i++) {
+        if(entry->arg_m[i].is_protected) {
+            reg = entry->arg_m[i].protected_reg;
+            re = dw_get_reg_entry(reg);
+            value = dw_get_register(ctx, re->libpatch_index);
+            entry->arg_m[i].saved_taint = value;
+
+            regb = entry->arg_m[i].base;
+            reb = dw_get_reg_entry(regb);
+            if(regb == X86_REG_INVALID) valueb = 0; // no base register
+            else valueb = dw_get_register(ctx, reb->libpatch_index);
+                
+            regi = entry->arg_m[i].index;
+            rei = dw_get_reg_entry(regi);
+            if(regi == X86_REG_INVALID) valuei = 0;
+            else valuei = dw_get_register(ctx, rei->libpatch_index);
+            
+            addr = valueb + valuei * entry->arg_m[i].scale + entry->arg_m[i].displacement;
+
+            if(dw_check_handling) {
+                // We have both a base and index, check that their usage has not changed
+                if(regi != X86_REG_INVALID && regb != X86_REG_INVALID) {
+                    if((dw_is_protected_index((void *)valuei) && regi != reg) || (dw_is_protected((void *)valueb) && regb != reg))
+                        dw_log(ERROR, DISASSEMBLY, "Registers not tainted as expected, protected %s (%llx), index %s (%llx), base %s (%llx)\n",
+                            re->name, value, rei->name, valuei, reb->name, valueb);
+                }
+            }
+            
+            if(entry->repeat) {
+                size_t count = dw_get_register(ctx, dw_get_reg_entry(X86_REG_RCX)->libpatch_index);
+                dw_check_access((void *)addr, entry->arg_m[i].length * count);
+            }
+            else dw_check_access((void *)addr, entry->arg_m[i].length);
+
+            if(dw_check_handling) {
+                dw_log(INFO, DISASSEMBLY, "Instruction 0x%llx, register %s untainted, 0x%llx becomes 0x%llx, addr 0x%llx + 0x%llx * 0x%llx + 0x%llx = 0x%llx\n", 
+                    entry->insn, re->name, value, (uint64_t)dw_unprotect((void *)value), valueb, valuei, entry->arg_m[i].scale, entry->arg_m[i].displacement, entry->arg_m[i].saved_address);
+            }
+
+            if(entry->arg_m[i].reprotect_mem) {
+                if(reg == regb) valueb = (uintptr_t)dw_unprotect((void *)valueb);
+                if(reg == regi && dw_is_protected_index((void *)valuei)) valuei = (uintptr_t)dw_unprotect((void *)valuei);
+                entry->arg_m[i].saved_address = valueb + valuei * entry->arg_m[i].scale + entry->arg_m[i].displacement;
+            }
+
+            dw_set_register(ctx, re->libpatch_index, (uintptr_t)dw_unprotect((void *)value));
+        }
+    }
+
+    if(dw_check_handling) {  
+        for(i = 0; i < dw_nb_saved_registers; i++) {
+            reg = dw_saved_registers[i];
+            re = dw_get_reg_entry(reg);
+            dw_save_regs[i] = dw_get_register(ctx, re->libpatch_index);
+            dw_log(INFO, DISASSEMBLY, "%s, %llx\n", re->name, ctx->general_purpose_registers[i]);
+        }
+    }
+
+    entry->hit_count++;
+}
+
+// Retaint registers, called from patch post-handler
+// - restore all the saved registers
+
+void
+dw_reprotect_context(struct patch_exec_context *ctx)
+{
+    struct insn_entry *entry = ctx->user_data;
+    struct reg_entry *re;
+    unsigned i, reg;
+    uintptr_t value;
+    void *before, *after;
+
+    if(dw_check_handling) {
+        dw_log(INFO, DISASSEMBLY, "Reprotect instruction 0x%llx: %s\n", entry->insn, entry->disasm_insn);
+        dw_print_regs(ctx);
+        for(i = 0; i < dw_nb_saved_registers; i++) {
+            // dw_log(INFO, MAIN, "%s = 0x%llx\n", dw_get_patch_reg_name(i), ctx->gregs[i]);
+            reg = dw_saved_registers[i];
+            re = dw_get_reg_entry(reg);
+            value = dw_get_register(ctx, re->libpatch_index);
+            if((dw_save_regs[i] != value) && dw_reg_written(entry, reg) == false)
+                dw_log(WARNING, MAIN, "Instruction 0x%llx, register %s modified but should not, now 0x%llx vs 0x%llx\n", 
+                    entry->insn, re->name, value, dw_save_regs[i]);
+        }
+    }
+        
+    for(int i = 0; i < entry->nb_arg_m; i++) {
+        if(entry->arg_m[i].reprotect) {
+            int reg = entry->arg_m[i].protected_reg;
+            re = dw_get_reg_entry(reg);
+            value = dw_get_register(ctx, re->libpatch_index);
+            
+            // If that register changed and was not flagged as "written" by the instruction, it will be detected above
+            // if(dw_untaint((void *)(entry->arg_m[i].saved_taint)) != (void *)value) 
+            //     dw_log(WARNING, MAIN, "Instruction 0x%llx, reprotect register %s differs now 0x%llx vs 0x%llx\n", 
+            //     entry->insn, re->name, value, entry->arg_m[i].saved_taint);
+
+            dw_set_register(ctx, re->libpatch_index, (uint64_t)dw_retaint((void *)value, (void *)entry->arg_m[i].saved_taint));
+        }
+        
+        if(entry->arg_m[i].reprotect_mem) {
+            if(dw_check_handling) before = *((void **)entry->arg_m[i].saved_address);
+
+            *((void **)entry->arg_m[i].saved_address) = dw_retaint(*((void **)entry->arg_m[i].saved_address), (void *)entry->arg_m[i].saved_taint);
+
+            if(dw_check_handling) {
+                after = *((void **)entry->arg_m[i].saved_address);
+                dw_log(INFO, DISASSEMBLY, "Reprotect_mem before 0x%llx, after 0x%llx\n", before, after);
+            }
+        }
+    }    
+}
+
+// Dump the content of the instruction table, for knowing the
+// number of instructions accessing protected objects,
+// and the number of hits for each instruction.
+// Print statistics about each instruction patched
+
+void
+dw_print_instruction_entries(instruction_table *table, int fd)
+{
+    struct insn_entry *entry;
+    struct reg_entry *re;
+    unsigned reg, count = 0;
+    
+    for(int i = 0; i < table->size; i++) {
+        entry = &(table->entries[i]);
+        if((void *)entry->insn != NULL) {
+            dw_fprintf(fd, "%4d 0x%lx: %9u: %2u: %1u %s; protected", count, entry->insn, entry->hit_count, entry->insn_length, entry->strategy, entry->disasm_insn);
+            count++;
+            for(int j = 0; j < entry->nb_arg_m; j++) {
+                if(entry->arg_m[j].is_protected) {
+                    reg = entry->arg_m[j].protected_reg;
+                    re = dw_get_reg_entry(reg);
+                    dw_fprintf(fd, " %s", re->name);
+                }
+            }
+            dw_fprintf(fd, "\n");
+        }
+    }
+}
+
+#if 0
+
 #include <olx/olx.h>
 
 #define MAX_EPILOGUE_SIZE 40
@@ -38,417 +589,106 @@ static void *alloc_olx(size_t *size)
     return ret;
 }
 
-// For each register than we may encounter in a memory access, we have the name
-// and the machine code epilogue, in binary, to retaint the pointer as needed.
-//
-// The entries are in the order of the index in the mcontext_t structure
-// where the registers are saved upon entry in a signal handler.
-//
-// enum {REG_R8 = 0, REG_R9, REG_R10, REG_R11, REG_R12, REG_R13, REG_R14, REG_R15, 
-// REG_RDI, REG_RSI, REG_RBP, REG_RBX, REG_RDX, REG_RAX, REG_RCX, REG_RSP,
-// (those extra registers are in mcontext_t but not used in memory accesses)
-// REG_RIP, REG_EFL, REG_CSGSFS, REG_ERR, REG_TRAPNO, REG_OLDMASK, REG_CR2}
+/* 
+- Quel code est utilisé dans le memcpy/memmove qui segfault ? Il est
+possible qu'il passe à une implémentation SSE ou autre au-delà d'une
+certaine taille,
 
-struct register_entry {
-    char *name;
-    unsigned epilogue_size;
-    uint8_t epilogue[17];
-    bool is_greg;
-};
+- Ça peut être causé par un problème de comparaison entre l'adresse de
+fin et la valeur actuelle du pointeur. Certaines causes possibles:
 
-// The epilogue needs to retaint the pointer contained in the register.
-// For this test, we just put back 0x0001 in the unused MS bytes.
-// If the taint was an object ID, we would save it on the stack
-// and the epilogue would have to pop it and put it back as taint
-//
-// Ideally, the epilogue should not affect any flag or use other registers.
-// Otherwise, it would have to save and restore them.
-// The following sequence should do the trick to add 0x0001 (shown for r8)
-//
-//    rorxq   $48, %r8, %r8
-//    leaq    0x1(%r8), %r8
-//    rorxq   $16, %r8, %r8
+1) Omettre de remettre le taint sur le pointeur après une lecture ou
+écriture, alors que l'adresse de fin a le taint.
 
-struct register_entry reg_table[] = {
-    {"r8", 16, {0xc4, 0x43, 0xfb, 0xf0, 0xc0, 0x30, 0x4d, 0x8d, 0x40, 0x01, 0xc4, 0x43, 0xfb, 0xf0, 0xc0, 0x10, 0x00}, true},
-    {"r9", 16, {0xc4, 0x43, 0xfb, 0xf0, 0xc9, 0x30, 0x4d, 0x8d, 0x49, 0x01, 0xc4, 0x43, 0xfb, 0xf0, 0xc9, 0x10, 0x00}, true},
-    {"r10", 16, {0xc4, 0x43, 0xfb, 0xf0, 0xd2, 0x30, 0x4d, 0x8d, 0x52, 0x01, 0xc4, 0x43, 0xfb, 0xf0, 0xd2, 0x10, 0x00}, true},
-    {"r11", 16, {0xc4, 0x43, 0xfb, 0xf0, 0xdb, 0x30, 0x4d, 0x8d, 0x5b, 0x01, 0xc4, 0x43, 0xfb, 0xf0, 0xdb, 0x10, 0x00}, true},
-    {"r12", 17, {0xc4, 0x43, 0xfb, 0xf0, 0xe4, 0x30, 0x4d, 0x8d, 0x64, 0x24, 0x01, 0xc4, 0x43, 0xfb, 0xf0, 0xe4, 0x10}, true},
-    {"r13", 16, {0xc4, 0x43, 0xfb, 0xf0, 0xed, 0x30, 0x4d, 0x8d, 0x6d, 0x01, 0xc4, 0x43, 0xfb, 0xf0, 0xed, 0x10, 0x00}, true},
-    {"r14", 16, {0xc4, 0x43, 0xfb, 0xf0, 0xf6, 0x30, 0x4d, 0x8d, 0x76, 0x01, 0xc4, 0x43, 0xfb, 0xf0, 0xf6, 0x10, 0x00}, true},
-    {"r15", 16, {0xc4, 0x43, 0xfb, 0xf0, 0xff, 0x30, 0x4d, 0x8d, 0x7f, 0x01, 0xc4, 0x43, 0xfb, 0xf0, 0xff, 0x10, 0x00}, true},
-    {"rdi", 16, {0xc4, 0xe3, 0xfb, 0xf0, 0xff, 0x30, 0x48, 0x8d, 0x7f, 0x01, 0xc4, 0xe3, 0xfb, 0xf0, 0xff, 0x10, 0x00}, true},
-    {"rsi", 16, {0xc4, 0xe3, 0xfb, 0xf0, 0xf6, 0x30, 0x48, 0x8d, 0x76, 0x01, 0xc4, 0xe3, 0xfb, 0xf0, 0xf6, 0x10, 0x00}, true},
-    {"rbp", 16, {0xc4, 0xe3, 0xfb, 0xf0, 0xed, 0x30, 0x48, 0x8d, 0x6d, 0x01, 0xc4, 0xe3, 0xfb, 0xf0, 0xed, 0x10, 0x00}, true},
-    {"rbx", 16, {0xc4, 0xe3, 0xfb, 0xf0, 0xdb, 0x30, 0x48, 0x8d, 0x5b, 0x01, 0xc4, 0xe3, 0xfb, 0xf0, 0xdb, 0x10, 0x00}, true},
-    {"rdx", 16, {0xc4, 0xe3, 0xfb, 0xf0, 0xd2, 0x30, 0x48, 0x8d, 0x52, 0x01, 0xc4, 0xe3, 0xfb, 0xf0, 0xd2, 0x10, 0x00}, true},
-    {"rax", 16, {0xc4, 0xe3, 0xfb, 0xf0, 0xc0, 0x30, 0x48, 0x8d, 0x40, 0x01, 0xc4, 0xe3, 0xfb, 0xf0, 0xc0, 0x10, 0x00}, true},
-    {"rcx", 16, {0xc4, 0xe3, 0xfb, 0xf0, 0xc9, 0x30, 0x48, 0x8d, 0x49, 0x01, 0xc4, 0xe3, 0xfb, 0xf0, 0xc9, 0x10, 0x00}, true},
-    {"rsp", 17, {0xc4, 0xe3, 0xfb, 0xf0, 0xe4, 0x30, 0x48, 0x8d, 0x64, 0x24, 0x01, 0xc4, 0xe3, 0xfb, 0xf0, 0xe4, 0x10}, true}
-};
+2) Si le taint flag set le bit de signe (most significant bit), si la
+comparaison est signée, ça pourrait ne pas avoir l'effet attendu.
 
-// Map the capstone register identifiers to libpatch gregs context.
-// -1 for register not used, -2 for non general purpose register 
+3) Avoir une adresse de fin à laquelle il manque le taint, par exemple à
+cause d'une erreur de manipulation lors de son incrémentation du nombre
+de bytes à copier.
 
-static int
-cap_to_patch_ctx(unsigned reg) 
-{
-    int ret = -2;
-    switch(reg) {
-        case X86_REG_INVALID:  ret = -1; break;
-        case X86_REG_RAX: ret = PATCH_X86_64_RAX; break;
-        case X86_REG_RBP: ret = PATCH_X86_64_RBP; break;
-        case X86_REG_RBX: ret = PATCH_X86_64_RBX; break;
-        case X86_REG_RCX: ret = PATCH_X86_64_RCX; break;
-        case X86_REG_RDI: ret = PATCH_X86_64_RDI; break;
-        case X86_REG_RDX: ret = PATCH_X86_64_RDX; break;
-        case X86_REG_RSI: ret = PATCH_X86_64_RSI; break;
-        case X86_REG_R8: ret = PATCH_X86_64_R8; break;
-        case X86_REG_R9: ret = PATCH_X86_64_R9; break;
-        case X86_REG_R10: ret = PATCH_X86_64_R10; break;
-        case X86_REG_R11: ret = PATCH_X86_64_R11; break;
-        case X86_REG_R12: ret = PATCH_X86_64_R12; break;
-        case X86_REG_R13: ret = PATCH_X86_64_R13; break;
-        case X86_REG_R14: ret = PATCH_X86_64_R14; break;
-        case X86_REG_R15: ret = PATCH_X86_64_R15; break;
-    }
-    return ret;
-}
+4) memcpy/memmove est un parfait use-case pour les pointeur à
+autoincrément, donc valider si c'est ce qui se passe. (e.g. string
+instructions telles que MOVS, CMPS, SCAS, LODS, et STOS). La direction
+incrément/décrément dépend du flag DF.
 
-// Map the capstone register identifiers to Linux mcontext_t ones
-// -1 for register not used, -2 for non general purpose register 
+5) c'est aussi un use-case parfait pour le préfix "rep", qui va répéter
+l'instruction préfixée tant que la condition est vraie.
 
-static int
-cap_to_mctx(unsigned reg) 
-{
-    int ret = -2;
-    switch(reg) {
-        case X86_REG_INVALID:  ret = -1; break;
-        case X86_REG_RAX: ret = REG_RAX; break;
-        case X86_REG_RBP: ret = REG_RBP; break;
-        case X86_REG_RBX: ret = REG_RBX; break;
-        case X86_REG_RCX: ret = REG_RCX; break;
-        case X86_REG_RDI: ret = REG_RDI; break;
-        case X86_REG_RDX: ret = REG_RDX; break;
-        case X86_REG_RSI: ret = REG_RSI; break;
-        case X86_REG_RSP: ret = REG_RSP; break;
-        case X86_REG_R8: ret = REG_R8; break;
-        case X86_REG_R9: ret = REG_R9; break;
-        case X86_REG_R10: ret = REG_R10; break;
-        case X86_REG_R11: ret = REG_R11; break;
-        case X86_REG_R12: ret = REG_R12; break;
-        case X86_REG_R13: ret = REG_R13; break;
-        case X86_REG_R14: ret = REG_R14; break;
-        case X86_REG_R15: ret = REG_R15; break;
-    }
-    return ret;
-}
+- VPGATHERQQ ymm11, qword ptr [ymm9], ymm10
+    save the whole vector before untaint even if a condition is there, restored after anyway...
+    save registers in TLS structure may be easier
+    how to access those registers from C if not in saved context...
+    register __m128 foo asm("xmm0")
 
-/* Names and values for registers used in the Capstone disassembly library
+- instruction loop auto-inc rcx?
 
-typedef enum x86_reg {
-        X86_REG_INVALID = 0,
-        X86_REG_AH, X86_REG_AL, X86_REG_AX, X86_REG_BH, X86_REG_BL, // 1-5
-        X86_REG_BP, X86_REG_BPL, X86_REG_BX, X86_REG_CH, X86_REG_CL, // 6-10
-        X86_REG_CS, X86_REG_CX, X86_REG_DH, X86_REG_DI, X86_REG_DIL, // 11-15
-        X86_REG_DL, X86_REG_DS, X86_REG_DX, X86_REG_EAX, X86_REG_EBP, // 16-20
-        X86_REG_EBX, X86_REG_ECX, X86_REG_EDI, X86_REG_EDX, X86_REG_EFLAGS, // 21-25
-        X86_REG_EIP, X86_REG_EIZ, X86_REG_ES, X86_REG_ESI, X86_REG_ESP, // 26-30
-        X86_REG_FPSW, X86_REG_FS, X86_REG_GS, X86_REG_IP, X86_REG_RAX, // 31-35
-        X86_REG_RBP, X86_REG_RBX, X86_REG_RCX, X86_REG_RDI, X86_REG_RDX, // 36-40
-        X86_REG_RIP, X86_REG_RIZ, X86_REG_RSI, X86_REG_RSP, X86_REG_SI, // 41-45
-        X86_REG_SIL, X86_REG_SP, X86_REG_SPL, X86_REG_SS, X86_REG_CR0, // 46-50
-        X86_REG_CR1, X86_REG_CR2, X86_REG_CR3, X86_REG_CR4, X86_REG_CR5, // 51-55
-        X86_REG_CR6, X86_REG_CR7, X86_REG_CR8, X86_REG_CR9, X86_REG_CR10, // 56-60
-        X86_REG_CR11, X86_REG_CR12, X86_REG_CR13, X86_REG_CR14, X86_REG_CR15, // 61-65
-        X86_REG_DR0, X86_REG_DR1, X86_REG_DR2, X86_REG_DR3, X86_REG_DR4, // 66-70
-        X86_REG_DR5, X86_REG_DR6, X86_REG_DR7, X86_REG_DR8, X86_REG_DR9, // 71-75
-        X86_REG_DR10, X86_REG_DR11, X86_REG_DR12, X86_REG_DR13, X86_REG_DR14, // 76-80
-        X86_REG_DR15, X86_REG_FP0, X86_REG_FP1, X86_REG_FP2, X86_REG_FP3, // 81-85
-        X86_REG_FP4, X86_REG_FP5, X86_REG_FP6, X86_REG_FP7, X86_REG_K0, // 86-90
-        X86_REG_K1, X86_REG_K2, X86_REG_K3, X86_REG_K4, X86_REG_K5, // 91-95
-        X86_REG_K6, X86_REG_K7, X86_REG_MM0, X86_REG_MM1, X86_REG_MM2, // 96-100
-        X86_REG_MM3, X86_REG_MM4, X86_REG_MM5, X86_REG_MM6, X86_REG_MM7, // 101-105
-        X86_REG_R8, X86_REG_R9, X86_REG_R10, X86_REG_R11, X86_REG_R12, // 106-110
-        X86_REG_R13, X86_REG_R14, X86_REG_R15, X86_REG_ST0, X86_REG_ST1, // 111-115
-        X86_REG_ST2, X86_REG_ST3, X86_REG_ST4, X86_REG_ST5, X86_REG_ST6, // 116-120
-        X86_REG_ST7, X86_REG_XMM0, X86_REG_XMM1, X86_REG_XMM2, X86_REG_XMM3, // 121-125
-        X86_REG_XMM4, X86_REG_XMM5, X86_REG_XMM6, X86_REG_XMM7, X86_REG_XMM8, // 125-130
-        X86_REG_XMM9, X86_REG_XMM10, X86_REG_XMM11, X86_REG_XMM12, X86_REG_XMM13, // 131-135
-        X86_REG_XMM14, X86_REG_XMM15, X86_REG_XMM16, X86_REG_XMM17, X86_REG_XMM18, // 136-140
-        X86_REG_XMM19, X86_REG_XMM20, X86_REG_XMM21, X86_REG_XMM22, X86_REG_XMM23, // 141-145
-        X86_REG_XMM24, X86_REG_XMM25, X86_REG_XMM26, X86_REG_XMM27, X86_REG_XMM28, // 146-150
-        X86_REG_XMM29, X86_REG_XMM30, X86_REG_XMM31, X86_REG_YMM0, X86_REG_YMM1, // 151-155
-        X86_REG_YMM2, X86_REG_YMM3, X86_REG_YMM4, X86_REG_YMM5, X86_REG_YMM6, // 156-160
-        X86_REG_YMM7, X86_REG_YMM8, X86_REG_YMM9, X86_REG_YMM10, X86_REG_YMM11, // 161-165
-        X86_REG_YMM12, X86_REG_YMM13, X86_REG_YMM14, X86_REG_YMM15, X86_REG_YMM16, // 166-170
-        X86_REG_YMM17, X86_REG_YMM18, X86_REG_YMM19, X86_REG_YMM20, X86_REG_YMM21, // 171-175
-        X86_REG_YMM22, X86_REG_YMM23, X86_REG_YMM24, X86_REG_YMM25, X86_REG_YMM26, // 176-180
-        X86_REG_YMM27, X86_REG_YMM28, X86_REG_YMM29, X86_REG_YMM30, X86_REG_YMM31, // 181-185
-        X86_REG_ZMM0, X86_REG_ZMM1, X86_REG_ZMM2, X86_REG_ZMM3, X86_REG_ZMM4, // 186-190
-        X86_REG_ZMM5, X86_REG_ZMM6, X86_REG_ZMM7, X86_REG_ZMM8, X86_REG_ZMM9, // 191-195
-        X86_REG_ZMM10, X86_REG_ZMM11, X86_REG_ZMM12, X86_REG_ZMM13, X86_REG_ZMM14, // 195-200
-        X86_REG_ZMM15, X86_REG_ZMM16, X86_REG_ZMM17, X86_REG_ZMM18, X86_REG_ZMM19, // 201-205
-        X86_REG_ZMM20, X86_REG_ZMM21, X86_REG_ZMM22, X86_REG_ZMM23, X86_REG_ZMM24, // 206-210
-        X86_REG_ZMM25, X86_REG_ZMM26, X86_REG_ZMM27, X86_REG_ZMM28, X86_REG_ZMM29, // 211-215
-        X86_REG_ZMM30, X86_REG_ZMM31, X86_REG_R8B, X86_REG_R9B, X86_REG_R10B, // 216-220
-        X86_REG_R11B, X86_REG_R12B, X86_REG_R13B, X86_REG_R14B, X86_REG_R15B, // 221-225
-        X86_REG_R8D, X86_REG_R9D, X86_REG_R10D, X86_REG_R11D, X86_REG_R12D, // 226-230
-        X86_REG_R13D, X86_REG_R14D, X86_REG_R15D, X86_REG_R8W, X86_REG_R9W, // 231-235
-        X86_REG_R10W, X86_REG_R11W, X86_REG_R12W, X86_REG_R13W, X86_REG_R14W, // 236-240
-        X86_REG_R15W, X86_REG_ENDING
-} x86_reg;
+- Instruction stocke adresse détaintée...
+
+0000000000000000 <fct>:
+    0:        48 89 3f                     mov    %rdi,(%rdi)
+    3:        c3                           retq
+
 */
 
-// When an instruction accesses a protected object, we need to create an entry to
-// tell us the affected registers, a buffer to emulate the instruction, and an
-// epilogue to reprotect the registers if needed.
+// Create an out of line execution (OLX) buffer for this instruction.
+//
+// When a tainted pointer is encountered, a signal is received. The handler
+// can untaint the pointer, execute the offending instruction out of line,
+// execute retainting code and continue with the next instruction.
 
-struct insn_table {
-    size_t size;
-    struct insn_entry *entries;
-    csh handle;
-    cs_insn *insn;
-};
-
-// Allocate the instruction hash table and initialize libcapstone
-
-instruction_table*
-dw_init_instruction_table(size_t size)
+static void chk(olx_status s)
 {
-    instruction_table *table = malloc(sizeof(instruction_table));
-    table->size = 2 * size - 1; // have a hash table about twice as large, and a power of two -1 
-    table->entries = calloc(sizeof(struct insn_entry), table->size);
-
-    cs_err csres = cs_open(CS_ARCH_X86, CS_MODE_64, &(table->handle));
-    if(csres != CS_ERR_OK) dw_log(ERROR, DISASSEMBLY, "cs_open failed, returned %d\n", csres);
-    csres = cs_option(table->handle, CS_OPT_DETAIL, CS_OPT_ON);
-    table->insn = cs_malloc(table->handle);    
-    olx_init(table->handle, NULL, NULL, NULL, NULL);
-    return table;
+  if(s == OLX_OK) return;
+  dw_log(ERROR, DISASSEMBLY, "libolx returned %d\n", s);
 }
-
-// Deallocate the instruction hash table and close libcapstone
 
 void
-dw_fini_instruction_table(instruction_table *table) {
-    olx_fini();
-    free(table->entries);
-    cs_free(table->insn, 1);
-    cs_close(&(table->handle));
-    free(table);
-}
-
-// Get the entry for this instruction address
-
-struct insn_entry*
-dw_get_instruction_entry(instruction_table *table, uintptr_t fault)
+dw_instruction_entry_make_olx(struct insn_entry *entry, uintptr_t next, dw_olx_probe pre_handler, dw_olx_probe post_handler)
 {
-    size_t hash = fault % table->size;
-    size_t cursor = hash;
-
-    while((void *)table->entries[cursor].insn != NULL) {
-        if(table->entries[cursor].insn == fault) return &(table->entries[cursor]);
-        cursor = (cursor + 1) % table->size;
-        if(cursor == hash) break;
-    }
-    return NULL;
-}
-
-// Create a new entry for this instruction address
-
-struct insn_entry*
-dw_create_instruction_entry(instruction_table *table, uintptr_t fault, uintptr_t *next, mcontext_t *mctx)
-{
-    size_t hash = fault % table->size;
-    size_t cursor = hash;
-
-    while((void *)table->entries[cursor].insn != NULL) {
-        if(table->entries[cursor].insn == fault) dw_log(ERROR, DISASSEMBLY, "Trying to add existing instruction in hash table\n"); 
-        cursor = (cursor + 1) % table->size;
-        if(cursor == hash) dw_log(ERROR, DISASSEMBLY, "Instruction hash table full\n");
-    }
-
-    // We insert the new entry at the first empty location following the hash code index
-    table->entries[cursor].insn = fault;
-    struct insn_entry *entry = &(table->entries[cursor]);
-    
-    cs_x86 *x86;
-    cs_detail *detail;
-    size_t sizeds = 100;
-    const uint8_t *code = (uint8_t *)fault;
-    uint64_t instr_addr = (uint64_t) fault;
-    int reg, base, index;
-    uintptr_t addr, scale, displacement, base_addr, index_addr;
-    unsigned i, j;
-    unsigned arg_m = 0, arg_r = 0;
-    bool success;
-    int error_code;
-    
-    success = cs_disasm_iter(table->handle, &code , &sizeds, &instr_addr, table->insn);
-    error_code = cs_errno(table->handle);
-    if(!success) dw_log(ERROR, DISASSEMBLY, "Capstone cannot decode instruction 0x%llx, error %d\n", fault, error_code);
-    entry->insn_length = table->insn->size;
-    *next = instr_addr;
-    snprintf(entry->disasm_insn, sizeof(entry->disasm_insn), "%.8s %.22s", table->insn->mnemonic, table->insn->op_str);
-    
-    dw_log(INFO, DISASSEMBLY, "Instruction 0x%llx (%d, %d), 0x%lx: %s %s, (%hu)\n", fault, success, 
-        error_code, table->insn->address, table->insn->mnemonic, table->insn->op_str, table->insn->size);    
-
-    detail = table->insn->detail;
-    x86 = &(detail->x86);
-
-    for (i = 0; i < x86->op_count; i++){
-        switch(x86->operands[i].type) {
-        
-            // We need to know the overwritten registers to avoid retainting them
-    	    case X86_OP_REG: 
-    	        if(x86->operands[i].access & CS_AC_WRITE && (reg = cap_to_mctx(x86->operands[i].reg)) >= 0) {
-    	            if(arg_r >= MAX_REG_ARG) dw_log(ERROR, DISASSEMBLY, "Too many destination register arguments\n");
-    	            entry->arg_r[arg_r] = reg;
-    	            arg_r++; 
-    	        }
-    	        dw_log(INFO, DISASSEMBLY, "Register operand %lu, reg %d, access %hhu\n", i, x86->operands[i].reg, x86->operands[i].access);
-    	        break;
-    	        
-            // The memory address is given by base + (index * scale) + displacement
-            // Is the base (or even index with scale = 1) tainted? Mark it as protected
-            case X86_OP_MEM:
-    	        if(arg_m >= MAX_MEM_ARG) dw_log(ERROR, DISASSEMBLY, "Too many memory arguments\n");
-    	        
-                entry->arg_m[arg_m].base = base = cap_to_mctx(x86->operands[i].mem.base);
-                if(base < -1) dw_log(ERROR, DISASSEMBLY, "Base register not general register\n");
-                if(base < 0) base_addr = 0; // No base register
-                else base_addr = mctx->gregs[base];
-                
-                entry->arg_m[arg_m].index = index = cap_to_mctx(x86->operands[i].mem.index);
-                if(index < -1) dw_log(ERROR, DISASSEMBLY, "Index register not general register\n");
-                if(index < 0) index_addr = 0;
-                else index_addr = mctx->gregs[index];
-                
-                entry->arg_m[arg_m].scale = scale = x86->operands[i].mem.scale;
-                entry->arg_m[arg_m].displacement = displacement = x86->operands[i].mem.disp;
-
-                addr = base_addr + (index_addr * scale) + displacement;                        
-                if(dw_is_protected((void *)base_addr)) {
-                    entry->arg_m[arg_m].is_protected = true;
-                    entry->arg_m[arg_m].protected_reg = entry->arg_m[arg_m].base;
-                    entry->arg_m[arg_m].protected_patch_reg = cap_to_patch_ctx(x86->operands[i].mem.base);
-                    if(dw_is_protected((void *)index_addr)) dw_log(ERROR, DISASSEMBLY,"Both base and index registers are protected\n");
-                    
-                } else if(dw_is_protected((void *)index_addr)) {
-                    entry->arg_m[arg_m].is_protected = true;
-                    entry->arg_m[arg_m].protected_reg = entry->arg_m[arg_m].index;
-                    entry->arg_m[arg_m].protected_patch_reg = cap_to_patch_ctx(x86->operands[i].mem.index);
-
-                } else entry->arg_m[arg_m].is_protected = false;
-
-    	        dw_log(INFO, DISASSEMBLY, 
-    	            "Memory operand %lu, segment %d, base %d (0x%llx) + (index %d (0x%llx) x scale %llx) + disp %llx = %llx, access %hhu\n", i, 
-    	            x86->operands[i].mem.segment, base, base_addr, index, index_addr, scale, displacement, addr, x86->operands[i].access);
-    	            
-                arg_m++;
-                break;
-                
-            case X86_OP_IMM:
-                dw_log(INFO, DISASSEMBLY, "Immediate operand %lu, value %lu\n", i, x86->operands[i].imm);
-                break;
-            default:
-                dw_log(INFO, DISASSEMBLY, "Invalid operand %lu\n", i);
-                break;
-        }
-    }
-    
-    // We need to have at least one protected register as memory argument.
-    // Otherwise we should not have a segmentation violation.
-    entry->nb_arg_m = arg_m;
-    entry->nb_arg_r = arg_r;
-    unsigned nb_protected = 0;
-    
-    for(i = 0; i < arg_m; i++) {
-        if(entry->arg_m[i].is_protected) {
-            nb_protected++;
-            
-            // We need to retaint the register unless it is overwritten by the instruction
-            entry->arg_m[i].reprotect = true;
-            for(j = 0; j < arg_r; j++) {
-                if(entry->arg_r[j] == entry->arg_m[i].protected_reg) entry->arg_m[i].reprotect = false;
-            }
-        }
-        else entry->arg_m[i].reprotect = false;
-    }
-    
-    if(nb_protected == 0) dw_log(ERROR, DISASSEMBLY,"No protected memory argument but generates a fault\n");
-    return entry;
-}
-
-// Create an out of line execution (OLX) buffer for this instruction
-
-void
-dw_instruction_entry_olx_make(instruction_table *table, struct insn_entry *entry, uintptr_t next)
-{
-    uint16_t olx_offset;
-    size_t olx_size;
-    size_t epilogue_size = 0;
+    olx_stream stream;
+    uintptr_t buffer;
     size_t size;
-    uint8_t epilogue[MAX_EPILOGUE_SIZE];
-    unsigned reg;
+    olx_status ret;
+
+    ret = olx_make(&stream); chk(ret);
+    ret = olx_add_call_to_C(stream, OLX_CALL_C_SAVE_X86_64_XSAVE_CONTEXT, pre_handler, entry); chk(ret);
+    ret = olx_add_instruction_and_relocate(stream, (void *)entry->insn, entry->insn_length, entry->insn); chk(ret);
+    ret = olx_add_call_to_C(stream, OLX_CALL_C_SAVE_X86_64_XSAVE_CONTEXT, post_handler, entry); chk(ret);
+    ret = olx_add_branch(stream, entry->next_insn); chk(ret);
+    ret = olx_flush(stream, alloc_olx, &buffer, &size); chk(ret);
+    ret = olx_drop(stream); chk(ret);
+    entry->olx_buffer = buffer; chk(ret);
+}
+
+
+    // We use the OLX buffer, check that the same register is protected, 
+    // check that the access is valid, save the protected register 
+    // to restore the taint in the epilogue, remove the taint,
+    // increase the hit count, and jump to the OLX buffer
+
+    // Skip the red zone before saving anything on the stack
+
+    if(entry->nb_reprotect > 0) mctx->gregs[REG_RSP] -= 128;
 
     for(int i = 0; i < entry->nb_arg_m; i++) {
-        if(entry->arg_m[i].reprotect) {
-            reg = entry->arg_m[i].protected_reg;
-            size = reg_table[reg].epilogue_size;
-            if(epilogue_size + size > MAX_EPILOGUE_SIZE) 
-                dw_log(ERROR, DISASSEMBLY, "Epilogue too long\n");
-                
-            memcpy(epilogue + epilogue_size, reg_table[reg].epilogue, size);
-            epilogue_size += size;
+        if(entry->arg_m[i].is_protected) {
+            int reg = entry->arg_m[i].protected_reg;
+            if(entry->arg_m[i].reprotect) {
+                mctx->gregs[REG_RSP] -= 8;
+                memcpy((void*)mctx->gregs[REG_RSP], &(mctx->gregs[reg]), 8);
+            }
+            
+            if(dw_is_protected((void *)mctx->gregs[reg])) {
+                dw_check_access((void *)(mctx->gregs[reg]));
+                mctx->gregs[reg] = (long long int)dw_unprotect((void *)mctx->gregs[reg]);
+            }
+            else dw_log(ERROR, MAIN, "Memory argument register is unexpectedly not protected\n");
         }
     }
-    int ret = olx_make(table->insn, 1, NULL, 0, epilogue, epilogue_size, next, alloc_olx, &olx_offset, &(entry->olx_buffer), &olx_size);
-    if(ret < 0) dw_log(ERROR, DISASSEMBLY, "Function olx_make did not work\n");
-}
 
-// Patch the instruction accessing a protected object and attach a pre and post handler
-// to unprotect and reprotect the tainted registers
+    entry->hit_count++;
+    mctx->gregs[REG_RIP] = entry->olx_buffer;
+    dw_protect_active = save_active;
 
-bool
-dw_instruction_entry_patch(struct insn_entry *entry, patch_probe patch_handler)
-{
-    patch_op op = {
-        .type = PATCH_OP_INSTALL,
-	.addr.func_sym = NULL,
-	.addr.patch_addr = entry->insn,
-	.probe = patch_handler,
-	.user_data = entry,
-	.free_user = free,
-    };
-    
-    int res = patch_queue(PATCH_POST_PROBE, &op);
-    if (res == PATCH_OK) {
-        patch_result *results;
-	size_t results_count;
-	patch_commit(&results, &results_count);
-	patch_drop_results(results, results_count);
-	return true;
-    } else return false;
-}
-
-// Dump the content of the instruction table, for knowing the
-// number of instructions accessing protected objects,
-// and the number of hits for each instruction.
-
-void
-dw_print_instruction_entries(instruction_table *table, int fd)
-{
-    struct insn_entry *entry;
-    
-    for(int i = 0; i < table->size; i++) {
-        entry = &(table->entries[i]);
-        if((void *)entry->insn != NULL) {
-            dw_fprintf(fd, "0x%lx: %9u: %2u: %1u %s\n", entry->insn, entry->hit_count, entry->insn_length, entry->strategy, entry->disasm_insn);    
-        }
-    }
-}
-
+#endif
