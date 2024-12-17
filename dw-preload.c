@@ -13,9 +13,8 @@
 #include <sys/user.h>
 #include <sys/mman.h>
 
-static size_t nb_insn_olx_entries = 10000;
-
-// Add size to check access in wrappers?
+// Number of instructions accessing tainted pointers that we can track.
+static size_t nb_insn_olx_entries = 30000;
 
 // In the current version, we will only try PATCH_TRAP which should always work.
 // This should let us debug two aspects. The first is libc wrappers to insure that no tainted
@@ -24,7 +23,6 @@ static size_t nb_insn_olx_entries = 10000;
 // The second aspect is the untainting / retainting of pointers. We know that we 
 // currently do not handle vector indirect access instructions such as 
 // VPGATHERQQ ymm11, qword ptr [ymm9], ymm10
-// du benchmark 502.gcc_r de SPEC cpu2017
 
 static enum dw_strategies dw_strategy = DW_PATCH_TRAP;
 
@@ -102,15 +100,16 @@ static size_t
 
 // What objects in sequence to protect, from (first) to (first + max)
 // By default protect all
-
 static long unsigned 
   nb_protected = 0, 
   nb_protected_candidates = 0, 
   first_protected = 0, 
   max_nb_protected = ULONG_MAX;
  
-static bool check_handling = true;
+// Use extended checking of coherency
+static bool check_handling = false;
 
+// Verbosity of messages
 static enum dw_log_level log_level = 0;
 
 // Generate a statistics file with instructions hits
@@ -139,7 +138,7 @@ dw_init()
     arg = getenv("DW_STRATEGY");
     if(arg != NULL) dw_strategy = atoi(arg);
     arg = getenv("DW_CHECK_HANDLING");
-    if(arg != NULL && atoi(arg) == 0) { check_handling = false; dw_set_check_handling(check_handling); }
+    if(arg != NULL && atoi(arg) == 1) { check_handling = true; dw_set_check_handling(check_handling); }
 
     dw_log(INFO, MAIN, "Starting program dw\n");
     dw_log(INFO, MAIN, "Min protect size %lu, max protect size %lu, max nb protected %lu, first protected %lu\n", 

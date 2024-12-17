@@ -33,28 +33,25 @@
 #include <dirent.h>
 #include <libintl.h>
 #include <locale.h>
+#include <sys/param.h>
 #include "dw-log.h"
 #include "dw-protect.h"
 #include "dw-wrap-glibc.h"
 
 // Intercept common glibc functions to check access and remove the protection from pointers. 
 // This is essential for system calls because otherwise they will fail.
-// It is also useful for utility functions as it can simplify the access check (a single one instead of multiple ones)
-// and avoid some functions that may perform tricky pointer arithmetic (e.g. memcpy / memmove)
-//
-// For now only the unprotect / reprotect is done. Access checks have not been added yet.
-//
-// Limitations
+// It is also useful for utility functions, as it can simplify the access check 
+// (a single one instead of multiple ones) and avoid some functions that may perform 
+// tricky pointer arithmetic (e.g. memcpy / memmove)
 //
 // Only a minimal set of wrappers was implemented, it is far from being complete. 
-// The fprintf functions were not wrapped, because it would be very difficult to 
-// process the pointers in the variable list of arguments that follows the format.
 // Moreover, some of the wrappers are incomplete. For instance, for the execvpe and 
 // similar functions, the argv and envp arrays are unprotected, but not the pointers
 // contained within. This would require allocating a new array where to copy the unprotected
 // pointers.
 
 // Check that we can get the desired symbol
+
 void *dlsym_check(void *restrict handle, const char *restrict symbol) {
     void *ret = dlsym(handle, symbol);
     if(ret == NULL) dw_log(WARNING, WRAP, "Symbol %s not found\n", symbol);
@@ -70,25 +67,27 @@ static size_t arglen(char *const argv[])
     return sizeof(char *) * (i + 1);
 }
 
+// Have our own strlen, not called with tainted pointers, that will
+// not be instrumented by libpatch.
+
+size_t dw_strlen(const char* s)
+{
+  const char* cursor;
+  for (cursor = s; *cursor != 0; cursor++);
+  return (size_t)(cursor - s);
+}
+
 // Declare all the pointers to the original libc functions
 
+static char* (*libc_strchr)(const char *s, int c);
+static char* (*libc_strrchr)(const char *s, int c);
+static int (*libc_strcmp)(const char *s1, const char *s2);
+static int (*libc_strncmp)(const char *s1, const char *s2, size_t n);
+static int (*libc_fputs)(const char *restrict s, FILE *restrict stream);
+static int (*libc_puts)(const char *s);
 static size_t (*libc_strlen)(const char *s);
-// static int (*libc__builtin___sprintf_chk)(char *s, int flag, size_t os, const char *fmt, ...);
-// int __builtin___snprintf_chk (char *s, size_t maxlen, int flag, size_t os);
-// int __builtin___vsprintf_chk (char *s, int flag, size_t os, const char *fmt,va_list ap);
-// int __builtin___vsnprintf_chk (char *s, size_t maxlen, int flag, size_t os, const char *fmt, va_list ap);
-// int __builtin___printf (int flag, const char *format, ...);
-// int __builtin___vprintf (int flag, const char *format, va_list ap);
-// int __builtin___fprintf (FILE *stream, int flag, const char *format, ...);
-// int __builtin___vfprintf (FILE *stream, int flag, const char *format, va_list ap);
-// static int (*libc_printf)(const char *format, ...);
-// static int (*libc_fprintf)(FILE *stream, const char *format, ...);
-// static int (*libc_dprintf)(int fd, const char *format, ...);
-// static int (*libc_sprintf)(char *str, const char *format, ...);
-// static int (*libc_snprintf)(char *str, size_t size, const char *format, ...);
 static int (*libc_open)(const char *pathname, int flags, ...);
 static int (*libc_openat)(int dirfd, const char *pathname, int flags, ...);
-// static int (*libc_openat2)(int dirfd, const char *pathname, const struct open_how *how, size_t size);
 static int (*libc_creat)(const char *pathname, mode_t mode);
 static int (*libc_access)(const char *pathname, int mode);
 static char* (*libc_getcwd)(char *buf, size_t size);
@@ -123,6 +122,7 @@ static void* (*libc_memmove)(void *dest, const void *src, size_t n);
 static void* (*libc_mempcpy)(void *restrict dest, const void *restrict src, size_t n);
 static void* (*libc_memset)(void *s, int c, size_t n);
 static char* (*libc_strcpy)(char *restrict dest, const char *src);
+static char* (*libc_strcat)(char *restrict dest, const char *src);
 static char* (*libc_strncpy)(char *restrict dest, const char *restrict src, size_t n);
 static wchar_t* (*libc_wmemmove)(wchar_t *dest, const wchar_t *src, size_t n);
 static wchar_t* (*libc_wmempcpy)(wchar_t *restrict dest, const wchar_t *restrict src, size_t n);
@@ -130,10 +130,8 @@ static wchar_t* (*libc_wmemcpy)(wchar_t *restrict dest, const wchar_t *restrict 
 static char* (*libc_gettext)(const char * msgid);
 static char* (*libc_dgettext)(const char * domainname, const char * msgid);
 extern char* __dgettext(const char * domainname, const char * msgid);
-// static char* (*libc_dcgettext)(const char * domainname, const char * msgid, int category);
 extern char* __dcgettext(const char * domainname, const char * msgid, int category);
 static char* (*libc_ngettext)(const char *msgid, const char *msgid_plural, unsigned long int n);
-// static char* (*libc_dngettext)(const char *domainname, const char *msgid, const char *msgid_plural, unsigned long int n);
 static char* (*libc_dcngettext)(const char *domainname, const char *msgid, const char *msgid_plural, unsigned long int n, int category);
 static char* (*libc_setlocale)(int category, const char *locale);
 static char* (*libc_textdomain)(const char * domainname);
@@ -147,20 +145,19 @@ static int (*libc_execvpe)(const char *file, char *const argv[], char *const env
 // very early. Therefore we do check for initialization right before use with the iss() macro.
 
 int dw_init_stubs = 0;
-size_t (*dw_strlen)(const char *s);
+// size_t (*dw_strlen)(const char *s);
 
 void dw_init_syscall_stubs() {
 
-    dw_strlen = libc_strlen = dlsym_check(RTLD_NEXT, "strlen");
-//    libc_printf = dlsym_check(RTLD_NEXT, "printf");
-//    libc_fprintf = dlsym_check(RTLD_NEXT, "fprintf");
-//    libc_dprintf = dlsym_check(RTLD_NEXT, "dprintf");
-//    libc_sprintf = dlsym_check(RTLD_NEXT, "sprintf");
-//    libc_snprintf = dlsym_check(RTLD_NEXT, "snprintf");
-//    libc__builtin___sprintf_chk = dlsym_check(RTLD_NEXT, "__builtin___sprintf_chk");
+    libc_strlen = dw_strlen;
+    libc_strchr = dlsym_check(RTLD_NEXT, "strchr");
+    libc_strrchr = dlsym_check(RTLD_NEXT, "strrchr");
+    libc_strcmp = dlsym_check(RTLD_NEXT, "strcmp");
+    libc_strncmp = dlsym_check(RTLD_NEXT, "strncmp");
+    libc_fputs = dlsym_check(RTLD_NEXT, "fputs");
+    libc_puts = dlsym_check(RTLD_NEXT, "puts");
     libc_open = dlsym_check(RTLD_NEXT, "open");
     libc_openat = dlsym_check(RTLD_NEXT, "openat");
-//    libc_openat2 = dlsym_check(RTLD_NEXT, "openat2");
     libc_creat = dlsym_check(RTLD_NEXT, "creat");
     libc_access = dlsym_check(RTLD_NEXT, "access");
     libc_getcwd = dlsym_check(RTLD_NEXT, "getcwd");
@@ -192,15 +189,14 @@ void dw_init_syscall_stubs() {
     libc_mempcpy = dlsym_check(RTLD_NEXT, "mempcpy");
     libc_memset = dlsym_check(RTLD_NEXT, "memset");
     libc_strcpy = dlsym_check(RTLD_NEXT, "strcpy");
+    libc_strcat = dlsym_check(RTLD_NEXT, "strcat");
     libc_strncpy = dlsym_check(RTLD_NEXT, "strncpy");
     libc_wmemmove = dlsym_check(RTLD_NEXT, "wmemmove");
     libc_wmempcpy = dlsym_check(RTLD_NEXT, "wmempcpy");
     libc_wmemcpy = dlsym_check(RTLD_NEXT, "wmemcpy");
     libc_gettext = dlsym_check(RTLD_NEXT, "gettext");
     libc_dgettext = __dgettext; // dlsym_check(RTLD_NEXT, "dgettext ");
-//    libc_dcgettext = __dcgettext; // dlsym_check(RTLD_NEXT, "dcgettext");
     libc_ngettext = dlsym_check(RTLD_NEXT, "ngettext");
-//    libc_dngettext = dlsym_check(RTLD_NEXT, "dngettext ");
     libc_dcngettext = dlsym_check(RTLD_NEXT, "dcngettext");
     libc_setlocale = dlsym_check(RTLD_NEXT, "setlocale");
     libc_opendir = dlsym_check(RTLD_NEXT, "opendir");
@@ -240,6 +236,13 @@ static inline void dputc_wrapper(char c, void* extra_arg)
     libc_write(fd, &c, 1);
 }
 
+int __fprintf_chk(FILE *stream, int flag, const char *format, ...) {
+    va_list arg; va_start(arg, format); 
+    const int ret = vfctprintf(fputc_wrapper, (void *)stream, format, arg);
+    va_end(arg);
+    return ret;
+}
+
 int fprintf(FILE *stream, const char *format, ...) {
     va_list arg; va_start(arg, format); 
     const int ret = vfctprintf(fputc_wrapper, (void *)stream, format, arg);
@@ -262,6 +265,14 @@ int __sprintf_chk(char *s, int flag, size_t os, const char *fmt, ...) {
   return ret;
 }
 
+int __snprintf_chk(char *s, size_t maxlen, int flag, size_t os, const char *fmt, ...) {
+  va_list arg;
+  va_start(arg, fmt);
+  const int ret = vsnprintf(s, os, fmt, arg);
+  va_end(arg);
+  return ret;
+}
+
 int vfprintf(FILE *restrict stream, const char *restrict format, va_list arg)
 {
     return vfctprintf(fputc_wrapper, (void *)stream, format, arg);
@@ -272,37 +283,12 @@ int vdprintf(int fd, const char *restrict format, va_list arg)
     return vfctprintf(dputc_wrapper, (void *)((uintptr_t)fd), format, arg);
 }
 
-/*
-int printf(const char *format, ...) {
-    sin(); va_list arg; va_start(arg, format);
-    char *nformat = dw_unprotect((void *)format);
-    dw_check_access((void *)format, libc_strlen(nformat) + 1); 
-    int ret = vprintf(nformat, arg); va_end(arg);
-    dw_reprotect((void *)format);
-    sout(); return ret;
-}
-
-int sprintf(char *str, const char *format, ...) {
-    sin(); va_list arg; va_start(arg, format); 
-    char *nformat = dw_unprotect((void *)format);
-    char *nstr = dw_unprotect((void *)str);
-    dw_check_access((void *)str, __glibc_objsize(nstr)); 
-    dw_check_access((void *)format, libc_strlen(nformat) + 1); 
-    int ret = vsprintf(nstr, nformat, arg); va_end(arg);
-    dw_reprotect((void *)str); dw_reprotect((void *)format);
-    sout(); return ret;
-}
-
-int snprintf(char *str, size_t size, const char *format, ...) {
-    sin(); va_list arg; va_start(arg, format); 
-    char *nformat = dw_unprotect((void *)format);
-    dw_check_access((void *)str, size); 
-    dw_check_access((void *)format, libc_strlen(nformat) + 1); 
-    int ret = vsnprintf(dw_unprotect((void *)str), size, nformat, arg); va_end(arg);
-    dw_reprotect((void *)str); dw_reprotect((void *)format);
-    sout(); return ret;
-}
-*/
+char *strchr(const char *s, int c) { sin(); char *ns = dw_unprotect((void *)s); dw_check_access((void *)s, libc_strlen(ns) + 1); char *ret = libc_strchr(ns, c); dw_reprotect((void *)s); sout(); if(ret == NULL) return ret; return (void *)dw_retaint(ret, s); }
+char *strrchr(const char *s, int c) { sin(); char *ns = dw_unprotect((void *)s); dw_check_access((void *)s, libc_strlen(ns) + 1); char *ret = libc_strrchr(ns, c); dw_reprotect((void *)s); sout(); if(ret == NULL) return ret; return (void *)dw_retaint(ret, s); }
+int strcmp(const char *s1, const char *s2) { sin(); char *ns1 = dw_unprotect((void *)s1); dw_check_access((void *)s1, libc_strlen(ns1) + 1); char *ns2 = dw_unprotect((void *)s2); dw_check_access((void *)s2, libc_strlen(ns2) + 1); int ret = libc_strcmp(ns1, ns2); dw_reprotect((void *)s1); dw_reprotect((void *)s2); sout(); return ret; }
+int strncmp(const char *s1, const char *s2, size_t n) { sin(); char *ns1 = dw_unprotect((void *)s1); dw_check_access((void *)s1, MIN(n, libc_strlen(ns1) + 1)); char *ns2 = dw_unprotect((void *)s2); dw_check_access((void *)s2, MIN(n, libc_strlen(ns2) + 1)); int ret = libc_strncmp(ns1, ns2, n); dw_reprotect((void *)s1); dw_reprotect((void *)s2); sout(); return ret; }
+int fputs(const char *restrict s, FILE *restrict stream) { sin(); char *ns = dw_unprotect((void *)s); dw_check_access((void *)s, libc_strlen(ns) + 1); int ret = libc_fputs(ns, stream); dw_reprotect((void *)s); sout(); return ret; }
+int puts(const char *s) { sin(); char *ns = dw_unprotect((void *)s); dw_check_access((void *)s, libc_strlen(ns) + 1); int ret = libc_puts(ns); dw_reprotect((void *)s); sout(); return ret; }
 
 // Open can take 2 or 3 arguments, we handle it just like glibc does it internally.
 int open(const char *pathname, int flags, ...) { 
@@ -333,7 +319,6 @@ int openat(int dirfd, const char *pathname, int flags, ...) {
     dw_reprotect((void *)pathname); sout(); return ret;
 }
 
-// int openat2(int dirfd, const char *pathname, const struct open_how *how, size_t size) { sin(); return libc_openat2(dirfd, dw_unprotect(pathname), how, size); }
 int creat(const char *pathname, mode_t mode) { sin(); char *npathname = dw_unprotect((void *)pathname); dw_check_access((void *)pathname, libc_strlen(npathname) + 1); int ret = libc_creat(npathname, mode); dw_reprotect((void *)pathname); sout(); return ret; }
 int access(const char *pathname, int mode) { sin(); char *npathname = dw_unprotect((void *)pathname); dw_check_access((void *)pathname, libc_strlen(npathname) + 1); int ret = libc_access(npathname, mode); dw_reprotect((void *)pathname); sout(); return ret; }
 char *getcwd(char *buf, size_t size) { sin(); dw_check_access((void *)buf, size); char *ret = libc_getcwd(dw_unprotect((void *)buf), size); dw_reprotect((void *)buf); sout(); if(ret == dw_untaint(buf)) return buf; return ret; }
@@ -396,6 +381,7 @@ void *memmove(void *dest, const void *src, size_t n) { sin(); dw_check_access(de
 void *mempcpy(void *restrict dest, const void *restrict src, size_t n) { sin(); dw_check_access(dest, n); dw_check_access(src, n); libc_mempcpy((void *)dw_unprotect(dest), (void *)dw_unprotect(src), n); dw_reprotect(dest); dw_reprotect(src); sout(); return dest; }
 void *memset(void *s, int c, size_t n) { sin(); dw_check_access(s, n); libc_memset((void *)dw_unprotect(s), c, n); dw_reprotect(s); sout(); return s; }
 char *strcpy(char *restrict dest, const char *src) { sin(); char *ndest = dw_unprotect((void *)dest); char *nsrc = dw_unprotect((void *)src); size_t len = libc_strlen(nsrc) + 1; dw_check_access(dest, len); dw_check_access(src, len); libc_strcpy(ndest, nsrc); dw_reprotect(dest); dw_reprotect(src); sout(); return dest;}
+char *strcat(char *restrict dest, const char *src) { sin(); char *ndest = dw_unprotect((void *)dest); char *nsrc = dw_unprotect((void *)src); size_t dst_len = libc_strlen(ndest); size_t src_len = libc_strlen(nsrc); dw_check_access(dest, dst_len + src_len + 1); dw_check_access(src, src_len + 1); libc_strcat(ndest, nsrc); dw_reprotect(dest); dw_reprotect(src); sout(); return dest;}
 char *strncpy(char *restrict dest, const char *restrict src, size_t n) { sin(); char *nsrc = dw_unprotect((void *)src); size_t len = libc_strlen(nsrc) + 1; dw_check_access(dest, n); dw_check_access(src, len < n ? len : n); libc_strncpy(dw_unprotect(dest), nsrc, n); dw_reprotect(dest); dw_reprotect(src); sout(); return dest; }
 wchar_t *wmemmove(wchar_t *dest, const wchar_t *src, size_t n) { sin(); dw_check_access(dest, n * sizeof(wchar_t)); dw_check_access(src, n * sizeof(wchar_t)); libc_wmemmove((wchar_t *)dw_unprotect(dest), (wchar_t *)dw_unprotect(src), n); dw_reprotect(dest); dw_reprotect(src); sout(); return dest; }
 
@@ -412,7 +398,6 @@ char *gettext (const char * msgid) { sin(); char *nmsgid = dw_unprotect((void *)
 char *dgettext (const char * domainname, const char * msgid) { sin(); char *ndomainname = dw_unprotect((void *)domainname); char *nmsgid = dw_unprotect((void *)msgid); dw_check_access((void *)domainname, libc_strlen(ndomainname) + 1); dw_check_access((void *)msgid, libc_strlen(nmsgid) + 1); char *ret = libc_dgettext(ndomainname, nmsgid); dw_reprotect(domainname); dw_reprotect(msgid); sout(); if(ret == nmsgid) return (char *)msgid; else return ret; }
 char *dcgettext (const char * domainname, const char * msgid, int category) { sin(); char *ndomainname = dw_unprotect((void *)domainname); char *nmsgid = dw_unprotect((void *)msgid); dw_check_access((void *)domainname, libc_strlen(ndomainname) + 1); dw_check_access((void *)msgid, libc_strlen(nmsgid) + 1); char *ret = __dcgettext (ndomainname, nmsgid, category); dw_reprotect(domainname); dw_reprotect(msgid); sout(); if(ret == nmsgid) return (char *)msgid; else return ret; }
 char *ngettext(const char *msgid, const char *msgid_plural, unsigned long int n) { sin(); char *nmsgid = dw_unprotect((void *)msgid); char *nmsgid_plural = dw_unprotect((void *)msgid_plural); dw_check_access((void *)msgid, libc_strlen(nmsgid) + 1); dw_check_access((void *)msgid_plural, libc_strlen(nmsgid_plural) + 1); char *ret = libc_ngettext(nmsgid, nmsgid_plural, n); dw_reprotect(msgid); dw_reprotect(msgid_plural); sout(); if(ret == nmsgid) return (char *)msgid; else if(ret == nmsgid_plural) return (char *)msgid_plural; else return ret; } 
-// char *dngettext(const char *domainname, const char *msgid, const char *msgid_plural, unsigned long int n) { sin(); char *ret = libc_dngettext(dw_unprotect(domainname), dw_unprotect(msgid), dw_unprotect(msgid_plural), n); dw_reprotect(domainname); dw_reprotect(msgid); dw_reprotect(msgid_plural); sout(); if(ret == dw_untaint(msgid)) return (char *)msgid; else if(ret == dw_untaint(msgid_plural)) return (char *)msgid_plural; else return ret; }
 char *dcngettext(const char *domainname, const char *msgid, const char *msgid_plural, unsigned long int n, int category) { sin(); char *ndomainname = dw_unprotect((void *)domainname); char *nmsgid = dw_unprotect((void *)msgid); char *nmsgid_plural = dw_unprotect((void *)msgid_plural); dw_check_access((void *)domainname, libc_strlen(ndomainname) + 1); dw_check_access((void *)msgid, libc_strlen(nmsgid) + 1); dw_check_access((void *)msgid_plural, libc_strlen(nmsgid_plural) + 1); char *ret = libc_dcngettext(ndomainname, nmsgid, nmsgid_plural, n, category); dw_reprotect(domainname); dw_reprotect(msgid); dw_reprotect(msgid_plural); sout(); if(ret == nmsgid) return (char *)msgid; else if(ret == nmsgid_plural) return (char *)msgid_plural; else return ret; }
 char *setlocale(int category, const char *locale) { sin(); char *nlocale = dw_unprotect((void *)locale); dw_check_access((void *)locale, libc_strlen(nlocale) + 1); char *ret = libc_setlocale(category, nlocale); dw_reprotect(locale); sout(); return ret; }
 char *textdomain(const char * domainname) { sin(); char *ndomainname = dw_unprotect((void *)domainname); dw_check_access((void *)domainname, libc_strlen(ndomainname) + 1); char *ret = libc_textdomain(ndomainname); dw_reprotect(domainname); sout(); return ret; }

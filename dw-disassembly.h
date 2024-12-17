@@ -24,15 +24,42 @@ struct insn_table;
 
 typedef struct insn_table instruction_table;
 
+// x86_64 instructions can have several memory arguments.
+// Each can contain a tainted pointer. Normally, the base register
+// is tainted but sometimes the index register is tainted instead.
+// On some instructions with two memory arguments, it may happen that
+// both are tainted. Sometimes only one is tainted but not always the same.
+// Thus, the detection of which argument is tainted must be dynamic.
+
 struct memory_arg {
+
+    // Those fields are extracted directly from the Capstone library
+    // The base and index are set to X86_REG_INVALID if not used
     uintptr_t scale;
     uintptr_t displacement;
     int base;
     int index;
     unsigned length;
-    uintptr_t saved_taint, saved_address;
-    unsigned protected_reg; // index in mcontext_t->gregs
-    bool is_protected, reprotect, reprotect_mem;
+    unsigned access;
+    
+    // If the same register as the base or index is also a register
+    // argument, base_access or index_access will be non zero and set
+    // to CS_AC_READ / CS_AC_WRITE, and some care is needed when 
+    // untainting and retainting that register.
+    unsigned base_access, index_access;
+    
+    // When the unprotect handler is called, if the base or index register 
+    // is tainted, this taint is saved, otherwise the field is set to zero.
+    // It will be used to retaint the register in the reprotect handler,
+    // and to detect if the tainted register, base or index, changes
+    // between different executions of that instruction.
+    uintptr_t base_taint, index_taint;
+    
+    // When a register is untainted before its value is read from or written to memory,
+    // because it is at the same time a base pointer and register argument,
+    // we need to fix the value at that address in the unprotect handler.
+    // We thus save the address and the value.
+    uintptr_t saved_address, saved_value;
 };
 
 struct reg_arg {
@@ -45,7 +72,6 @@ struct insn_entry {
     struct memory_arg arg_m[MAX_MEM_ARG];
     struct reg_arg arg_r[MAX_REG_ARG];
     unsigned nb_arg_m;
-    unsigned nb_reprotect;
     unsigned nb_arg_r;
     bool repeat;
     bool post_handler;

@@ -42,10 +42,10 @@ int main(int argc, char *argv[]) {
     line[8] = 0;
   }
 
-  // for(i = 0; i < size; i++) {
-  //   fprintf(out,"Line %d, %s\n", i, table[i]);
-  // }
-//    for(j = 0; j < size; j++) crc += table[j][0];
+  for(i = 0; i < size; i++) {
+      fprintf(out,"Line %d, %s\n", i, table[i]);
+  }
+  for(j = 0; j < size; j++) crc += table[j][0];
 
   crc = 0;
   for(i = 0; i < loop_size; i++) {

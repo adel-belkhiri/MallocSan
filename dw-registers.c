@@ -5,6 +5,8 @@
 #include <libpatch/patch.h>
 #include <capstone/capstone.h>
 
+// Included information our table is based on:
+//
 // ucontext_t uc_mcontext gregs []
 //     REG_R8, REG_R9, REG_R10, REG_R11, REG_R12, REG_R13, REG_R14,
 //     REG_R15, REG_RDI, REG_RSI, REG_RBP, REG_RBX, REG_RDX, REG_RAX, REG_RCX, 
@@ -21,13 +23,6 @@
 //     PATCH_X86_64_R11, PATCH_X86_64_R12, PATCH_X86_64_R13, PATCH_X86_64_R14, PATCH_X86_64_R15
 //
 // patch_probe_context *extended_states
-//
-// Install new version of libolx, fill in the table in a separate file
-// Make separate functions to untaint / taint called from hooks
-// Have assertions in those functions
-// Check on small program
-// Print if xmm/ymm case
-// Debug wrappers
 
 unsigned dw_saved_registers[] = {
     X86_REG_RAX, X86_REG_RBX, X86_REG_RCX, X86_REG_RDX, X86_REG_RSI, 
@@ -45,9 +40,9 @@ struct reg_entry reg_table[] = {
     { X86_REG_AX, "ax", 2, 1, offsetof(ucontext_t, uc_mcontext.gregs[REG_RAX]), offsetof(struct patch_exec_context, general_purpose_registers[PATCH_X86_64_RAX]), -1, 0, {} },
     { X86_REG_BH, "bh", 1, 1, offsetof(ucontext_t, uc_mcontext.gregs[REG_RBX])+1, offsetof(struct patch_exec_context, general_purpose_registers[PATCH_X86_64_RBX])+1, -1, 0, {} },
     { X86_REG_BL, "bl", 1, 1, offsetof(ucontext_t, uc_mcontext.gregs[REG_RBX]), offsetof(struct patch_exec_context, general_purpose_registers[PATCH_X86_64_RBX]), -1, 0, {} },
-    { X86_REG_BP, "bp", 2, 1, offsetof(ucontext_t, uc_mcontext.gregs[REG_RBX]), offsetof(struct patch_exec_context, general_purpose_registers[PATCH_X86_64_RBX]), -1, 0, {} },
+    { X86_REG_BP, "bp", 2, 1, offsetof(ucontext_t, uc_mcontext.gregs[REG_RBP]), offsetof(struct patch_exec_context, general_purpose_registers[PATCH_X86_64_RBP]), -1, 0, {} },
     { X86_REG_BPL, "bpl", 1, 1, offsetof(ucontext_t, uc_mcontext.gregs[REG_RBP]), offsetof(struct patch_exec_context, general_purpose_registers[PATCH_X86_64_RBP]), -1, 0, {} },
-    { X86_REG_BX, "bx", 2, 1, offsetof(ucontext_t, uc_mcontext.gregs[REG_RBP]), offsetof(struct patch_exec_context, general_purpose_registers[PATCH_X86_64_RBP]), -1, 0, {} },
+    { X86_REG_BX, "bx", 2, 1, offsetof(ucontext_t, uc_mcontext.gregs[REG_RBX]), offsetof(struct patch_exec_context, general_purpose_registers[PATCH_X86_64_RBX]), -1, 0, {} },
     { X86_REG_CH, "ch", 1, 1, offsetof(ucontext_t, uc_mcontext.gregs[REG_RCX])+1, offsetof(struct patch_exec_context, general_purpose_registers[PATCH_X86_64_RCX])+1, -1, 0, {} },
     { X86_REG_CL, "cl", 1, 1, offsetof(ucontext_t, uc_mcontext.gregs[REG_RCX]), offsetof(struct patch_exec_context, general_purpose_registers[PATCH_X86_64_RCX]), -1, 0, {} },
     { X86_REG_CS, "cs", 2, 1, -1, -1, -1, 0, {} },
@@ -67,7 +62,7 @@ struct reg_entry reg_table[] = {
     { X86_REG_EFLAGS, "flags", 8, 1, offsetof(ucontext_t, uc_mcontext.gregs[REG_EFL]), -1 /* offsetof(struct patch_exec_context, general_purpose_registers[PATCH_X86_64_EFL]) */, -1, 0, {} },
     { X86_REG_EIP, "eip", 4, 1, offsetof(ucontext_t, uc_mcontext.gregs[REG_RIP]), -1 /* offsetof(struct patch_exec_context, general_purpose_registers[PATCH_X86_64_RIP]) */, -1, 0, {} },
     { X86_REG_EIZ, "eiz", 4, 1, -1, -1, -1, 0, {} },
-    { X86_REG_ES, "es", 2, 1, offsetof(ucontext_t, uc_mcontext.gregs[REG_RSI]), offsetof(struct patch_exec_context, general_purpose_registers[PATCH_X86_64_RSI]), -1, 0, {} },
+    { X86_REG_ES, "es", 2, 1, -1, -1, -1, 0, {} },
     { X86_REG_ESI, "esi", 4, 1, offsetof(ucontext_t, uc_mcontext.gregs[REG_RSI]), offsetof(struct patch_exec_context, general_purpose_registers[PATCH_X86_64_RSI]), -1, 0, {} },
     { X86_REG_ESP, "esp", 4, 1, offsetof(ucontext_t, uc_mcontext.gregs[REG_RSP]), -1 /* offsetof(struct patch_exec_context, general_purpose_registers[PATCH_X86_64_RSP]) */, -1, 0, {} },
     { X86_REG_FPSW, "fpsw", 10, 1, -1, -1, -1, 0, {} },
@@ -295,89 +290,3 @@ struct reg_entry *dw_get_reg_entry(unsigned reg)
     return (reg_table + reg);
 }
 
-#if 0
-void dw_test_proc(void *arg)
-{
-  register void *tmp1 asm ("r12");
-  register void *tmp2 asm ("r13");
-  register void *tmp3 asm ("r14");
-  register void *tmp4 asm ("r15");
-
-  uintptr_t *ptr = (uintptr_t *)arg;
-  uintptr_t var1 = ptr[0];
-  uintptr_t var2 = ptr[1];
-  uintptr_t var3 = ptr[2];
-  uintptr_t var4 = ptr[3];
-  uintptr_t var5 = ptr[4];
-  uintptr_t var6 = ptr[5];
-  uintptr_t var7 = ptr[6];
-  uintptr_t var8 = ptr[7];
-
-  var2 = var1 + var2;
-  var3 = var2 + var3;
-  var4 = var3 + var4;
-  var5 = var4 + var5;
-  var6 = var5 + var6;
-  var7 = var6 + var7;
-  var8 = var7 + var8;
-  fprintf(stderr, "%lu %lu %lu %lu %lu %lu %lu %lu %p %p %p %p\n", var1, var2, var3, var4, var5, var6, var7, var8, tmp1, tmp2, tmp3, tmp4);
-}
-
-// The epilogue needs to retaint the pointer contained in the register.
-// Here we have saved the register before it was untainted. We simply pop it back.
-// The table contains for each register the code for popping it.
-// We also have to replace the stack pointer, because we jumped over the red zone.
-// The code is in epilogue_red_zone.
-//
-//    pop %r8
-//    leaq 0x80(%rsp), %rsp
-
-static uint8_t epilogue_red_zone[] = {0x48, 0x8d, 0xa4, 0x24, 0x80, 0x00, 0x00, 0x00};
-
-struct register_entry olx_restore_taint_table[] = {
-    {"r8", 1, {0x41, 0x58}},
-    {"r9", 1, {0x41, 0x59}},
-    {"r10", 1, {0x41, 0x5a}},
-    {"r11", 1, {0x41, 0x5b}},
-    {"r12", 1, {0x41, 0x5c}},
-    {"r13", 1, {0x41, 0x5d}},
-    {"r14", 1, {0x41, 0x5e}},
-    {"r15", 1, {0x41, 0x5f}},
-    {"rdi", 1, {0x5f, 0x00}},
-    {"rsi", 1, {0x5e, 0x00}},
-    {"rbp", 1, {0x5d, 0x00}},
-    {"rbx", 1, {0x5b, 0x00}},
-    {"rdx", 1, {0x5a, 0x00}},
-    {"rax", 1, {0x58, 0x00}},
-    {"rcx", 1, {0x59, 0x00}},
-    {"rsp", 1, {0x5c, 0x00}}
-};
-
-// For this test, we just put back 0x0001 in the unused MS bytes.
-// Ideally, the epilogue should not affect any flag or use other registers.
-// Otherwise, it would have to save and restore them.
-// The following sequence should do the trick to add 0x0001 (shown for r8)
-//
-//    rorxq   $48, %r8, %r8
-//    leaq    0x1(%r8), %r8
-//    rorxq   $16, %r8, %r8
-
-struct register_entry olx_naive_table[] = {
-    {"r8", 16, {0xc4, 0x43, 0xfb, 0xf0, 0xc0, 0x30, 0x4d, 0x8d, 0x40, 0x01, 0xc4, 0x43, 0xfb, 0xf0, 0xc0, 0x10, 0x00}},
-    {"r9", 16, {0xc4, 0x43, 0xfb, 0xf0, 0xc9, 0x30, 0x4d, 0x8d, 0x49, 0x01, 0xc4, 0x43, 0xfb, 0xf0, 0xc9, 0x10, 0x00}},
-    {"r10", 16, {0xc4, 0x43, 0xfb, 0xf0, 0xd2, 0x30, 0x4d, 0x8d, 0x52, 0x01, 0xc4, 0x43, 0xfb, 0xf0, 0xd2, 0x10, 0x00}},
-    {"r11", 16, {0xc4, 0x43, 0xfb, 0xf0, 0xdb, 0x30, 0x4d, 0x8d, 0x5b, 0x01, 0xc4, 0x43, 0xfb, 0xf0, 0xdb, 0x10, 0x00}},
-    {"r12", 17, {0xc4, 0x43, 0xfb, 0xf0, 0xe4, 0x30, 0x4d, 0x8d, 0x64, 0x24, 0x01, 0xc4, 0x43, 0xfb, 0xf0, 0xe4, 0x10}},
-    {"r13", 16, {0xc4, 0x43, 0xfb, 0xf0, 0xed, 0x30, 0x4d, 0x8d, 0x6d, 0x01, 0xc4, 0x43, 0xfb, 0xf0, 0xed, 0x10, 0x00}},
-    {"r14", 16, {0xc4, 0x43, 0xfb, 0xf0, 0xf6, 0x30, 0x4d, 0x8d, 0x76, 0x01, 0xc4, 0x43, 0xfb, 0xf0, 0xf6, 0x10, 0x00}},
-    {"r15", 16, {0xc4, 0x43, 0xfb, 0xf0, 0xff, 0x30, 0x4d, 0x8d, 0x7f, 0x01, 0xc4, 0x43, 0xfb, 0xf0, 0xff, 0x10, 0x00}},
-    {"rdi", 16, {0xc4, 0xe3, 0xfb, 0xf0, 0xff, 0x30, 0x48, 0x8d, 0x7f, 0x01, 0xc4, 0xe3, 0xfb, 0xf0, 0xff, 0x10, 0x00}},
-    {"rsi", 16, {0xc4, 0xe3, 0xfb, 0xf0, 0xf6, 0x30, 0x48, 0x8d, 0x76, 0x01, 0xc4, 0xe3, 0xfb, 0xf0, 0xf6, 0x10, 0x00}},
-    {"rbp", 16, {0xc4, 0xe3, 0xfb, 0xf0, 0xed, 0x30, 0x48, 0x8d, 0x6d, 0x01, 0xc4, 0xe3, 0xfb, 0xf0, 0xed, 0x10, 0x00}},
-    {"rbx", 16, {0xc4, 0xe3, 0xfb, 0xf0, 0xdb, 0x30, 0x48, 0x8d, 0x5b, 0x01, 0xc4, 0xe3, 0xfb, 0xf0, 0xdb, 0x10, 0x00}},
-    {"rdx", 16, {0xc4, 0xe3, 0xfb, 0xf0, 0xd2, 0x30, 0x48, 0x8d, 0x52, 0x01, 0xc4, 0xe3, 0xfb, 0xf0, 0xd2, 0x10, 0x00}},
-    {"rax", 16, {0xc4, 0xe3, 0xfb, 0xf0, 0xc0, 0x30, 0x48, 0x8d, 0x40, 0x01, 0xc4, 0xe3, 0xfb, 0xf0, 0xc0, 0x10, 0x00}},
-    {"rcx", 16, {0xc4, 0xe3, 0xfb, 0xf0, 0xc9, 0x30, 0x48, 0x8d, 0x49, 0x01, 0xc4, 0xe3, 0xfb, 0xf0, 0xc9, 0x10, 0x00}},
-    {"rsp", 17, {0xc4, 0xe3, 0xfb, 0xf0, 0xe4, 0x30, 0x48, 0x8d, 0x64, 0x24, 0x01, 0xc4, 0xe3, 0xfb, 0xf0, 0xe4, 0x10}}
-};
-#endif // 0

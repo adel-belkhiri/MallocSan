@@ -21,7 +21,7 @@ extern bool dw_protect_active;
 void dw_protect_init();
 
 // Check that the pointer to the object is within bounds 
-void dw_check_access(const void *ptr, size_t size);
+int dw_check_access(const void *ptr, size_t size);
 
 // Get the allocated size of a protected object
 size_t dw_get_size(void *ptr);

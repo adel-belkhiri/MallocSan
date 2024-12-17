@@ -84,6 +84,7 @@ void dw_log(enum dw_log_level level, enum dw_log_category_name topic, const char
     __write(2, buffer, cursor - buffer);
     va_end(args);
 
+    // The first time we print a memory map, this helps in debugging
     if(level <= dw_log_categories[topic].backtrace_level) {
         if(! mapped) {
             mapped = true;
