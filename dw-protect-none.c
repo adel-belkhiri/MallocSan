@@ -18,10 +18,11 @@ void dw_protect_init()
 {
 }
 
-void dw_check_access(const void *ptr, size_t size)
+int dw_check_access(const void *ptr, size_t size)
 {
     if(ptr == NULL) dw_log(WARNING, PROTECT, "Null pointer access\n");
     if(size == 0) dw_log(WARNING, PROTECT, "Zero size access\n");
+    return 0;
 }
 
 // Add a taint

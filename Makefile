@@ -14,12 +14,8 @@ libdw:
 	gcc -c -Wall -fPIC -g  -I $(PATCH)/include dw-preload.c -o dw-preload.o
 	gcc -shared -g -o libmallocsan.so dw-log.o dw-protect-oid.o dw-disassembly.o dw-registers.o dw-wrap-glibc.o dw-printf.o dw-preload.o -lcapstone -L $(PATCH)/lib/ -lpatch -lunwind
 	gcc -c -Wall -g simple.c -o simple.o
-	#gcc -c -Wall -g simple2.c -o simple2.o
 	#gcc -O2 -g -o simple simple.o
-	#gcc -O2 -g -o simple2 simple2.o
-	#gcc -O2 -g -Wall -o simple-bug -I $(PATCH)/include simple-bug.c -L $(PATCH)/lib/ -lpatch
-	gcc -g -o simple-dw simple.o dw-log.o dw-protect-oid.o dw-disassembly.o dw-registers.o dw-wrap-glibc.o dw-printf.o dw-preload.o -lcapstone -L $(PATCH)/lib/ -lpatch -l unwind	
-	#gcc -O2 -g -o simple2-dw simple2.o dw-log.o dw-protect-oid.o dw-disassembly.o dw-registers.o dw-wrap-glibc.o dw-preload.o -lcapstone -L $(PATCH)/lib/ -lpatch -l unwind
+	gcc -g -o simple-dw simple.o dw-log.o dw-protect-oid.o dw-disassembly.o dw-registers.o dw-wrap-glibc.o dw-printf.o dw-preload.o -lcapstone -L $(PATCH)/lib -lpatch -l unwind	
         
 clean:
-	-rm *.o *.so simple simple-dw simple2-dw
+	-rm *.o *.so simple simple-dw

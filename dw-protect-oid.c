@@ -3,10 +3,6 @@
 #include "dw-log.h"
 #include "stdint.h"
 
-// This is mostly a stub for now. We taint pointers with 0x0001 in the MS bytes
-// Normally we would keep an object table with the bounds of each object
-// and use the object id as taint. We would add a dw_check_access function.
-
 const uintptr_t taint_mask =    (uintptr_t)0xffff000000000000;
 const uintptr_t untaint_mask =  (uintptr_t)0x0000ffffffffffff;
 
@@ -27,6 +23,7 @@ struct object_id {
     size_t size;
 };
 
+// We have 2 unused bytes to store the object id. We are limited to less than 2^16.
 static const unsigned oids_size = 65000;
 static unsigned oids_head = 0;
 static struct object_id oids[65000];
@@ -44,20 +41,23 @@ void dw_protect_init()
     oids[oids_size - 1].size = 0;
 }
 
-void dw_check_access(const void *ptr, size_t size)
+int dw_check_access(const void *ptr, size_t size)
 {
     unsigned oid = (uintptr_t)ptr >> 48;
     void *real_addr = (void *)((uintptr_t)ptr & untaint_mask);
     
-    if(oid == 0) return;
+    if(oid == 0) return 0;
     if(oid > (oids_size - 1) || oids[oid].base_addr == 0) {
         dw_log(PROTECT, WARNING, "Invalid taint value %u for %p\n", oid, ptr);
-        return;
+        return 1;
     }
 
-    if(real_addr < oids[oid].base_addr || real_addr + size > oids[oid].base_addr + oids[oid].size)
-        dw_log(WARNING, PROTECT, "Invalid access (%x)%p size %d not between %p and %p\n", 
+    if(real_addr < oids[oid].base_addr || real_addr + size > oids[oid].base_addr + oids[oid].size) {
+        dw_log(ERROR, PROTECT, "Invalid access (%x)%p size %d not between %p and %p\n", 
             oid, real_addr, size, oids[oid].base_addr, oids[oid].base_addr + oids[oid].size);
+        return 1;
+    }
+    return 0;
 }
 
 size_t dw_get_size(void *ptr)
