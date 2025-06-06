@@ -1430,9 +1430,9 @@ static int vsnprintf_impl(output_gadget_t* output, const char* format, va_list a
   // termination
   append_termination_with_gadget(output);
 
-  dw_reprotect((void *)format); 
-  dw_sout(); 
-  
+  dw_reprotect((void *)format);
+  dw_sout();
+
   // return written chars without terminating \0
   return (int)output->pos;
 }

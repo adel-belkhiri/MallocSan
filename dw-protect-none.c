@@ -1,17 +1,20 @@
 #include <malloc.h>
-#include "dw-protect.h"
+
 #include "dw-log.h"
+#include "dw-protect.h"
 #include "stdint.h"
 
-// This is mostly a stub for now. We taint pointers with 0x0001 in the MS bytes
-// Normally we would keep an object table with the bounds of each object
-// and use the object id as taint. We would add a dw_check_access function.
+/*
+ * This is mostly a stub for now. We taint pointers with 0x0001 in the MS bytes
+ * Normally we would keep an object table with the bounds of each object
+ * and use the object id as taint. We would add a dw_check_access function.
+ */
 
-const uintptr_t taint_mask =    (uintptr_t)0xffff000000000000;
-const uintptr_t untaint_mask =  (uintptr_t)0x0000ffffffffffff;
-const uintptr_t default_taint = (uintptr_t)0x0001000000000000;
+const uintptr_t taint_mask    = (uintptr_t) 0xffff000000000000;
+const uintptr_t untaint_mask  = (uintptr_t) 0x0000ffffffffffff;
+const uintptr_t default_taint = (uintptr_t) 0x0001000000000000;
 
-// Start without protecting objects, wait until libdw is fully initialized
+/* Start without protecting objects, wait until libdw is fully initialized */
 bool dw_protect_active = false;
 
 void dw_protect_init()
@@ -20,97 +23,111 @@ void dw_protect_init()
 
 int dw_check_access(const void *ptr, size_t size)
 {
-    if(ptr == NULL) dw_log(WARNING, PROTECT, "Null pointer access\n");
-    if(size == 0) dw_log(WARNING, PROTECT, "Zero size access\n");
-    return 0;
-}
+	if (ptr == NULL)
+		dw_log(WARNING, PROTECT, "Null pointer access\n");
 
-// Add a taint
-void*
-dw_protect(const void *ptr)
-{
-    return (void *)((uintptr_t)ptr | default_taint);
-}
+	if (size == 0)
+		dw_log(WARNING, PROTECT, "Zero size access\n");
 
-// This would be used with the mprotect method
-void
-dw_reprotect(const void *ptr)
-{
-}
-
-void*
-dw_untaint(const void *ptr)
-{
-    return (void *)((uintptr_t)ptr & untaint_mask);
-}
-
-// Put back the taint on the modified (incremented) pointer
-void*
-dw_retaint(const void *ptr, const void *old_ptr)
-{
-    return (void *)((uintptr_t)ptr | ((uintptr_t)old_ptr & taint_mask));
-}
-
-// Remove the taint or mprotect
-void*
-dw_unprotect(const void *ptr)
-{
-    return (void *)((uintptr_t)ptr & untaint_mask);
-}
-
-// For now insure that it is the taint that we put, and not corruption
-int
-dw_is_protected(const void *ptr)
-{
-    uintptr_t taint = (uintptr_t)ptr >> 48;
-    if(taint == 0) return 0;
-    if(taint == 1) return 1;
-    dw_log(WARNING, MAIN, "Taint should be 1, pointer %p\n", ptr);
-    return 1;
-}
-
-// For now insure that it is the taint that we put, and not corruption
-int
-dw_is_protected_index(const void *ptr)
-{
-    uintptr_t taint = (uintptr_t)ptr >> 63;
-    if(taint == 0) return dw_is_protected(ptr);
-    else return 0; // negative index, not a taint
-}
-
-// Alloc and return the tainted pointer
-void*
-dw_malloc_protect(size_t size)
-{
-    void *result = __libc_malloc(size);
-    result = dw_protect(result);
-    return result;
+	return 0;
 }
 
 /*
-void*
-dw_realloc_protect(void *ptr, size_t size)
+ * Add a taint to a pointer.
+ */
+void *dw_protect(const void *ptr)
 {
-    void *result = __libc_malloc(size);
-    result = dw_protect(result);
-    return result;
+	return (void *) ((uintptr_t) ptr | default_taint);
+}
+
+/*
+ * This would be used with the mprotect method.
+ */
+void dw_reprotect(const void *ptr)
+{
+}
+
+void *dw_untaint(const void *ptr)
+{
+	return (void *) ((uintptr_t) ptr & untaint_mask);
+}
+
+/*
+ * Put back the taint on the modified (incremented) pointer.
+ */
+void *dw_retaint(const void *ptr, const void *old_ptr)
+{
+	return (void *) ((uintptr_t) ptr | ((uintptr_t) old_ptr & taint_mask));
+}
+
+/*
+ * Remove the taint or mprotect.
+ */
+void *dw_unprotect(const void *ptr)
+{
+	return (void *) ((uintptr_t) ptr & untaint_mask);
+}
+
+/*
+ * For now insure that it is the taint that we put, and not corruption.
+ */
+int dw_is_protected(const void *ptr)
+{
+	uintptr_t taint = (uintptr_t)ptr >> 48;
+	if(taint == 0) return 0;
+	if(taint == 1) return 1;
+
+	dw_log(WARNING, MAIN, "Taint should be 1, pointer %p\n", ptr);
+	return 1;
+}
+
+/*
+ * For now insure that it is the taint that we put, and not corruption.
+ */
+int dw_is_protected_index(const void *ptr)
+{
+	uintptr_t taint = (uintptr_t) ptr >> 63;
+
+	if (taint == 0)
+		return dw_is_protected(ptr);
+	else
+		return 0;
+}
+
+/*
+ * Alloc and return the tainted pointer
+ */
+void *dw_malloc_protect(size_t size)
+{
+	void *result = __libc_malloc(size);
+	result = dw_protect(result);
+	return result;
+}
+
+/*
+void* dw_realloc_protect(void *ptr, size_t size)
+{
+	void *result = __libc_malloc(size);
+	result = dw_protect(result);
+	return result;
 }
 */
 
-// Remove the taint and free the object
-void
-dw_free_protect(void *ptr)
+/*
+ * Remove the taint and free the object.
+ */
+void dw_free_protect(void *ptr)
 {
-    void *result = dw_unprotect(ptr);
-    __libc_free(result);
+	void *result = dw_unprotect(ptr);
+	__libc_free(result);
 }
 
-// Memalign and return the tainted pointer
-void*
-dw_memalign_protect(size_t alignment, size_t size)
+/*
+ * Memalign and return the tainted pointer.
+ */
+void *dw_memalign_protect(size_t alignment, size_t size)
 {
-    void *result = __libc_memalign(alignment, size);
-    result = dw_protect(result);
-    return result;
+	void *result = __libc_memalign(alignment, size);
+	result = dw_protect(result);
+	return result;
 }
-
