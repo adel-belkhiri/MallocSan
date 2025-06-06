@@ -1,15 +1,16 @@
 #define _GNU_SOURCE 1
 
-#include "dw-registers.h"
-#include <ucontext.h>
-#include <libpatch/patch.h>
 #include <capstone/capstone.h>
+#include <libpatch/patch.h>
+#include <ucontext.h>
+
+#include "dw-registers.h"
 
 // Included information our table is based on:
 //
 // ucontext_t uc_mcontext gregs []
 //     REG_R8, REG_R9, REG_R10, REG_R11, REG_R12, REG_R13, REG_R14,
-//     REG_R15, REG_RDI, REG_RSI, REG_RBP, REG_RBX, REG_RDX, REG_RAX, REG_RCX, 
+//     REG_R15, REG_RDI, REG_RSI, REG_RBP, REG_RBX, REG_RDX, REG_RAX, REG_RCX,
 //     REG_RSP, REG_RIP, REG_EFL, REG_CSGSFS, REG_ERR, REG_TRAPNO,
 //     REG_OLDMASK, REG_CR2
 //
@@ -18,17 +19,17 @@
 //     cwd, swd, ftw, fop, rip, rdp, mxcsr, mxcr_mask, _st[8] (each 16 bytes), _xmm[16] (each 4 x u32)
 //
 // patch_probe_context gregs[]
-//     PATCH_X86_64_RAX, PATCH_X86_64_RBX, PATCH_X86_64_RCX, PATCH_X86_64_RDX, PATCH_X86_64_RSI, 
+//     PATCH_X86_64_RAX, PATCH_X86_64_RBX, PATCH_X86_64_RCX, PATCH_X86_64_RDX, PATCH_X86_64_RSI,
 //     PATCH_X86_64_RDI, PATCH_X86_64_RBP, PATCH_X86_64_R8, PATCH_X86_64_R9, PATCH_X86_64_R10,
 //     PATCH_X86_64_R11, PATCH_X86_64_R12, PATCH_X86_64_R13, PATCH_X86_64_R14, PATCH_X86_64_R15
 //
 // patch_probe_context *extended_states
 
 unsigned dw_saved_registers[] = {
-    X86_REG_RAX, X86_REG_RBX, X86_REG_RCX, X86_REG_RDX, X86_REG_RSI, 
+    X86_REG_RAX, X86_REG_RBX, X86_REG_RCX, X86_REG_RDX, X86_REG_RSI,
     X86_REG_RDI, X86_REG_RBP, X86_REG_R8, X86_REG_R9, X86_REG_R10,
     X86_REG_R11, X86_REG_R12, X86_REG_R13, X86_REG_R14, X86_REG_R15};
-    
+
 const unsigned dw_nb_saved_registers = sizeof(dw_saved_registers) / sizeof(unsigned);
 
 uintptr_t dw_save_regs[sizeof(dw_saved_registers) / sizeof(unsigned)];
@@ -286,7 +287,7 @@ static unsigned reg_table_size = sizeof(reg_table) / sizeof(struct reg_entry);
 
 struct reg_entry *dw_get_reg_entry(unsigned reg)
 {
-    if(reg >= reg_table_size) return NULL;
-    return (reg_table + reg);
+	if (reg >= reg_table_size)
+		return NULL;
+	return (reg_table + reg);
 }
-
