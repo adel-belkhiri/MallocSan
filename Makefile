@@ -3,7 +3,7 @@ OLX=$(HOME)/lib/libolx
 PATCH=$(HOME)/lib/libpatch
 CAPSTONE=/usr/include
 
-libdw: 
+libdw:
 	gcc -c -Wall -fPIC -g dw-log.c -o dw-log.o
 	gcc -c -Wall -fPIC -g dw-protect-oid.c -o dw-protect-oid.o
 	gcc -c -Wall -fPIC -g dw-protect-none.c -o dw-protect-none.o
@@ -15,7 +15,7 @@ libdw:
 	gcc -shared -g -o libmallocsan.so dw-log.o dw-protect-oid.o dw-disassembly.o dw-registers.o dw-wrap-glibc.o dw-printf.o dw-preload.o -lcapstone -L $(PATCH)/lib/ -lpatch -lunwind
 	gcc -c -Wall -g simple.c -o simple.o
 	#gcc -O2 -g -o simple simple.o
-	gcc -g -o simple-dw simple.o dw-log.o dw-protect-oid.o dw-disassembly.o dw-registers.o dw-wrap-glibc.o dw-printf.o dw-preload.o -lcapstone -L $(PATCH)/lib -lpatch -l unwind	
-        
+	gcc -g -o simple-dw simple.o dw-log.o dw-protect-oid.o dw-disassembly.o dw-registers.o dw-wrap-glibc.o dw-printf.o dw-preload.o -lcapstone -L $(PATCH)/lib -lpatch -l unwind
+
 clean:
 	-rm *.o *.so simple simple-dw

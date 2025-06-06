@@ -19,9 +19,9 @@ struct dw_log_category {
 };
 
 struct dw_log_category dw_log_categories[] = {
-    {"protect", 1, 2, 1}, 
-    {"disassembly", 1, 2, 1}, 
-    {"main", 1, 2, 1}, 
+    {"protect", 1, 2, 1},
+    {"disassembly", 1, 2, 1},
+    {"main", 1, 2, 1},
     {"wrap", 1, 2, 1}
 };
 
@@ -57,18 +57,18 @@ static unsigned string_copy(char *dest, char *src, size_t n)
     int i = 0;
     for(; i < n - 1 && src[i] != 0 ; i++) dest[i] = src[i];
     dest[i] = 0;
-    return i; 
+    return i;
 }
 
-void dw_log(enum dw_log_level level, enum dw_log_category_name topic, const char *fmt, ...)  
+void dw_log(enum dw_log_level level, enum dw_log_category_name topic, const char *fmt, ...)
 {
     char buffer[1024];
     static bool mapped = false;
     char *cursor = buffer;
     unsigned nbc = 1024;
-    
+
     // This message is not within the log level, return without printing it
-    if(dw_log_categories[topic].active == 0 || level > dw_log_categories[topic].level) return; 
+    if(dw_log_categories[topic].active == 0 || level > dw_log_categories[topic].level) return;
 
     // Write to a stack buffer and then call the low level write. We avoid any malloc that glibc could do
     // First the level name and category name
@@ -76,7 +76,7 @@ void dw_log(enum dw_log_level level, enum dw_log_category_name topic, const char
     *cursor = ' '; nbc -= 1; cursor += 1;
     ret = string_copy(cursor, dw_log_categories[topic].name, nbc); nbc -= ret; cursor += ret;
     ret = string_copy(cursor, ": ", nbc); nbc -= ret; cursor += ret;
-    
+
     // Then write the user supplied format and arguments
     va_list args;
     va_start(args, fmt);
@@ -97,14 +97,14 @@ void dw_log(enum dw_log_level level, enum dw_log_category_name topic, const char
         }
         dw_backtrace(2);
     }
-    
+
     // If the log level is "ERROR", this is fatal and the program exits
     // if(level == ERROR) exit(1);
     if(level == ERROR) abort();
 }
 
 // Simple fprintf facility that should not use malloc
-void dw_fprintf(int fd, const char *fmt, ...) 
+void dw_fprintf(int fd, const char *fmt, ...)
 {
     char buffer[1024];
 

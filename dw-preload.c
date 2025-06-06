@@ -20,8 +20,8 @@ static size_t nb_insn_olx_entries = 30000;
 // This should let us debug two aspects. The first is libc wrappers to insure that no tainted
 // pointers leak to system calls. A trace of system calls with arguments and a stack dump
 // can let us check if a tainted pointer is passed as argument and by which call path.
-// The second aspect is the untainting / retainting of pointers. We know that we 
-// currently do not handle vector indirect access instructions such as 
+// The second aspect is the untainting / retainting of pointers. We know that we
+// currently do not handle vector indirect access instructions such as
 // VPGATHERQQ ymm11, qword ptr [ymm9], ymm10
 
 static enum dw_strategies dw_strategy = DW_PATCH_TRAP;
@@ -50,14 +50,14 @@ void signal_protected(int sig, siginfo_t *info, void *context)
     dw_protect_active = false;
 
     // Check if we are within wrapped / inactive functions where this signal should not happen
-    if(!save_active) 
+    if(!save_active)
         dw_log(WARNING, MAIN, "Signal received while within wrappers\n");
-    
+
     // Get the instruction address
     ucontext_t* uctx = ((ucontext_t*)context);
     uintptr_t fault_insn = uctx->uc_mcontext.gregs[REG_RIP];
     uintptr_t next_insn;
-      
+
     // Check if it is the first time that we encounter this address
     entry = dw_get_instruction_entry(insn_table, fault_insn);
 
@@ -72,7 +72,7 @@ void signal_protected(int sig, siginfo_t *info, void *context)
     // If we cannot install the patch, we fall back to the olx buffer strategy
     if(dw_strategy == DW_PATCH_JUMP) {
         success = dw_instruction_entry_patch(entry, DW_PATCH_JUMP, patch_handler);
-        if(success) {     
+        if(success) {
             dw_log(INFO, MAIN, "Patched instruction 0x%llx\n", entry->insn);
             entry->strategy = DW_PATCH_JUMP;
             dw_protect_active = save_active;
@@ -80,32 +80,32 @@ void signal_protected(int sig, siginfo_t *info, void *context)
         } else dw_log(WARNING, MAIN, "Patch jump failed for instruction 0x%llx\n", entry->insn);
     }
     else if(dw_strategy != DW_PATCH_TRAP) dw_log(ERROR, MAIN, "Unknown strategy %d\n", dw_strategy);
-        
+
     // This strategy should always work.
     success = dw_instruction_entry_patch(entry, DW_PATCH_TRAP, patch_handler);
     if(!success) dw_log(ERROR, MAIN, "Patch trap failed for instruction 0x%llx\n", entry->insn);
     entry->strategy = DW_PATCH_TRAP;
     // We return and it will trap again, but this time libpatch will call the patch_handler
     dw_protect_active = save_active;
-    return;  
+    return;
 }
 
 // Since this library is activated by LD_PRELOAD, we cannot use the main function argv
 // to receive arguments. We use environment variables instead.
 
 // Range of object sizes to protect, by default protect all
-static size_t 
-  min_protect_size = 0, 
+static size_t
+  min_protect_size = 0,
   max_protect_size = ULONG_MAX;
 
 // What objects in sequence to protect, from (first) to (first + max)
 // By default protect all
-static long unsigned 
-  nb_protected = 0, 
-  nb_protected_candidates = 0, 
-  first_protected = 0, 
+static long unsigned
+  nb_protected = 0,
+  nb_protected_candidates = 0,
+  first_protected = 0,
   max_nb_protected = ULONG_MAX;
- 
+
 // Use extended checking of coherency
 static bool check_handling = false;
 
@@ -117,7 +117,7 @@ static enum dw_log_level log_level = 0;
 static char *stats_file = ".taintstats.txt";
 
 // This is the initialisation function called at preload time
-extern void __attribute__((constructor(65535))) 
+extern void __attribute__((constructor(65535)))
 dw_init()
 {
     // Get the parameters passed as environment variables
@@ -141,9 +141,9 @@ dw_init()
     if(arg != NULL && atoi(arg) == 1) { check_handling = true; dw_set_check_handling(check_handling); }
 
     dw_log(INFO, MAIN, "Starting program dw\n");
-    dw_log(INFO, MAIN, "Min protect size %lu, max protect size %lu, max nb protected %lu, first protected %lu\n", 
+    dw_log(INFO, MAIN, "Min protect size %lu, max protect size %lu, max nb protected %lu, first protected %lu\n",
         min_protect_size, max_protect_size, max_nb_protected, first_protected);
-    dw_log(INFO, MAIN, "Instruction entries %lu, log level %d, stats file %s, strategy %d, check handling %d\n", 
+    dw_log(INFO, MAIN, "Instruction entries %lu, log level %d, stats file %s, strategy %d, check handling %d\n",
         nb_insn_olx_entries, log_level, stats_file, dw_strategy, check_handling);
 
     // Initialise the different modules
@@ -155,12 +155,12 @@ dw_init()
     // Insert the SIGSEGV signal handler to catch protected pointers
     // We use an alternate stack to allow the handler to save
     // tainted registers on the application stack.
-    
+
     stack_t ss;
     size_t ss_size = 16 * PAGE_SIZE;
     int ret;
     struct sigaction sa;
-    
+
     ss.ss_sp = malloc(ss_size);
     ss.ss_size = ss_size;
     ss.ss_flags = 0;
@@ -174,8 +174,8 @@ dw_init()
     if(ret < 0) dw_log(ERROR, MAIN, "Sigaction SIGSEGV failed\n");
     ret = sigaction(SIGBUS, &sa, NULL);
     if(ret < 0) dw_log(ERROR, MAIN, "Sigaction SIGBUS failed\n");
-    
-    // start intercepting allocation functions        
+
+    // start intercepting allocation functions
     dw_protect_active = true;
 }
 
@@ -187,7 +187,7 @@ __attribute__((destructor)) dw_fini()
         int fd = open(stats_file, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR|S_IWUSR|S_IRGRP|S_IWGRP);
         if(fd < 0) dw_log(WARNING, MAIN, "Cannot open file '%s' to write statistics\n", stats_file);
         else {
-            dw_fprintf(fd, "There was a total of %d protected malloc on %d candidates\n\n", 
+            dw_fprintf(fd, "There was a total of %d protected malloc on %d candidates\n\n",
                 nb_protected, nb_protected_candidates);
             dw_print_instruction_entries(insn_table, fd);
             close(fd);
@@ -202,7 +202,7 @@ __attribute__((destructor)) dw_fini()
 // Filter the objects to be tainted according to size range and
 // Rank in the allocation sequence.
 
-static bool 
+static bool
 check_candidate(size_t size)
 {
     if(size >= min_protect_size && size <= max_protect_size) {
@@ -236,7 +236,7 @@ malloc2(size_t size, void *caller)
     void *ret = NULL;
     bool save_active = dw_protect_active;
     dw_protect_active = false;
-    
+
     if(save_active) {
         if(check_caller(caller)) {
             if(check_candidate(size)) ret = dw_malloc_protect(size);
@@ -244,7 +244,7 @@ malloc2(size_t size, void *caller)
         else dw_log(INFO, MAIN, "Not tainting malloc, caller from library\n");
     }
     if(ret == NULL) ret = __libc_malloc(size);
-    
+
     dw_protect_active = save_active;
     dw_log(INFO, MAIN, "Malloc %p, size %lu, nb_candidates %lu\n", ret, size, nb_protected_candidates);
     return ret;
@@ -293,10 +293,10 @@ memalign(size_t alignment, size_t size)
     void *ret;
     bool save_active = dw_protect_active;
     dw_protect_active = false;
-    
+
     if(save_active && check_candidate(size)) ret = dw_memalign_protect(alignment, size);
     else ret = __libc_memalign(alignment, size);
-    
+
     dw_protect_active = save_active;
     dw_log(INFO, MAIN, "Memalign %p, size %lu, nb_candidates %lu\n", ret, size, nb_protected_candidates);
     return ret;

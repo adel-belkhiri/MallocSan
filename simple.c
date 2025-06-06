@@ -16,14 +16,14 @@ int main(int argc, char *argv[]) {
   char *str = malloc(10);
   str[0] = 'A'; str[1] = 'B'; str[2] = 'C'; str[3] = 0;
   fprintf(out, "This is a problem %s\n", str);
-  
+
   if(argc < 2) size = 20;
   else size = atoi(argv[1]);
   if(argc < 3) loop_size = 1;
   else loop_size = atoi(argv[2]);
   if(argc < 4) test_access = 0;
   else test_access = atoi(argv[3]);
-  
+
   fprintf(out, "Malloc table in main %p\n", main);
   table = malloc(sizeof(char *) * size);
 
@@ -49,8 +49,8 @@ int main(int argc, char *argv[]) {
 
   crc = 0;
   for(i = 0; i < loop_size; i++) {
-    for(j = 0; j < size; j++) 
-    { 
+    for(j = 0; j < size; j++)
+    {
       line = table[j];
       crc += 1;
       crc += line[0];
@@ -69,7 +69,7 @@ int main(int argc, char *argv[]) {
     fprintf(out,"Free line %d, %p in table %p\n", i, line, table);
     free(line);
   }
-  
+
   fprintf(out, "Free table, crc = %d\n", crc);
   free(table);
 }

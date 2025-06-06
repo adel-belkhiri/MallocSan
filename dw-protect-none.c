@@ -113,4 +113,3 @@ dw_memalign_protect(size_t alignment, size_t size)
     result = dw_protect(result);
     return result;
 }
-

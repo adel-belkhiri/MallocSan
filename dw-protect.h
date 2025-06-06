@@ -3,7 +3,7 @@
 
 #include <stdbool.h>
 
-// There are different ways to protect heap objects. 
+// There are different ways to protect heap objects.
 //
 // One is pointer tainting, dereferencing the pointer
 // will trigger a SIGSEGV giving control to check the access.
@@ -20,7 +20,7 @@ extern bool dw_protect_active;
 // Initialize the module
 void dw_protect_init();
 
-// Check that the pointer to the object is within bounds 
+// Check that the pointer to the object is within bounds
 int dw_check_access(const void *ptr, size_t size);
 
 // Get the allocated size of a protected object
@@ -30,7 +30,7 @@ size_t dw_get_size(void *ptr);
 // The pointer will be discarded and need not be retainted
 void dw_reprotect(const void *ptr);
 
-// Return the untainted pointer 
+// Return the untainted pointer
 void* dw_untaint(const void *ptr);
 
 // Reapply the taint from the old pointer to ptr.

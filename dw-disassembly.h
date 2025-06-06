@@ -10,8 +10,8 @@
 
 // The instruction table contains all the information about the instructions that
 // access tainted pointers. This is in order to untaint the pointers, emulate the
-// access and retaint the pointers. The structure is not opaque for now because 
-// it is accessed from a few files. More abstraction is likely in the future, 
+// access and retaint the pointers. The structure is not opaque for now because
+// it is accessed from a few files. More abstraction is likely in the future,
 // especially when multiple architectures will be supported.
 
 #define MAX_MEM_ARG 3
@@ -41,20 +41,20 @@ struct memory_arg {
     int index;
     unsigned length;
     unsigned access;
-    
+
     // If the same register as the base or index is also a register
     // argument, base_access or index_access will be non zero and set
-    // to CS_AC_READ / CS_AC_WRITE, and some care is needed when 
+    // to CS_AC_READ / CS_AC_WRITE, and some care is needed when
     // untainting and retainting that register.
     unsigned base_access, index_access;
-    
-    // When the unprotect handler is called, if the base or index register 
+
+    // When the unprotect handler is called, if the base or index register
     // is tainted, this taint is saved, otherwise the field is set to zero.
     // It will be used to retaint the register in the reprotect handler,
     // and to detect if the tainted register, base or index, changes
     // between different executions of that instruction.
     uintptr_t base_taint, index_taint;
-    
+
     // When a register is untainted before its value is read from or written to memory,
     // because it is at the same time a base pointer and register argument,
     // we need to fix the value at that address in the unprotect handler.
@@ -108,7 +108,7 @@ void dw_patch_init();
 
 typedef void (*dw_patch_probe)(struct patch_exec_context *ctx, uint8_t post_or_ret);
 
-// Patch the instruction described by that entry and have 
+// Patch the instruction described by that entry and have
 // the specified handler called before and after that instruction
 bool dw_instruction_entry_patch(struct insn_entry *entry, enum dw_strategies strategy, dw_patch_probe patch_handler);
 

@@ -11,13 +11,13 @@ const uintptr_t untaint_mask =  (uintptr_t)0x0000ffffffffffff;
    trigger a SIGSEGV. With the base_addr and the size, we can check
    if the bytes accessed are within the allocated bounds for the object.
 
-   The base_addr field is NULL when the entry is not in use. 
+   The base_addr field is NULL when the entry is not in use.
    In that case, the size field contains the index of the next
    entry in the free list, or 0 if this is the free list end.
    The array entry at index zero is not used since this would
    correspond to a null taint, no taint. Moreover, index 0 is
    reserved for the free list end. */
-   
+
 struct object_id {
     void *base_addr;
     size_t size;
@@ -45,7 +45,7 @@ int dw_check_access(const void *ptr, size_t size)
 {
     unsigned oid = (uintptr_t)ptr >> 48;
     void *real_addr = (void *)((uintptr_t)ptr & untaint_mask);
-    
+
     if(oid == 0) return 0;
     if(oid > (oids_size - 1) || oids[oid].base_addr == 0) {
         dw_log(PROTECT, WARNING, "Invalid taint value %u for %p\n", oid, ptr);
@@ -53,7 +53,7 @@ int dw_check_access(const void *ptr, size_t size)
     }
 
     if(real_addr < oids[oid].base_addr || real_addr + size > oids[oid].base_addr + oids[oid].size) {
-        dw_log(ERROR, PROTECT, "Invalid access (%x)%p size %d not between %p and %p\n", 
+        dw_log(ERROR, PROTECT, "Invalid access (%x)%p size %d not between %p and %p\n",
             oid, real_addr, size, oids[oid].base_addr, oids[oid].base_addr + oids[oid].size);
         return 1;
     }
@@ -68,7 +68,7 @@ size_t dw_get_size(void *ptr)
         dw_log(PROTECT, WARNING, "Invalid taint value %u for %p\n", oid, ptr);
         return 0;
     }
-    return oids[oid].size;            
+    return oids[oid].size;
 }
 
 // Add the object to the oid table and taint the pointer
@@ -82,7 +82,7 @@ dw_protect(void *ptr, size_t size)
     unsigned next_head = oids[oids_head].size;
     oids[oids_head].base_addr = ptr;
     oids[oids_head].size = size;
-    void *result = (void *)((uintptr_t)ptr | ((uintptr_t)oids_head) << 48); 
+    void *result = (void *)((uintptr_t)ptr | ((uintptr_t)oids_head) << 48);
     oids_head = next_head;
     return result;
 }

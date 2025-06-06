@@ -13,7 +13,7 @@
 // are saved (e.g. signal handler, libpatch handler...), and other information
 // to help untaint and taint pointers in those registers.
 
-struct reg_entry {
+struct reg_entry { 
     int index;
     char *name;
     int size;
