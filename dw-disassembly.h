@@ -12,8 +12,9 @@
 #define MAX_MEM_ARG 3
 #define MAX_REG_ARG 6
 #define MAX_MOD_REG 6
+#define MAX_SCAN_INST_COUNT 32
 
-enum dw_strategies { DW_PATCH_TRAP = 0, DW_PATCH_JUMP };
+enum dw_strategies {DW_PATCH_TRAP=0, DW_PATCH_JUMP, DW_PATCH_UNKNOWN};
 
 /*
  * The instruction table contains all the information about the instructions
@@ -57,6 +58,12 @@ struct memory_arg {
 	 * between different executions of that instruction. */
 	uintptr_t base_taint, index_taint;
 
+	/* The values of base and index registers before untainting. We need
+	 * these values to compute and check similar memory accesses. The latter
+	 * are memory accesses with the same base and index registers as the
+	 * original, but with different displacement, scale and/or size. */
+	uintptr_t base_addr, index_addr;
+
 	/* When a register is untainted before its value is read from or written
 	 * to memory, because it is at the same time a base pointer and register
 	 * argument, we need to fix the value at that address in the unprotect
@@ -77,6 +84,7 @@ struct insn_entry {
 	unsigned nb_arg_r;
 	bool repeat;
 	bool post_handler;
+	bool deferred_post_handler;
 	uintptr_t insn;
 	uintptr_t next_insn;
 	uintptr_t olx_buffer;
@@ -116,7 +124,8 @@ typedef void (*dw_patch_probe)(struct patch_exec_context *ctx, uint8_t post_or_r
  * the specified handler called before and after that instruction */
 bool dw_instruction_entry_patch(struct insn_entry *entry,
 								enum dw_strategies strategy,
-								dw_patch_probe patch_handler);
+								dw_patch_probe patch_handler,
+								bool deferred_post_handler);
 
 /* A potentially tainted pointer is accessed, unprotect it before the access */
 void dw_unprotect_context(struct patch_exec_context *ctx);
