@@ -90,7 +90,9 @@ size_t dw_strlen(const char *s)
 static char* (*libc_strchr)(const char *s, int c);
 static char* (*libc_strrchr)(const char *s, int c);
 static int (*libc_strcmp)(const char *s1, const char *s2);
+static int (*libc_strcasecmp)(const char *s1, const char *s2);
 static int (*libc_strncmp)(const char *s1, const char *s2, size_t n);
+static int (*libc_strncasecmp)(const char *s1, const char *s2, size_t n);
 static int (*libc_fputs)(const char *restrict s, FILE *restrict stream);
 static int (*libc_puts)(const char *s);
 static size_t (*libc_strlen)(const char *s);
@@ -127,11 +129,20 @@ static void* (*libc_memcpy_chk)(void *dest, const void *src, size_t len, size_t 
 static void* (*libc_memfrob)(void *s, size_t n);
 static void* (*libc_memmem)(const void *haystack, size_t haystacklen, const void *needle, size_t needlelen);
 static void* (*libc_memmove)(void *dest, const void *src, size_t n);
+static void* (*libc_memmove_chk)(void *dest, const void *src, size_t len, size_t destlen);
 static void* (*libc_mempcpy)(void *restrict dest, const void *restrict src, size_t n);
 static void* (*libc_memset)(void *s, int c, size_t n);
+static void* (*libc_memset_chk)(void *s, int c, size_t n, size_t destlen);
 static char* (*libc_strcpy)(char *restrict dest, const char *src);
+static void* (*libc_strcpy_chk)(void *dest, const void *src, size_t destlen);
 static char* (*libc_strcat)(char *restrict dest, const char *src);
+static char* (*libc_strcat_chk)(char *dest, const char *src, size_t destlen);
+static char* (*libc_strncat_chk)(char *dest, const char *src, size_t n, size_t destlen);
 static char* (*libc_strncpy)(char *restrict dest, const char *restrict src, size_t n);
+static void* (*libc_strncpy_chk)(void *dest, const void *src, size_t n, size_t destlen);
+static size_t (*libc_strspn)(const char *str1, const char *str2);
+static char* (*libc_strstr)(const char *str1, const char *str2);
+static size_t (*libc_strcspn)(const char *str1, const char *str2);
 static wchar_t* (*libc_wmemmove)(wchar_t *dest, const wchar_t *src, size_t n);
 static wchar_t* (*libc_wmempcpy)(wchar_t *restrict dest, const wchar_t *restrict src, size_t n);
 static wchar_t* (*libc_wmemcpy)(wchar_t *restrict dest, const wchar_t *restrict src, size_t n);
@@ -148,7 +159,6 @@ static int (*libc_execv)(const char *pathname, char *const argv[]);
 static int (*libc_execvp)(const char *file, char *const argv[]);
 static int (*libc_execvpe)(const char *file, char *const argv[], char *const envp[]);
 
-
 int dw_init_stubs = 0;
 // size_t (*dw_strlen)(const char *s);
 
@@ -163,7 +173,9 @@ void dw_init_syscall_stubs()
 	libc_strchr = dlsym_check(RTLD_NEXT, "strchr");
 	libc_strrchr = dlsym_check(RTLD_NEXT, "strrchr");
 	libc_strcmp = dlsym_check(RTLD_NEXT, "strcmp");
+	libc_strcasecmp = dlsym_check(RTLD_NEXT, "strcasecmp");
 	libc_strncmp = dlsym_check(RTLD_NEXT, "strncmp");
+	libc_strncasecmp = dlsym_check(RTLD_NEXT, "strncasecmp");
 	libc_fputs = dlsym_check(RTLD_NEXT, "fputs");
 	libc_puts = dlsym_check(RTLD_NEXT, "puts");
 	libc_open = dlsym_check(RTLD_NEXT, "open");
@@ -196,11 +208,20 @@ void dw_init_syscall_stubs()
 	libc_memfrob = dlsym_check(RTLD_NEXT, "memfrob");
 	libc_memmem = dlsym_check(RTLD_NEXT, "memmem");
 	libc_memmove = dlsym_check(RTLD_NEXT, "memmove");
+	libc_memmove_chk = dlsym_check(RTLD_NEXT, "__memmove_chk");
 	libc_mempcpy = dlsym_check(RTLD_NEXT, "mempcpy");
 	libc_memset = dlsym_check(RTLD_NEXT, "memset");
+	libc_memset_chk = dlsym_check(RTLD_NEXT, "__memset_chk");
 	libc_strcpy = dlsym_check(RTLD_NEXT, "strcpy");
+	libc_strcpy_chk = dlsym_check(RTLD_NEXT, "__strcpy_chk");
 	libc_strcat = dlsym_check(RTLD_NEXT, "strcat");
+	libc_strcat_chk = dlsym_check(RTLD_NEXT, "__strcat_chk");
+	libc_strncat_chk = dlsym_check(RTLD_NEXT, "__strncat_chk");
 	libc_strncpy = dlsym_check(RTLD_NEXT, "strncpy");
+	libc_strncpy_chk = dlsym_check(RTLD_NEXT, "__strncpy_chk");
+	libc_strspn = dlsym_check(RTLD_NEXT, "strspn");
+	libc_strcspn = dlsym_check(RTLD_NEXT, "strcspn");
+	libc_strstr = dlsym_check(RTLD_NEXT, "strstr");
 	libc_wmemmove = dlsym_check(RTLD_NEXT, "wmemmove");
 	libc_wmempcpy = dlsym_check(RTLD_NEXT, "wmempcpy");
 	libc_wmemcpy = dlsym_check(RTLD_NEXT, "wmemcpy");
@@ -307,7 +328,9 @@ int vdprintf(int fd, const char *restrict format, va_list arg)
 char *strchr(const char *s, int c) { sin(); char *ns = dw_unprotect((void *)s); dw_check_access((void *)s, libc_strlen(ns) + 1); char *ret = libc_strchr(ns, c); dw_reprotect((void *)s); sout(); if(ret == NULL) return ret; return (void *)dw_retaint(ret, s); }
 char *strrchr(const char *s, int c) { sin(); char *ns = dw_unprotect((void *)s); dw_check_access((void *)s, libc_strlen(ns) + 1); char *ret = libc_strrchr(ns, c); dw_reprotect((void *)s); sout(); if(ret == NULL) return ret; return (void *)dw_retaint(ret, s); }
 int strcmp(const char *s1, const char *s2) { sin(); char *ns1 = dw_unprotect((void *)s1); dw_check_access((void *)s1, libc_strlen(ns1) + 1); char *ns2 = dw_unprotect((void *)s2); dw_check_access((void *)s2, libc_strlen(ns2) + 1); int ret = libc_strcmp(ns1, ns2); dw_reprotect((void *)s1); dw_reprotect((void *)s2); sout(); return ret; }
+int strcasecmp(const char *s1, const char *s2) { sin(); char *ns1 = dw_unprotect((void *)s1); dw_check_access((void *)s1, libc_strlen(ns1) + 1); char *ns2 = dw_unprotect((void *)s2); dw_check_access((void *)s2, libc_strlen(ns2) + 1); int ret = libc_strcasecmp(ns1, ns2); dw_reprotect((void *)s1); dw_reprotect((void *)s2); sout(); return ret; }
 int strncmp(const char *s1, const char *s2, size_t n) { sin(); char *ns1 = dw_unprotect((void *)s1); dw_check_access((void *)s1, MIN(n, libc_strlen(ns1) + 1)); char *ns2 = dw_unprotect((void *)s2); dw_check_access((void *)s2, MIN(n, libc_strlen(ns2) + 1)); int ret = libc_strncmp(ns1, ns2, n); dw_reprotect((void *)s1); dw_reprotect((void *)s2); sout(); return ret; }
+int strncasecmp(const char *s1, const char *s2, size_t n) { sin(); char *ns1 = dw_unprotect((void *)s1); dw_check_access((void *)s1, MIN(n, libc_strlen(ns1) + 1)); char *ns2 = dw_unprotect((void *)s2); dw_check_access((void *)s2, MIN(n, libc_strlen(ns2) + 1)); int ret = libc_strncasecmp(ns1, ns2, n); dw_reprotect((void *)s1); dw_reprotect((void *)s2); sout(); return ret; }
 int fputs(const char *restrict s, FILE *restrict stream) { sin(); char *ns = dw_unprotect((void *)s); dw_check_access((void *)s, libc_strlen(ns) + 1); int ret = libc_fputs(ns, stream); dw_reprotect((void *)s); sout(); return ret; }
 int puts(const char *s) { sin(); char *ns = dw_unprotect((void *)s); dw_check_access((void *)s, libc_strlen(ns) + 1); int ret = libc_puts(ns); dw_reprotect((void *)s); sout(); return ret; }
 
@@ -401,10 +424,7 @@ void *memcpy(void *dest, const void *src, size_t n) { sin(); dw_check_access(des
 void *__memcpy_chk(void *dest, const void *src, size_t len, size_t destlen) { sin(); dw_check_access(dest, destlen); dw_check_access(src, len); libc_memcpy_chk((void *)dw_unprotect(dest), (const void *)dw_unprotect(src), len, destlen); dw_reprotect(dest); dw_reprotect(src); sout(); return dest; }
 // void *memfrob(void *s, size_t n) { sin(); return libc_memfrob(void *s, size_t n); }
 
-void *memmem(const void *haystack,
-		size_t haystacklen,
-		const void *needle,
-		size_t needlelen)
+void *memmem(const void *haystack, size_t haystacklen, const void *needle, size_t needlelen)
 {
 	sin();
 	dw_check_access(haystack, haystacklen);
@@ -420,11 +440,20 @@ void *memmem(const void *haystack,
 }
 
 void *memmove(void *dest, const void *src, size_t n) { sin(); dw_check_access(dest, n); dw_check_access(src, n); libc_memmove((void *)dw_unprotect(dest), (void *)dw_unprotect(src), n); dw_reprotect(dest); dw_reprotect(src); sout(); return dest; }
+void *__memmove_chk(void *dest, const void *src, size_t len, size_t destlen) { sin(); dw_check_access(dest, destlen); dw_check_access(src, len); void *ret = libc_memmove_chk(dw_unprotect(dest), dw_unprotect(src), len, destlen); dw_reprotect(dest); dw_reprotect(src); sout(); return ret; }
 void *mempcpy(void *restrict dest, const void *restrict src, size_t n) { sin(); dw_check_access(dest, n); dw_check_access(src, n); libc_mempcpy((void *)dw_unprotect(dest), (void *)dw_unprotect(src), n); dw_reprotect(dest); dw_reprotect(src); sout(); return dest; }
 void *memset(void *s, int c, size_t n) { sin(); dw_check_access(s, n); libc_memset((void *)dw_unprotect(s), c, n); dw_reprotect(s); sout(); return s; }
+void *__memset_chk(void *s, int c, size_t n, size_t destlen) { sin(); dw_check_access(s, destlen); void *ret = libc_memset_chk(dw_unprotect(s), c, n, destlen); dw_reprotect(s); sout(); return ret; }
 char *strcpy(char *restrict dest, const char *src) { sin(); char *ndest = dw_unprotect((void *)dest); char *nsrc = dw_unprotect((void *)src); size_t len = libc_strlen(nsrc) + 1; dw_check_access(dest, len); dw_check_access(src, len); libc_strcpy(ndest, nsrc); dw_reprotect(dest); dw_reprotect(src); sout(); return dest;}
+char *__strcpy_chk(char *dest, const char *src, size_t destlen) { sin(); size_t srclen = libc_strlen(dw_unprotect(src)) + 1; dw_check_access(dest, destlen); dw_check_access(src, srclen); char *ret = libc_strcpy_chk(dw_unprotect(dest), dw_unprotect(src), destlen); dw_reprotect(dest); dw_reprotect(src); sout(); return ret; }
 char *strcat(char *restrict dest, const char *src) { sin(); char *ndest = dw_unprotect((void *)dest); char *nsrc = dw_unprotect((void *)src); size_t dst_len = libc_strlen(ndest); size_t src_len = libc_strlen(nsrc); dw_check_access(dest, dst_len + src_len + 1); dw_check_access(src, src_len + 1); libc_strcat(ndest, nsrc); dw_reprotect(dest); dw_reprotect(src); sout(); return dest;}
+char *__strcat_chk(char *dest, const char *src, size_t destlen) { sin(); size_t srclen = libc_strlen(dw_unprotect(src)) + 1; dw_check_access(dest, destlen); dw_check_access(src, srclen); char *ret = libc_strcat_chk(dw_unprotect(dest), dw_unprotect(src), destlen); dw_reprotect(dest); dw_reprotect(src); sout(); return ret; }
+char *__strncat_chk(char *dest, const char *src, size_t n, size_t destlen) { sin(); size_t srclen = libc_strlen(dw_unprotect(src)) + 1; dw_check_access(dest, destlen); dw_check_access(src, srclen < n ? srclen : n); char *ret = libc_strncat_chk(dw_unprotect(dest), dw_unprotect(src), n, destlen); dw_reprotect(dest); dw_reprotect(src); sout(); return ret; }
 char *strncpy(char *restrict dest, const char *restrict src, size_t n) { sin(); char *nsrc = dw_unprotect((void *)src); size_t len = libc_strlen(nsrc) + 1; dw_check_access(dest, n); dw_check_access(src, len < n ? len : n); libc_strncpy(dw_unprotect(dest), nsrc, n); dw_reprotect(dest); dw_reprotect(src); sout(); return dest; }
+char *__strncpy_chk(char *dest, const char *src, size_t n, size_t destlen) { sin(); size_t srclen = libc_strlen(dw_unprotect(src)) + 1; dw_check_access(dest, destlen); dw_check_access(src, srclen < n ? srclen : n); char *ret = libc_strncpy_chk(dw_unprotect(dest), dw_unprotect(src), n, destlen); dw_reprotect(dest); dw_reprotect(src); sout(); return ret; }
+size_t strspn(const char *str1, const char *str2) { sin(); char *ns = dw_unprotect((void *)str1); char *nstr2 = dw_unprotect((void *)str2); dw_check_access((void *)str1, libc_strlen(ns) + 1); dw_check_access((void *)str2, libc_strlen(nstr2) + 1); size_t ret = libc_strspn(ns, nstr2); dw_reprotect((void *)str1); dw_reprotect((void *)str2); sout(); return ret; }
+size_t strcspn(const char *str1, const char *str2) { sin(); char *ns = dw_unprotect((void *)str1); char *nstr2 = dw_unprotect((void *)str2); dw_check_access((void *)str1, libc_strlen(ns) + 1); dw_check_access((void *)str2, libc_strlen(nstr2) + 1); size_t ret = libc_strcspn(ns, nstr2); dw_reprotect((void *)str1); dw_reprotect((void *)str2); sout(); return ret; }
+char *strstr(const char *str1, const char *str2) { sin(); char *nstr1 = dw_unprotect((void *)str1); char *nstr2 = dw_unprotect((void *)str2); dw_check_access((void *)str1, libc_strlen(nstr1) + 1); dw_check_access((void *)str2, libc_strlen(nstr2) + 1); char *ret = libc_strstr(nstr1, nstr2); dw_reprotect((void *)str1); dw_reprotect((void *)str2); if(ret != NULL) dw_reprotect((void *)ret); sout(); return ret; }
 wchar_t *wmemmove(wchar_t *dest, const wchar_t *src, size_t n) { sin(); dw_check_access(dest, n * sizeof(wchar_t)); dw_check_access(src, n * sizeof(wchar_t)); libc_wmemmove((wchar_t *)dw_unprotect(dest), (wchar_t *)dw_unprotect(src), n); dw_reprotect(dest); dw_reprotect(src); sout(); return dest; }
 
 wchar_t *wmempcpy(wchar_t *restrict dest, const wchar_t *restrict src, size_t n)
