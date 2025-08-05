@@ -38,10 +38,40 @@ static instruction_table *insn_table;
  */
 static void patch_handler(struct patch_exec_context *ctx, uint8_t post)
 {
-	if (!post)
-		dw_unprotect_context(ctx);
-	else
+	struct insn_entry *entry = ctx->user_data;
+	if (post || ctx->program_counter != entry->insn) {
+		//dw_log(WARNING, MAIN, "REprotect @ 0x%lx\n", ctx->program_counter);
 		dw_reprotect_context(ctx);
+	} else {
+		// dw_log(WARNING, MAIN, "UNprotect @ 0x%lx\n", ctx->program_counter);
+		dw_unprotect_context(ctx);
+	}
+}
+
+/*
+ * This function patches one address. It returns the strategy that finally
+ * worked, or DW_PATCH_UNKNOWN on failure.
+ */
+static enum dw_strategies patch_one_location(struct insn_entry *entry,
+		enum dw_strategies patch_strategy,
+		dw_patch_probe handler,
+		bool deferred)
+{
+	enum dw_strategies fallback = (patch_strategy == DW_PATCH_JUMP) ?
+								   DW_PATCH_TRAP :
+								   DW_PATCH_UNKNOWN;
+
+	// First attempt with the chosen strategy
+	if (dw_instruction_entry_patch(entry, patch_strategy, handler, deferred))
+		return patch_strategy;
+
+	// Second attempt with the fallback strategy if the chosen strategy is jump
+	if (fallback != DW_PATCH_UNKNOWN &&
+		dw_instruction_entry_patch(entry, fallback, handler, deferred))
+		return fallback;
+
+	// Patch failed!
+	return DW_PATCH_UNKNOWN;
 }
 
 /*
@@ -55,7 +85,6 @@ void signal_protected(int sig, siginfo_t *info, void *context)
 	 * We should not have any tainted pointer access while in the handler.
 	 * It is not reentrant and signals are blocked anyway.
 	 */
-	bool success;
 	bool save_active = dw_protect_active;
 	dw_protect_active = false;
 
@@ -71,13 +100,12 @@ void signal_protected(int sig, siginfo_t *info, void *context)
 	uintptr_t fault_insn = uctx->uc_mcontext.gregs[REG_RIP];
 	uintptr_t next_insn;
 
-	// Check if it is the first time that we encounter this address
-	entry = dw_get_instruction_entry(insn_table, fault_insn);
-
 	/*
-	 * Once the instruction is patched, we should not get this handler
-	 * called any more
+	 * Check if it is the first time that we encounter this address. Once
+	 * the instruction is patched, we should not get this handler called any
+	 * more.
 	 */
+	entry = dw_get_instruction_entry(insn_table, fault_insn);
 	if (entry != NULL)
 		dw_log(ERROR, MAIN, "SIGSEGV handler called for already patched instruction 0x%llx\n",
 			   entry->insn);
@@ -91,31 +119,24 @@ void signal_protected(int sig, siginfo_t *info, void *context)
 	 * If we cannot install the patch, we fall back to the olx buffer
 	 * strategy.
 	 */
-	if (dw_strategy == DW_PATCH_JUMP) {
-		success = dw_instruction_entry_patch(
-				entry, DW_PATCH_JUMP, patch_handler);
-		if (success) {
-			dw_log(INFO, MAIN, "Patched instruction 0x%llx\n", entry->insn);
-			entry->strategy = DW_PATCH_JUMP;
-			dw_protect_active = save_active;
-			return;
-		} else
-			dw_log(WARNING, MAIN, "Patch jump failed for instruction 0x%llx\n", entry->insn);
-	} else if (dw_strategy != DW_PATCH_TRAP)
-		dw_log(ERROR, MAIN, "Unknown strategy %d\n", dw_strategy);
 
-	// This strategy should always work.
-	success = dw_instruction_entry_patch(
-			entry, DW_PATCH_TRAP, patch_handler);
-	if (!success)
-		dw_log(ERROR, MAIN, "Patch trap failed for instruction 0x%llx\n", entry->insn);
+	// Patch the faulting instruction
+	enum dw_strategies chosen_strategy =
+					patch_one_location(entry, dw_strategy, patch_handler, false);
 
-	entry->strategy = DW_PATCH_TRAP;
+	if (chosen_strategy == DW_PATCH_UNKNOWN)
+		dw_log(ERROR, MAIN, "Patch failed for instruction 0x%llx\n", entry->insn);
+
+	entry->strategy = (chosen_strategy == dw_strategy) ? chosen_strategy : DW_PATCH_MIXED;
+
+	dw_log(WARNING, MAIN,
+		   "Successfully patched 0x%llx (Post-handler: %d, Deferred: %s, Strategy: %d)\n",
+		   entry->insn, entry->post_handler, entry->deferred_post_handler ? "Yes" : "No",
+		   (int) entry->strategy);
 
 	// We return and it will trap again, but this time libpatch will call
 	// the patch_handler
 	dw_protect_active = save_active;
-	return;
 }
 
 /*
