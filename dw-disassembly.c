@@ -580,26 +580,6 @@ dw_create_instruction_entry(instruction_table *table,
 					 x86->prefix[0] == X86_PREFIX_REPE ||
 					 x86->prefix[0] == X86_PREFIX_REPNE);
 
-	/*
-	 * On control transfer instructions, the post handler hooks do not work.
-	 * Thus, the tainted pointer will not be retainted after the execution.
-	 * This is not a problem if the register value is not reused. Otherwise,
-	 * a subsequent access may not be checked, or the program logic may be
-	 * compromised if the untainted pointer is compared with a tainted
-	 * pointer.
-	 */
-	if (detail->groups_count > 0) {
-		for (i = 0; i < detail->groups_count; i++) {
-			if (detail->groups[i] < X86_GRP_VM) {
-				dw_log(WARNING, DISASSEMBLY,
-					   "Trap on control transfer instruction, post handler cannot be used %llx\n",
-					   fault);
-				entry->post_handler = false;
-				break;
-			}
-		}
-	}
-
 	unsigned reg;
 	cs_regs regs_read, regs_write;
 	uint8_t read_count = 0, write_count = 0;
