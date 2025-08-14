@@ -469,12 +469,24 @@ wchar_t *wmempcpy(wchar_t *restrict dest, const wchar_t *restrict src, size_t n)
 	return (wchar_t *) dw_retaint(ret, dest);
 }
 
-wchar_t *wmemcpy(wchar_t *restrict dest, const wchar_t *restrict src, size_t n) { sin(); dw_check_access(dest, n * sizeof(wchar_t)); dw_check_access(src, n * sizeof(wchar_t)); libc_wmemcpy((wchar_t *)dw_unprotect(dest), (wchar_t *)dw_unprotect(src), n); dw_reprotect(dest); dw_reprotect(src); sout(); return dest; }
+/* libintl define macros with same functions' names when optimization is enabled. */
+#ifdef gettext
+#  undef gettext
+#endif
+#ifdef dgettext
+#  undef dgettext
+#endif
+#ifdef ngettext
+#  undef ngettext
+#endif
+
 char *gettext (const char * msgid) { sin(); char *nmsgid = dw_unprotect((void *)msgid); dw_check_access((void *)msgid, libc_strlen(nmsgid) + 1); char *ret = libc_gettext(nmsgid); dw_reprotect(msgid); sout(); if(ret == nmsgid) return (char *)msgid; else return ret; }
 char *dgettext (const char * domainname, const char * msgid) { sin(); char *ndomainname = dw_unprotect((void *)domainname); char *nmsgid = dw_unprotect((void *)msgid); dw_check_access((void *)domainname, libc_strlen(ndomainname) + 1); dw_check_access((void *)msgid, libc_strlen(nmsgid) + 1); char *ret = libc_dgettext(ndomainname, nmsgid); dw_reprotect(domainname); dw_reprotect(msgid); sout(); if(ret == nmsgid) return (char *)msgid; else return ret; }
 char *dcgettext (const char * domainname, const char * msgid, int category) { sin(); char *ndomainname = dw_unprotect((void *)domainname); char *nmsgid = dw_unprotect((void *)msgid); dw_check_access((void *)domainname, libc_strlen(ndomainname) + 1); dw_check_access((void *)msgid, libc_strlen(nmsgid) + 1); char *ret = __dcgettext (ndomainname, nmsgid, category); dw_reprotect(domainname); dw_reprotect(msgid); sout(); if(ret == nmsgid) return (char *)msgid; else return ret; }
 char *ngettext(const char *msgid, const char *msgid_plural, unsigned long int n) { sin(); char *nmsgid = dw_unprotect((void *)msgid); char *nmsgid_plural = dw_unprotect((void *)msgid_plural); dw_check_access((void *)msgid, libc_strlen(nmsgid) + 1); dw_check_access((void *)msgid_plural, libc_strlen(nmsgid_plural) + 1); char *ret = libc_ngettext(nmsgid, nmsgid_plural, n); dw_reprotect(msgid); dw_reprotect(msgid_plural); sout(); if(ret == nmsgid) return (char *)msgid; else if(ret == nmsgid_plural) return (char *)msgid_plural; else return ret; }
 char *dcngettext(const char *domainname, const char *msgid, const char *msgid_plural, unsigned long int n, int category) { sin(); char *ndomainname = dw_unprotect((void *)domainname); char *nmsgid = dw_unprotect((void *)msgid); char *nmsgid_plural = dw_unprotect((void *)msgid_plural); dw_check_access((void *)domainname, libc_strlen(ndomainname) + 1); dw_check_access((void *)msgid, libc_strlen(nmsgid) + 1); dw_check_access((void *)msgid_plural, libc_strlen(nmsgid_plural) + 1); char *ret = libc_dcngettext(ndomainname, nmsgid, nmsgid_plural, n, category); dw_reprotect(domainname); dw_reprotect(msgid); dw_reprotect(msgid_plural); sout(); if(ret == nmsgid) return (char *)msgid; else if(ret == nmsgid_plural) return (char *)msgid_plural; else return ret; }
+
+wchar_t *wmemcpy(wchar_t *restrict dest, const wchar_t *restrict src, size_t n) { sin(); dw_check_access(dest, n * sizeof(wchar_t)); dw_check_access(src, n * sizeof(wchar_t)); libc_wmemcpy((wchar_t *)dw_unprotect(dest), (wchar_t *)dw_unprotect(src), n); dw_reprotect(dest); dw_reprotect(src); sout(); return dest; }
 char *setlocale(int category, const char *locale) { sin(); char *nlocale = dw_unprotect((void *)locale); dw_check_access((void *)locale, libc_strlen(nlocale) + 1); char *ret = libc_setlocale(category, nlocale); dw_reprotect(locale); sout(); return ret; }
 char *textdomain(const char * domainname) { sin(); char *ndomainname = dw_unprotect((void *)domainname); dw_check_access((void *)domainname, libc_strlen(ndomainname) + 1); char *ret = libc_textdomain(ndomainname); dw_reprotect(domainname); sout(); return ret; }
 int execve(const char *pathname, char *const argv[], char *const envp[]) { sin(); char *npathname = dw_unprotect((void *)pathname); dw_check_access((void *)pathname, libc_strlen(npathname) + 1); dw_check_access((void *)argv, arglen(argv)); dw_check_access((void *)envp, arglen(envp)); int ret = libc_execve(npathname, dw_unprotect(argv), dw_unprotect(envp)); dw_reprotect(pathname); dw_reprotect(argv); dw_reprotect(envp); sout(); return ret; }

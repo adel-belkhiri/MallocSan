@@ -1,0 +1,78 @@
+This file tracks known limitations, bugs, and ideas for future improvements.
+Please contact Adel Belkhiri <adel.belkhiri@polymtl.ca> for suggestions or
+questions about this TODO list.
+
+=== to do:
+
+- Add support in libpatch for a custom set of registers to save for handler execution
+  Libpatch currently supports only a fixed set of clobbered registers (all
+  general-purpose registers) for its probes. Hence, we need to modify libpatch to allow
+  MallocSan to specify which registers should be saved during handler execution.
+  MallocSan’s tainted pointer tracking requires only a limited subset, so targeting
+  only the necessary clobbered registers will reduce unnecessary saves and improve
+  performance.
+  + Priority: High
+  + Category: Performance
+  + Requires: Libpatch feature enhancement.
+
+- Handle overlapping patches for adjacent short instructions (< 5 bytes)
+  The current Libpatch version cannot patch adjacent instructions
+  when they are smaller than 5 bytes. This blocks the use of the high-performance
+  Jump patching strategy, which is MallocSan's intended target. The slower Trap
+  strategy can, though, be used for correctness testing in the meantime.
+  + Priority: High
+  + Category: Performance
+  + Requires: Libpatch feature enhancement.
+
+- Implement support for VSIB-indexed memory access
+  The pre- and post-access handlers assume that memory pointers are
+  indexed by general-purpose registers. This task is to add support for VSIB
+  (Vector Scatter/Gather Instructions using Indexing with Vector registers),
+  where a vector register (xmm or ymm) holds the indices.
+  + Priority: Medium
+  + Category: Correctness
+
+- Handle VSIB access with no base register and masked lanes
+  This is a specific case of VSIB where there is no base register,
+  and a mask register (k0-k7) determines which elements of the vector index are
+  active pointers. This requires logic to untaint and retaint multiple pointers
+  within a single vector register according to the mask.
+  + Priority: Medium
+  + Category: Correctness
+
+- Expand glibc system call wrapper coverage
+  MallocSan wraps libc functions that make system calls to prevent
+  tainted pointers from reaching the kernel. The dw-wrap-glibc.c file needs to be
+  updated to cover a more comprehensive set of glibc functions.
+  + Priority: Low
+  + Category: Correctness
+
+- Benchmark performance of different patching strategies
+  Collect and analyze performance data for the "Trap" vs. "Jump" patching
+  strategies. This involves measuring the number of access instructions affected
+  and their execution frequency to quantify the overhead and potential gains.
+  + Priority: Low
+  + Category: Performance
+
+
+=== taken care of:
+
+- Deferred post-handler placement, and disabled it in some cases
+  Improved the algorithm for post-handler placement by scanning forward through
+  disassembled instructions to find a better insertion point. This reduces
+  unnecessary pre- and post-handler executions and improves MallocSan efficiency.
+  + Date: 08/2025
+
+- Correct post handler placement for short-instruction patching
+  When a short instruction was patched and multiple instructions executed out of
+  line, the post handler now runs immediately after the patched instruction rather
+  than after the moved group.
+  + Fixed by: libpatch's commit 349ac927eb (shadow stack support)
+  + Date: 07/2025
+
+- Post handler for control-transfer through tainted pointers
+  When a call or jump instruction accesses a tainted pointer (e.g., an indirect call
+  through a pointer stored in tainted memory), a post handler is now enabled after
+  executing the instruction out of line.
+  + Fixed by: libpatch's commit 6296555f (AROUND execution model for branching)
+  + Date: 07/2025

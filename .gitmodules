@@ -1,0 +1,6 @@
+[submodule "external/libolx"]
+	path = external/libolx
+	url = https://git.sr.ht/~old/libolx
+[submodule "external/libpatch"]
+	path = external/libpatch
+	url = https://git.sr.ht/~old/libpatch
