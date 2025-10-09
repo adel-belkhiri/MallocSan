@@ -48,30 +48,45 @@ static void patch_handler(struct patch_exec_context *ctx, uint8_t post)
 	}
 }
 
-/*
- * This function patches one address. It returns the strategy that finally
- * worked, or DW_PATCH_UNKNOWN on failure.
- */
-static enum dw_strategies patch_one_location(struct insn_entry *entry,
-		enum dw_strategies patch_strategy,
-		dw_patch_probe handler,
-		bool deferred)
+static inline const char *strategy_name(enum dw_strategies s)
 {
-	enum dw_strategies fallback = (patch_strategy == DW_PATCH_JUMP) ?
-								   DW_PATCH_TRAP :
-								   DW_PATCH_UNKNOWN;
+	switch (s) {
+		case DW_PATCH_TRAP: return "TRAP";
+		case DW_PATCH_JUMP: return "JUMP";
+		case DW_PATCH_MIXED: return "MIXED";
+		default: return "UNKNOWN";
+	}
+}
 
-	// First attempt with the chosen strategy
-	if (dw_instruction_entry_patch(entry, patch_strategy, handler, deferred))
-		return patch_strategy;
+/*
+ * This function patches an instruction and returns the strategy that finally worked,
+ * or exit on failure.
+ */
+static enum dw_strategies do_patch(struct insn_entry *entry, enum dw_strategies strategy,
+								   dw_patch_probe handler, bool is_deferred)
+{
+	const char *patch_type = is_deferred ? "deferred" : "initial";
+	uintptr_t patch_addr = is_deferred ? entry->next_insn : entry->insn;
+	enum dw_strategies chosen_strategy = DW_PATCH_UNKNOWN;
 
-	// Second attempt with the fallback strategy if the chosen strategy is jump
-	if (fallback != DW_PATCH_UNKNOWN &&
-		dw_instruction_entry_patch(entry, fallback, handler, deferred))
-		return fallback;
+	const enum dw_strategies fallback_strategy =
+				(strategy == DW_PATCH_JUMP) ? DW_PATCH_TRAP : DW_PATCH_UNKNOWN;
 
-	// Patch failed!
-	return DW_PATCH_UNKNOWN;
+	if (dw_instruction_entry_patch(entry, strategy, handler, is_deferred)) {
+		chosen_strategy = strategy;
+	} else if (fallback_strategy != DW_PATCH_UNKNOWN) {
+		if (dw_instruction_entry_patch(entry, fallback_strategy, handler, is_deferred))
+			chosen_strategy = fallback_strategy;
+	}
+
+	if (chosen_strategy == DW_PATCH_UNKNOWN)
+		dw_log(ERROR, MAIN, "Patching %s location 0x%llx failed (origin 0x%llx).\n",
+			   patch_type, patch_addr, entry->insn);
+
+	dw_log(INFO, MAIN, "Successfully patched %s site 0x%llx with %s strategy.\n",
+		   patch_type, patch_addr, strategy_name(chosen_strategy));
+
+	return chosen_strategy;
 }
 
 /*
@@ -115,24 +130,22 @@ void signal_protected(int sig, siginfo_t *info, void *context)
 	dw_log(INFO, MAIN, "Created entry for instruction 0x%llx\n", entry->insn);
 
 	/*
-	 * Here we want to patch all instructions accessing protected pointers.
-	 * If we cannot install the patch, we fall back to the olx buffer
-	 * strategy.
+	 * Here we patch the instruction that involves tainted registers. If the post-handler
+	 * is deferred, we also patch the deferred location. If we cannot install a patch with
+	 * a given strategy, we fall back to the trap strategy.
 	 */
 
-	// Patch the faulting instruction
-	enum dw_strategies chosen_strategy =
-					patch_one_location(entry, dw_strategy, patch_handler, false);
+	entry->strategy = do_patch(entry, dw_strategy, patch_handler, false);
 
-	if (chosen_strategy == DW_PATCH_UNKNOWN)
-		dw_log(ERROR, MAIN, "Patch failed for instruction 0x%llx\n", entry->insn);
+	if (entry->post_handler && entry->deferred_post_handler) {
+		if (entry->strategy != do_patch(entry, dw_strategy, patch_handler, true))
+			entry->strategy = DW_PATCH_MIXED;
+	}
 
-	entry->strategy = (chosen_strategy == dw_strategy) ? dw_strategy : chosen_strategy;
-
-	dw_log(WARNING, MAIN,
-		   "Successfully patched 0x%llx (Post-handler: %d, Deferred: %s, Strategy: %d)\n",
-		   entry->insn, entry->post_handler, entry->deferred_post_handler ? "Yes" : "No",
-		   (int) entry->strategy);
+	dw_log(INFO, MAIN,
+		"Patch summary for 0x%llx: Post-handler: %s, Deferred: %s, Strategy: %s\n",
+		entry->insn, entry->post_handler ? "Yes" : "No", entry->deferred_post_handler ? "Yes" : "No",
+		strategy_name(entry->strategy));
 
 	// We return and it will trap again, but this time libpatch will call
 	// the patch_handler

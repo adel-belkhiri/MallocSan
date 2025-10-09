@@ -14,7 +14,7 @@
 #define MAX_MOD_REG 6
 #define MAX_SCAN_INST_COUNT 32
 
-enum dw_strategies {DW_PATCH_TRAP=0, DW_PATCH_JUMP, DW_PATCH_UNKNOWN};
+enum dw_strategies {DW_PATCH_TRAP=0, DW_PATCH_JUMP, DW_PATCH_MIXED, DW_PATCH_UNKNOWN};
 
 /*
  * The instruction table contains all the information about the instructions
