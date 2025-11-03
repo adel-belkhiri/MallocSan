@@ -157,7 +157,8 @@ int dw_is_protected_index(const void *ptr)
 void *dw_malloc_protect(size_t size)
 {
 	void *result = __libc_malloc(size);
-	result = dw_protect(result, size);
+	if (result != NULL)
+		result = dw_protect(result, size);
 	return result;
 }
 
@@ -185,6 +186,7 @@ void dw_free_protect(void *ptr)
 void *dw_memalign_protect(size_t alignment, size_t size)
 {
 	void *result = __libc_memalign(alignment, size);
-	result = dw_protect(result, size);
+	if (result != NULL)
+		result = dw_protect(result, size);
 	return result;
 }

@@ -398,12 +398,21 @@ void *malloc(size_t size)
  */
 void *realloc(void *ptr, size_t size)
 {
+	if (ptr == NULL)
+		return malloc2(size, __builtin_return_address(0));
+
 	void *ret = malloc2(size, __builtin_return_address(0));
-	if (ptr != NULL) {
-		size_t old_size = dw_get_size(ptr);
-		memcpy(ret, ptr, old_size < size ? old_size : size);
-		free(ptr);
-	}
+	if (ret == NULL)
+		return NULL;
+
+	size_t old_size = dw_get_size(ptr);
+	size_t copy_size = old_size < size ? old_size : size;
+
+	void *dst = dw_unprotect(ret);
+	void *src = dw_unprotect(ptr);
+	memcpy(dst, src, copy_size);
+
+	free(ptr);
 	return ret;
 }
 
@@ -441,6 +450,7 @@ void *memalign(size_t alignment, size_t size)
 void *calloc(size_t nmemb, size_t size)
 {
 	void *ret = malloc2(nmemb * size, __builtin_return_address(0));
-	bzero(ret, nmemb * size);
+	if (ret != NULL)
+		bzero(ret, nmemb * size);
 	return ret;
 }
