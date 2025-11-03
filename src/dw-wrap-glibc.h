@@ -1,6 +1,9 @@
 #ifndef DW_WRAP_GLIBC_H
 #define DW_WRAP_GLIBC_H
 
+#include <signal.h>
+#include <stdbool.h>
+
 size_t dw_strlen(const char *s);
 
 /*
@@ -23,6 +26,8 @@ size_t dw_strlen(const char *s);
 extern int dw_init_stubs;
 
 void dw_init_syscall_stubs();
+int dw_libc_sigaction(int signum, const struct sigaction *act);
+bool dw_sigaction_get_saved(int signum, struct sigaction *sa);
 
 #define dw_sin()                       \
 	bool sin_save = dw_protect_active; \

@@ -13,6 +13,7 @@
 #include "dw-disassembly.h"
 #include "dw-log.h"
 #include "dw-protect.h"
+#include "dw-wrap-glibc.h"
 
 /* Number of instructions accessing tainted pointers that we can track. */
 static size_t nb_insn_olx_entries = 30000;
@@ -90,6 +91,46 @@ static enum dw_strategies do_patch(struct insn_entry *entry, enum dw_strategies 
 }
 
 /*
+ * Forward a signal to any previously installed handler.
+ *
+ * Some runtimes (e.g., Fortran) may have installed their own handlers. Therefore, the role
+ * of this function is to forward the signal to one of them.
+ */
+static void forward_to_saved_handler(int sig, siginfo_t *info, void *uctx)
+{
+	struct sigaction saved;
+
+	if (!dw_sigaction_get_saved(sig, &saved))
+		return;
+
+	/* If the handler expects the 3-argument form */
+	if ((saved.sa_flags & SA_SIGINFO) &&
+		saved.sa_sigaction != NULL &&
+		saved.sa_sigaction != (void *)SIG_DFL &&
+		saved.sa_sigaction != (void *)SIG_IGN)
+	{
+		saved.sa_sigaction(sig, info, uctx);
+		return;
+	}
+
+	/* Otherwise fall back to the classic one-argument handler */
+	sighandler_t handler = saved.sa_handler;
+
+	if (handler == SIG_IGN || handler == NULL)
+		return;
+
+	if (handler == SIG_DFL)
+	{
+		/* Hand control back to the kernel’s default behaviour */
+		dw_libc_sigaction(sig, &saved);
+		raise(sig);
+		return;
+	}
+
+	handler(sig);
+}
+
+/*
  * A protected object was presumably accessed, raising a signal (SIGSEGV or SIGBUS)
  */
 void signal_protected(int sig, siginfo_t *info, void *context)
@@ -127,6 +168,14 @@ void signal_protected(int sig, siginfo_t *info, void *context)
 
 	// New address, create an entry in the table
 	entry = dw_create_instruction_entry(insn_table, fault_insn, &next_insn, uctx);
+	if (entry == NULL) {
+		// The faulting instruction does not have any tainted pointers as operands. Therefore, we
+		// forward the signal to the previously saved handler (if there is any).
+		dw_protect_active = save_active;
+		forward_to_saved_handler(sig, info, context);
+		return;
+	}
+
 	dw_log(INFO, MAIN, "Created entry for instruction 0x%llx\n", entry->insn);
 
 	/*

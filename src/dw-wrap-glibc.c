@@ -30,6 +30,8 @@
 #include "dw-protect.h"
 #include "dw-wrap-glibc.h"
 
+extern void signal_protected(int sig, siginfo_t *info, void *context);
+
 /*
  * We wrap all important calls to glibc to insure that pointers are checked and
  * unprotected before being used internally in glibc or passed to system calls.
@@ -133,6 +135,7 @@ static void* (*libc_memmove_chk)(void *dest, const void *src, size_t len, size_t
 static void* (*libc_mempcpy)(void *restrict dest, const void *restrict src, size_t n);
 static void* (*libc_memset)(void *s, int c, size_t n);
 static void* (*libc_memset_chk)(void *s, int c, size_t n, size_t destlen);
+static int (*libc_sigaction)(int signum, const struct sigaction *act, struct sigaction *oldact);
 static char* (*libc_strcpy)(char *restrict dest, const char *src);
 static void* (*libc_strcpy_chk)(void *dest, const void *src, size_t destlen);
 static char* (*libc_strcat)(char *restrict dest, const char *src);
@@ -158,6 +161,13 @@ static int (*libc_execve)(const char *pathname, char *const argv[], char *const 
 static int (*libc_execv)(const char *pathname, char *const argv[]);
 static int (*libc_execvp)(const char *file, char *const argv[]);
 static int (*libc_execvpe)(const char *file, char *const argv[], char *const envp[]);
+
+static struct sigaction saved_sigsegv;
+static bool saved_sigsegv_valid = false;
+static struct sigaction saved_sigbus;
+static bool saved_sigbus_valid = false;
+static struct sigaction saved_sigtrap;
+static bool saved_sigtrap_valid = false;
 
 int dw_init_stubs = 0;
 // size_t (*dw_strlen)(const char *s);
@@ -212,6 +222,7 @@ void dw_init_syscall_stubs()
 	libc_mempcpy = dlsym_check(RTLD_NEXT, "mempcpy");
 	libc_memset = dlsym_check(RTLD_NEXT, "memset");
 	libc_memset_chk = dlsym_check(RTLD_NEXT, "__memset_chk");
+	libc_sigaction = dlsym_check(RTLD_NEXT, "sigaction");
 	libc_strcpy = dlsym_check(RTLD_NEXT, "strcpy");
 	libc_strcpy_chk = dlsym_check(RTLD_NEXT, "__strcpy_chk");
 	libc_strcat = dlsym_check(RTLD_NEXT, "strcat");
@@ -242,6 +253,162 @@ void dw_init_syscall_stubs()
 /* Make it shorter, every function calls those */
 #define sin() dw_sin()
 #define sout() dw_sout()
+
+/*
+ * Some applications and runtime environments (e.g., Fortran) might set their
+ * own signal handlers. Therefore, we wrap glibc sigaction and signal functions to
+ * prevent the overwriting of MallocSan's handlers (i.e., SIGSEGV, SIGBUS, and SIGTRAP),
+ * which are critical for its operation.
+ */
+static inline bool monitor_signal(int signum)
+{
+	return signum == SIGSEGV || signum == SIGBUS || signum == SIGTRAP;
+}
+
+static inline void pick_saved(int signum, struct sigaction **saved, bool **valid)
+{
+	switch (signum)
+	{
+	case SIGSEGV:
+		*saved = &saved_sigsegv;
+		*valid = &saved_sigsegv_valid;
+		break;
+
+	case SIGBUS:
+		*saved = &saved_sigbus;
+		*valid = &saved_sigbus_valid;
+		break;
+
+	case SIGTRAP:
+		*saved = &saved_sigtrap;
+		*valid = &saved_sigtrap_valid;
+		break;
+
+	default:
+		// We should not be here!
+		*saved = NULL;
+		*valid = NULL;
+	}
+}
+
+bool dw_sigaction_get_saved(int signum, struct sigaction *sa)
+{
+	struct sigaction *saved;
+	bool *valid;
+
+	if (!monitor_signal(signum))
+		return false;
+
+	pick_saved(signum, &saved, &valid);
+	if (!*valid)
+		return false;
+
+	*sa = *saved;
+	return true;
+}
+
+int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
+{
+	sin();
+
+	if (!monitor_signal(signum)) {
+		int ret = libc_sigaction(signum, act, oldact);
+		sout();
+		return ret;
+	}
+
+	struct sigaction *saved;
+	bool *valid;
+	pick_saved(signum, &saved, &valid);
+
+	// If act is NULL, we just return the old action as info
+	if (oldact != NULL) {
+		if (*valid) {
+			*oldact = *saved;
+		} else {
+			memset(oldact, 0, sizeof(*oldact));
+			oldact->sa_handler = SIG_DFL;
+			sigemptyset(&oldact->sa_mask);
+		}
+	}
+
+	if (act == NULL) {
+		sout();
+		return 0;
+	}
+
+	// If the signal is SIGTRAP, we allow setting it only once
+	if (signum == SIGTRAP) {
+		if (!*valid || act->sa_sigaction == saved->sa_sigaction ||
+		    (void (*)(int)) act->sa_handler == (void (*)(int)) saved->sa_handler) {
+			*saved = *act;
+			*valid = true;
+			int ret = libc_sigaction(signum, act, NULL);
+			sout();
+			return ret;
+		}
+
+		dw_log(WARNING, WRAP, "Blocked attempt to overwrite the SIGTRAP handler\n");
+		int ret = libc_sigaction(signum, saved, NULL);
+		sout();
+		return ret;
+	}
+
+	// If the action carries out our SIGSEGV and SIGBUS handlers, we let it pass through
+	if (act->sa_sigaction == signal_protected ||
+	    (void (*)(int)) act->sa_handler == (void (*)(int)) signal_protected) {
+		int ret = libc_sigaction(signum, act, NULL);
+		sout();
+		return ret;
+	}
+
+	// Otherwise, we save the new handler and replace it with our protected one
+	if (!*valid) {
+		*saved = *act;
+		*valid = true;
+	}
+
+	dw_log(WARNING, WRAP,
+		    "Blocked attempt to overwrite MallocSan %s handler\n", signum == SIGSEGV ? "SIGSEGV" : "SIGBUS");
+
+	struct sigaction replacement = *act;
+	replacement.sa_sigaction = signal_protected;
+	replacement.sa_handler = (void (*)(int)) signal_protected;
+	replacement.sa_flags |= SA_SIGINFO;
+
+	int ret = libc_sigaction(signum, &replacement, NULL);
+	sout();
+	return ret;
+}
+
+sighandler_t signal(int signum, sighandler_t handler)
+{
+	struct sigaction act;
+	struct sigaction oldact;
+
+	memset(&act, 0, sizeof(act));
+	act.sa_handler = handler;
+	sigemptyset(&act.sa_mask);
+
+#ifdef SA_RESTART
+	act.sa_flags = SA_RESTART;
+#else
+	act.sa_flags = 0;
+#endif
+
+	if (sigaction(signum, &act, &oldact) < 0)
+		return SIG_ERR;
+
+	return oldact.sa_handler;
+}
+
+int dw_libc_sigaction(int signum, const struct sigaction *act)
+{
+	sin();
+	int ret = libc_sigaction(signum, act, NULL);
+	sout();
+	return ret;
+}
 
 /*
  * For each tainted pointer passed to a wrapper, we could eventually check if it

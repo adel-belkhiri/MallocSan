@@ -611,13 +611,16 @@ dw_create_instruction_entry(instruction_table *table,
 	}
 
 	unsigned nb_protected = fill_instruction_operands(entry, table->handle, x86, uctx);
-	if (nb_protected == 0)
-		dw_log(ERROR, DISASSEMBLY,
+	if (nb_protected == 0) {
+		dw_log(WARNING, DISASSEMBLY,
 			   "Instruction 0x%llx generated a fault but no protected memory argument\n",
 			   entry->insn);
-	else if (nb_protected > 1)
-		dw_log(WARNING, DISASSEMBLY,
-			   "Instruction 0x%llx accesses more than one protected object\n",
+		bzero((void *)entry, sizeof(struct insn_entry));
+		return NULL;
+	}
+
+	if (nb_protected > 1)
+		dw_log(WARNING, DISASSEMBLY, "Instruction 0x%llx accesses more than one protected object\n",
 			   entry->insn);
 
 	bool need_immediate_reprotection = false;
