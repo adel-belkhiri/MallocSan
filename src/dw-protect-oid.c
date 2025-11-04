@@ -55,13 +55,13 @@ int dw_check_access(const void *ptr, size_t size)
 	if (oid == 0) return 0;
 
 	if (oid > (oids_size - 1) || oids[oid].base_addr == 0) {
-		dw_log(PROTECT, WARNING, "Invalid taint value %u for %p\n", oid, ptr);
+		dw_log(WARNING, PROTECT, "Invalid taint value %u for %p\n", oid, ptr);
 		return 1;
 	}
 
 	if (real_addr < oids[oid].base_addr ||
 		real_addr + size > oids[oid].base_addr + oids[oid].size) {
-		dw_log(ERROR, PROTECT, "Invalid access (%x)%p size %d not between %p and %p\n",
+		dw_log(ERROR, PROTECT, "Invalid access (oid %x): %p size %d not between %p and %p\n",
 			   oid, real_addr, size, oids[oid].base_addr,
 			   oids[oid].base_addr + oids[oid].size);
 		return 1;
@@ -77,7 +77,7 @@ size_t dw_get_size(void *ptr)
 		return malloc_usable_size(ptr);
 
 	if (oid > oids_size - 1 || oids[oid].base_addr == 0) {
-		dw_log(PROTECT, WARNING, "Invalid taint value %u for %p\n", oid, ptr);
+		dw_log(WARNING, PROTECT, "Invalid taint value %u for %p\n", oid, ptr);
 		return 0;
 	}
 	return oids[oid].size;
@@ -170,7 +170,7 @@ void dw_free_protect(void *ptr)
 	unsigned oid = (uintptr_t) ptr >> 48;
 	if (oid != 0) {
 		if (oid > oids_size - 1 || oids[oid].base_addr == 0)
-			dw_log(PROTECT, WARNING, "Invalid taint value %u for %p\n", oid, ptr);
+			dw_log(WARNING, PROTECT, "Invalid taint value %u for %p\n", oid, ptr);
 		else {
 			oids[oid].size = oids_head;
 			oids[oid].base_addr = NULL;
