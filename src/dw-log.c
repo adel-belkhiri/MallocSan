@@ -15,15 +15,15 @@ char* dw_log_level_name[] = {"ERROR", "WARNING", "INFO", "DEBUG"};
 struct dw_log_category {
 	char *name;
 	int active;
-	int level;
+	enum dw_log_level level;
 	int backtrace_level;
 };
 
 struct dw_log_category dw_log_categories[] = {
-	{"protect", 1, 2, 1},
-	{"disassembly", 1, 2, 1},
-	{"main", 1, 2, 1},
-	{"wrap", 1, 2, 1}
+	{"protect", 1, ERROR, 1},
+	{"disassembly", 1, ERROR, 1},
+	{"main", 1, ERROR, 1},
+	{"wrap", 1, ERROR, 1}
 };
 
 // We call directly write to avoid the wrappers.
@@ -140,9 +140,9 @@ void dw_fprintf(int fd, const char *fmt, ...)
  */
 void dw_set_log_level(enum dw_log_level level)
 {
-	if (level < 0)
+	if (level < ERROR || level > DEBUG)
 		return;
 
-	for (int i = 0; i < WRAP; i++)
+	for (int i = 0; i < (sizeof(dw_log_categories) / sizeof(dw_log_categories[0])); i++)
 		dw_log_categories[i].level = level;
 }
