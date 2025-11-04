@@ -26,6 +26,7 @@
 #include <wchar.h>
 
 #include "dw-log.h"
+#include "dw-printf.h"
 #include "dw-protect.h"
 #include "dw-wrap-glibc.h"
 
@@ -422,8 +423,6 @@ int dw_libc_sigaction(int signum, const struct sigaction *act)
 
 size_t strlen(const char *s) { sin(); size_t ret = libc_strlen(dw_unprotect((void *)s)); dw_reprotect((void *)s); sout(); return ret; }
 
-#include "dw-printf.h"
-
 static inline void fputc_wrapper(char c, void *extra_arg)
 {
 	FILE *fp = (FILE *) extra_arg;
@@ -463,11 +462,23 @@ int dprintf(int fd, const char *format, ...)
 	return ret;
 }
 
+int __printf_chk(int flag, const char *format, ...)
+{
+	va_list arg;
+	va_start(arg, format);
+	const int ret = vfctprintf(fputc_wrapper, (void *) stdout, format, arg);
+	va_end(arg);
+	return ret;
+}
+
+extern int dw_vsnprintf(char *restrict s, size_t n, const char *restrict fmt, va_list ap)
+    __asm__("vsnprintf");
+
 int __sprintf_chk(char *s, int flag, size_t os, const char *fmt, ...)
 {
 	va_list arg;
 	va_start(arg, fmt);
-	const int ret = vsnprintf(s, os, fmt, arg);
+	const int ret = dw_vsnprintf(s, os, fmt, arg);
 	va_end(arg);
 	return ret;
 }
@@ -476,9 +487,16 @@ int __snprintf_chk(char *s, size_t maxlen, int flag, size_t os, const char *fmt,
 {
 	va_list arg;
 	va_start(arg, fmt);
-	const int ret = vsnprintf(s, os, fmt, arg);
+	const int ret = dw_vsnprintf(s, os, fmt, arg);
 	va_end(arg);
 	return ret;
+}
+
+int __vsnprintf_chk(char *s, size_t maxlen, int flag, size_t os, const char *fmt, va_list ap)
+{
+	if (os == (size_t) -1 || os > maxlen)
+		os = maxlen;
+	return dw_vsnprintf(s, os, fmt, ap);
 }
 
 int vfprintf(FILE *restrict stream, const char *restrict format, va_list arg)
