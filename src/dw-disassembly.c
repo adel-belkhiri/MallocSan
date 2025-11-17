@@ -177,6 +177,25 @@ static inline bool similar_memory_access(const cs_x86_op *arg,
 #define UNW_LOCAL_ONLY
 #include <libunwind.h>
 
+static bool get_function_bounds(uintptr_t ip, uintptr_t *start, uintptr_t *end)
+{
+	if (!start || !end)
+		return false;
+
+	unw_proc_info_t pi;
+	int ret = unw_get_proc_info_by_ip(unw_local_addr_space, (unw_word_t)ip, &pi, NULL);
+	if (ret != 0)
+		return false;
+
+	*start = (uintptr_t)pi.start_ip;
+	*end = (uintptr_t)pi.end_ip;
+
+	if (*start == 0 || *end == 0 || *end <= *start)
+		return false;
+
+	return true;
+}
+
 /*
  * Check if we can defer the installation of post-handler and if this is the
  * case returns the address where the post-handler should be installed
@@ -193,17 +212,36 @@ static uintptr_t dw_defer_post_handler(instruction_table *table,
 	uint64_t last_safe_addr        = instr_addr;
 	uint64_t last_same_access_addr = 0; /* address of last identical memory access   */
 	unsigned count_innocuous_inst  = 0, count_same_access = 0, pending_same_access = 0;
-	size_t buff_size = MAX_SCAN_INST_COUNT * 15;
+	size_t buff_size;
 	unsigned n = 0;
 	int error_code;
 
-	while (n < MAX_SCAN_INST_COUNT) {
+
+	uintptr_t func_start = 0, func_end = 0;
+	size_t max_bytes = (size_t)MAX_SCAN_INST_COUNT * 15;
+
+
+	if (get_function_bounds(start_addr, &func_start, &func_end) && func_end > start_addr) {
+		size_t func_bytes_left = (size_t)(func_end - start_addr);
+		buff_size = func_bytes_left < max_bytes ? func_bytes_left : max_bytes;
+	} else {
+		// Fallback if libunwind can't provide bounds (keep your existing cap)
+		buff_size = max_bytes;
+		dw_log(WARNING, DISASSEMBLY,
+			   "Cannot get function bounds for address 0x%llx, using max scan size %lu\n",
+			   start_addr, buff_size);
+	}
+
+	while (n < MAX_SCAN_INST_COUNT && buff_size > 0) {
 		bool success = cs_disasm_iter(table->handle, &code, &buff_size, &instr_addr,
 								   table->insn);
 		if (!success) {
 			error_code = cs_errno(table->handle);
-			dw_log(ERROR, DISASSEMBLY, "Capstone cannot decode instruction 0x%llx, error %d\n",
-				   instr_addr, error_code);
+			if (error_code != CS_ERR_OK)
+				dw_log(ERROR, DISASSEMBLY, "Capstone cannot decode instruction 0x%llx, error %d\n",
+					    instr_addr, error_code);
+
+			goto stop_return;   // End of buffer
 		}
 
 		cs_insn *insn = table->insn;
