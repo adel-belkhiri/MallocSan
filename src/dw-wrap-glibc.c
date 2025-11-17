@@ -20,6 +20,7 @@
 #include <sys/mman.h>
 #include <sys/param.h>
 #include <sys/user.h>
+#include <sys/stat.h>
 #include <sys/vfs.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -99,6 +100,7 @@ static int (*libc_fputs)(const char *restrict s, FILE *restrict stream);
 static int (*libc_puts)(const char *s);
 static size_t (*libc_strlen)(const char *s);
 static int (*libc_open)(const char *pathname, int flags, ...);
+static int (*libc_open64)(const char *pathname, int flags, ...);
 static int (*libc_openat)(int dirfd, const char *pathname, int flags, ...);
 static int (*libc_creat)(const char *pathname, mode_t mode);
 static int (*libc_access)(const char *pathname, int mode);
@@ -108,8 +110,12 @@ static int (*libc_stat)(const char *restrict pathname, struct stat *restrict sta
 static int (*libc_fstat)(int fd, struct stat *statbuf);
 static int (*libc_lstat)(const char *restrict pathname, struct stat *restrict statbuf);
 static int (*libc_fstatat)(int dirfd, const char *restrict pathname, struct stat *restrict statbuf, int flags);
+static int (*libc_stat64)(const char *restrict pathname, struct stat64 *restrict statbuf);
+static int (*libc_fstat64)(int fd, struct stat64 *statbuf);
 static size_t (*libc_fread)(void *ptr, size_t size, size_t nmemb, FILE *stream);
 static size_t (*libc_fwrite)(const void *ptr, size_t size, size_t nmemb, FILE *stream);
+static FILE* (*libc_fopen)(const char *restrict pathname, const char *restrict mode);
+static FILE* (*libc_fopen64)(const char *restrict pathname, const char *restrict mode);
 static ssize_t (*libc_pread)(int fd, void *buf, size_t count, off_t offset);
 static ssize_t (*libc_pwrite)(int fd, const void *buf, size_t count, off_t offset);
 static ssize_t (*libc_read)(int fd, void *buf, size_t count);
@@ -189,6 +195,7 @@ void dw_init_syscall_stubs()
 	libc_fputs = dlsym_check(RTLD_NEXT, "fputs");
 	libc_puts = dlsym_check(RTLD_NEXT, "puts");
 	libc_open = dlsym_check(RTLD_NEXT, "open");
+	libc_open64 = dlsym_check(RTLD_NEXT, "open64");
 	libc_openat = dlsym_check(RTLD_NEXT, "openat");
 	libc_creat = dlsym_check(RTLD_NEXT, "creat");
 	libc_access = dlsym_check(RTLD_NEXT, "access");
@@ -198,8 +205,12 @@ void dw_init_syscall_stubs()
 	libc_fstat = dlsym_check(RTLD_NEXT, "fstat");
 	libc_lstat = dlsym_check(RTLD_NEXT, "lstat");
 	libc_fstatat = dlsym_check(RTLD_NEXT, "fstatat");
+	libc_stat64 = dlsym_check(RTLD_NEXT, "stat64");
+	libc_fstat64 = dlsym_check(RTLD_NEXT, "fstat64");
 	libc_fread = dlsym_check(RTLD_NEXT, "fread");
 	libc_fwrite = dlsym_check(RTLD_NEXT, "fwrite");
+	libc_fopen = dlsym_check(RTLD_NEXT, "fopen");
+	libc_fopen64 = dlsym_check(RTLD_NEXT, "fopen64");
 	libc_pread = dlsym_check(RTLD_NEXT, "pread");
 	libc_pwrite = dlsym_check(RTLD_NEXT, "pwrite");
 	libc_read = __read; // dlsym_check(RTLD_NEXT, "read");
@@ -511,6 +522,40 @@ int vdprintf(int fd, const char *restrict format, va_list arg)
 	return vfctprintf(dputc_wrapper, (void *) ((uintptr_t) fd), format, arg);
 }
 
+int vasprintf(char **strp, const char *format, va_list ap)
+{
+	sin();
+
+	char **nstrp = (char **)dw_untaint((void *)strp);
+	dw_check_access((void *)strp, sizeof(*strp));
+
+	va_list ap2;
+	va_copy(ap2, ap);
+	int len = dw_vsnprintf(NULL, 0, format, ap2);
+	va_end(ap2);
+
+	if (len < 0)
+	{
+		*nstrp = NULL;
+		sout();
+		return -1;
+	}
+
+	char *buf = (char *)__libc_malloc((size_t)len + 1);
+	if (buf == NULL)
+	{
+		*nstrp = NULL;
+		sout();
+		return -1;
+	}
+
+	(void)dw_vsnprintf(buf, (size_t)len + 1, format, ap);
+	*nstrp = buf;
+
+	sout();
+	return len;
+}
+
 char *strchr(const char *s, int c) { sin(); char *ns = dw_untaint((void *)s); dw_check_access((void *)s, libc_strlen(ns) + 1); char *ret = libc_strchr(ns, c); sout(); if(ret == NULL) return ret; return (char *)dw_retaint(ret, s); }
 char *strrchr(const char *s, int c) { sin(); char *ns = dw_untaint((void *)s); dw_check_access((void *)s, libc_strlen(ns) + 1); char *ret = libc_strrchr(ns, c); sout(); if(ret == NULL) return ret; return (char *)dw_retaint(ret, s); }
 int strcmp(const char *s1, const char *s2) { sin(); char *ns1 = dw_untaint((void *)s1); dw_check_access((void *)s1, libc_strlen(ns1) + 1); char *ns2 = dw_untaint((void *)s2); dw_check_access((void *)s2, libc_strlen(ns2) + 1); int ret = libc_strcmp(ns1, ns2); sout(); return ret; }
@@ -538,6 +583,57 @@ int open(const char *pathname, int flags, ...)
 	return ret;
 }
 
+
+int open64(const char *pathname, int flags, ...)
+{
+	sin();
+	mode_t mode = 0;
+	if (__OPEN_NEEDS_MODE(flags))
+	{
+		va_list arg;
+		va_start(arg, flags);
+		mode = va_arg(arg, mode_t);
+		va_end(arg);
+	}
+	char *npathname = dw_untaint((void *)pathname);
+	dw_check_access((void *)pathname, libc_strlen(npathname) + 1);
+	int ret;
+	if (libc_open64)
+		ret = libc_open64(npathname, flags, mode);
+	else
+		ret = libc_open(npathname, flags, mode);
+	sout();
+	return ret;
+}
+
+FILE *fopen(const char *restrict pathname, const char *restrict mode)
+{
+	sin();
+	char *npathname = dw_untaint((void *)pathname);
+	dw_check_access((void *)pathname, libc_strlen(npathname) + 1);
+	char *nmode = dw_untaint((void *)mode);
+	dw_check_access((void *)mode, libc_strlen(nmode) + 1);
+	FILE *ret = libc_fopen ? libc_fopen(npathname, nmode) : NULL;
+	sout();
+	return ret;
+}
+
+FILE *fopen64(const char *restrict pathname, const char *restrict mode)
+{
+	sin();
+	char *npathname = dw_untaint((void *)pathname);
+	dw_check_access((void *)pathname, libc_strlen(npathname) + 1);
+	char *nmode = dw_untaint((void *)mode);
+	dw_check_access((void *)mode, libc_strlen(nmode) + 1);
+	FILE *ret = NULL;
+	if (libc_fopen64)
+		ret = libc_fopen64(npathname, nmode);
+	else if (libc_fopen)
+		ret = libc_fopen(npathname, nmode);
+	sout();
+	return ret;
+}
+
 int openat(int dirfd, const char *pathname, int flags, ...)
 {
 	sin();
@@ -560,7 +656,9 @@ int access(const char *pathname, int mode) { sin(); char *npathname = dw_untaint
 char *getcwd(char *buf, size_t size) { sin(); char * nbuf = dw_untaint((void *)buf); dw_check_access((void *)buf, size); char *ret = libc_getcwd(nbuf, size); sout(); if(ret == nbuf) return buf; return ret; }
 ssize_t getrandom(void *buf, size_t buflen, unsigned int flags) { sin(); dw_check_access((void *)buf, buflen); ssize_t ret = libc_getrandom(dw_untaint(buf), buflen, flags); sout(); return ret; }
 int stat(const char *restrict pathname, struct stat *restrict statbuf) { sin(); char *npathname = dw_untaint((void *)pathname); dw_check_access((void *)pathname, libc_strlen(npathname) + 1); dw_check_access((void *)statbuf, sizeof(struct stat)); int ret = libc_stat(npathname, (struct stat *)dw_untaint((void *)statbuf)); sout(); return ret; }
+int stat64(const char *restrict pathname, struct stat64 *restrict statbuf) { sin(); char *npathname = dw_untaint((void *)pathname); dw_check_access((void *)pathname, libc_strlen(npathname) + 1); dw_check_access((void *)statbuf, sizeof(struct stat64)); int ret = libc_stat64 ? libc_stat64(npathname, (struct stat64 *)dw_untaint((void *)statbuf)) : libc_stat(npathname, (struct stat *)dw_untaint((void *)statbuf)); sout(); return ret; }
 int fstat(int fd, struct stat *statbuf) { sin(); dw_check_access((void *)statbuf, sizeof(struct stat)); int ret = libc_fstat(fd, (struct stat *)dw_untaint(statbuf)); sout(); return ret; }
+int fstat64(int fd, struct stat64 *statbuf) { sin(); dw_check_access((void *)statbuf, sizeof(struct stat64)); int ret = libc_fstat64 ? libc_fstat64(fd, (struct stat64 *)dw_untaint(statbuf)) : libc_fstat(fd, (struct stat *)dw_untaint(statbuf)); sout(); return ret; }
 int lstat(const char *restrict pathname, struct stat *restrict statbuf) { sin(); char *npathname = dw_untaint((void *)pathname); dw_check_access((void *)pathname, libc_strlen(npathname) + 1); dw_check_access((void *)statbuf, sizeof(struct stat)); int ret = libc_lstat(npathname, (struct stat *)dw_untaint((void *)statbuf)); sout(); return ret; }
 int fstatat(int dirfd, const char *restrict pathname, struct stat *restrict statbuf, int flags) { sin(); char *npathname = dw_untaint((void *)pathname); dw_check_access((void *)pathname, libc_strlen(npathname) + 1); dw_check_access((void *)statbuf, sizeof(struct stat)); int ret = libc_fstatat(dirfd, npathname, (struct stat *)dw_untaint((void *)statbuf), flags); sout(); return ret; }
 
