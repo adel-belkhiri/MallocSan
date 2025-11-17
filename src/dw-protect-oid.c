@@ -27,12 +27,19 @@ struct object_id {
 };
 
 /*
- * We have 2 unused bytes to store the object id. We are limited to less than
- * 2^16.
+ * We use the upper 2 bytes of the pointer to store an object ID (taint tag),
+ * so the ID is limited to a 16-bit value (< 2^16).
+ *
+ * The top bit of the tag (bit 15) must be 0 so that the resulting 64-bit
+ * value is not interpreted as a negative signed integer. This restricts
+ * valid tags to the range 0x0000–0x7FFF (2^15 possible values).
+ *
+ * We reserve tag 0 (0x0000) to mean "no taint", so we can use tags
+ * 0x0001–0x7FFF, i.e., up to 2^15 - 1 = 32767 distinct tainted IDs.
  */
-static const unsigned oids_size = 65000;
+static const unsigned oids_size = 32767;
 static unsigned oids_head = 0;
-static struct object_id oids[65000];
+static struct object_id oids[32767];
 
 /* Start without protecting objects, wait until libdw is fully initialized. */
 bool dw_protect_active = false;
@@ -47,16 +54,16 @@ void dw_protect_init()
 	oids[oids_size - 1].size = 0;
 }
 
-int dw_check_access(const void *ptr, size_t size)
+bool dw_check_access(const void *ptr, size_t size)
 {
 	unsigned oid = (uintptr_t) ptr >> 48;
 	void *real_addr = (void *) ((uintptr_t) ptr & untaint_mask);
 
-	if (oid == 0) return 0;
+	if (oid == 0) return true;
 
 	if (oid > (oids_size - 1) || oids[oid].base_addr == 0) {
 		dw_log(WARNING, PROTECT, "Invalid taint value %u for %p\n", oid, ptr);
-		return 1;
+		return false;
 	}
 
 	if (real_addr < oids[oid].base_addr ||
@@ -64,9 +71,9 @@ int dw_check_access(const void *ptr, size_t size)
 		dw_log(ERROR, PROTECT, "Invalid access (oid %x): %p size %d not between %p and %p\n",
 			   oid, real_addr, size, oids[oid].base_addr,
 			   oids[oid].base_addr + oids[oid].size);
-		return 1;
+		return false;
 	}
-	return 0;
+	return true;
 }
 
 size_t dw_get_size(void *ptr)
@@ -96,59 +103,70 @@ static void *dw_protect(void *ptr, size_t size)
 	unsigned next_head = oids[oids_head].size;
 	oids[oids_head].base_addr = ptr;
 	oids[oids_head].size = size;
-	void *result = (void *) ((uintptr_t) ptr | ((uintptr_t) oids_head) << 48);
+
+	uintptr_t p   = (uintptr_t)ptr & ~taint_mask;       // clear tag field
+	uintptr_t tag = (uintptr_t)oids_head << 48;
+
+	//void *result = (void *) ((uintptr_t) ptr | ((uintptr_t) oids_head) << 48);
+	void *result = (void *) (p | tag);
 	oids_head = next_head;
 	return result;
 }
 
 /*
- * This would be used with the mprotect method.
- */
-void dw_reprotect(const void *ptr)
-{
-}
-
-void *dw_untaint(const void *ptr)
-{
-	return (void *) ((uintptr_t) ptr & untaint_mask);
-}
-
-/*
  * Put back the taint on the modified (incremented) pointer.
  */
-void *dw_retaint(const void *ptr, const void *old_ptr)
+inline void *dw_reprotect(const void *ptr, const void *old_ptr)
 {
-	return (void *) ((uintptr_t) ptr | ((uintptr_t) old_ptr & taint_mask));
+	if (!ptr)
+		return NULL;
+
+	if ((uintptr_t)old_ptr & (1ULL << 63)) /*MSB*/
+		return (void*) ptr;
+
+	uintptr_t taint_bits = (uintptr_t) old_ptr & taint_mask;
+
+	// No taint to reapply
+	if (taint_bits == 0)
+		return (void *)ptr;
+
+	// Decode tag
+	uintptr_t oid = taint_bits >> 48;
+
+	if (oid >= oids_size || oids[oid].base_addr == 0) {
+		dw_log(ERROR, PROTECT, "Invalid taint bits %p from old pointer %p\n", (void *)taint_bits, old_ptr);
+		return (void *)ptr;
+	}
+
+	return (void *) (((uintptr_t) ptr & ~taint_mask) | ((uintptr_t) old_ptr & taint_mask));
 }
 
 /*
  * Remove the taint or mprotect.
  */
-void *dw_unprotect(const void *ptr)
+inline void *dw_unprotect(const void *ptr)
 {
+	if (!dw_is_protected(ptr))
+		return (void*) ptr;
+
 	return (void *) ((uintptr_t) ptr & untaint_mask);
 }
 
-/*
- * For now insure that it is the taint that we put, and not corruption.
- */
-int dw_is_protected(const void *ptr)
-{
-	uintptr_t taint = (uintptr_t) ptr >> 48;
-	if (taint == 0)
-		return 0;
-	return 1;
-}
 
-/*
- * For now insure that it is the taint that we put, and not corruption.
- */
-int dw_is_protected_index(const void *ptr)
+inline bool dw_is_protected(const void *ptr)
 {
-	uintptr_t taint = (uintptr_t) ptr >> 63;
-	if (taint == 0)
-		return dw_is_protected(ptr);
-	return 0;
+	if ((uintptr_t)ptr & (1ULL << 63)) /*MSB*/
+		return false;
+
+	unsigned oid = (uintptr_t) ptr >> 48;
+	if (oid == 0)
+		return false;
+
+	// Case of dangling freed object
+	//if (oid >= oids_size || oids[oid].base_addr == 0)
+	//	return false;
+
+	return true;
 }
 
 /*
@@ -177,7 +195,7 @@ void dw_free_protect(void *ptr)
 			oids_head = oid;
 		}
 	}
-	__libc_free(dw_untaint(ptr));
+	__libc_free(dw_unprotect(ptr));
 }
 
 /*

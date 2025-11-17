@@ -41,21 +41,9 @@ void *dw_protect(const void *ptr)
 }
 
 /*
- * This would be used with the mprotect method.
- */
-void dw_reprotect(const void *ptr)
-{
-}
-
-void *dw_untaint(const void *ptr)
-{
-	return (void *) ((uintptr_t) ptr & untaint_mask);
-}
-
-/*
  * Put back the taint on the modified (incremented) pointer.
  */
-void *dw_retaint(const void *ptr, const void *old_ptr)
+void *dw_reprotect(const void *ptr, const void *old_ptr)
 {
 	return (void *) ((uintptr_t) ptr | ((uintptr_t) old_ptr & taint_mask));
 }
@@ -79,19 +67,6 @@ int dw_is_protected(const void *ptr)
 
 	dw_log(WARNING, MAIN, "Taint should be 1, pointer %p\n", ptr);
 	return 1;
-}
-
-/*
- * For now insure that it is the taint that we put, and not corruption.
- */
-int dw_is_protected_index(const void *ptr)
-{
-	uintptr_t taint = (uintptr_t) ptr >> 63;
-
-	if (taint == 0)
-		return dw_is_protected(ptr);
-	else
-		return 0;
 }
 
 /*

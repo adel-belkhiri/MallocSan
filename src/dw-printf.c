@@ -1369,7 +1369,6 @@ static inline void format_string_loop(output_gadget_t* output, const char* forma
               putchar_via_gadget(output, ' ');
             }
           }
-          dw_reprotect((void *)orig_p);
         }
         format++;
         break;
@@ -1430,7 +1429,6 @@ static int vsnprintf_impl(output_gadget_t* output, const char* format, va_list a
   // termination
   append_termination_with_gadget(output);
 
-  dw_reprotect((void *)format);
   dw_sout();
 
   // return written chars without terminating \0
@@ -1452,13 +1450,12 @@ int vsnprintf_(char* s, size_t n, const char* format, va_list arg)
   output_gadget_t gadget = buffer_gadget((char *)dw_unprotect((void *)s), n);
   dw_check_access((void *)s, n);
   int ret = vsnprintf_impl(&gadget, format, arg);
-  dw_reprotect((void *)s);
   return ret;
 }
 
 int vsprintf_(char* s, const char* format, va_list arg)
 {
-  size_t n = __glibc_objsize((char *)dw_untaint((void *)s));
+  size_t n = __glibc_objsize((char *)dw_unprotect((void *)s));
   if(n > PRINTF_MAX_POSSIBLE_BUFFER_SIZE) n = PRINTF_MAX_POSSIBLE_BUFFER_SIZE;
   return vsnprintf_(s, n, format, arg);
 }

@@ -468,9 +468,9 @@ fill_instruction_operands(struct insn_entry *entry,
 			if (dw_is_protected((void *) base_addr)) {
 				nb_protected++;
 				entry->arg_m[arg_m].base_taint = base_addr;
-				if (dw_is_protected_index((void *) index_addr))
+				if (dw_is_protected((void *) index_addr))
 					dw_log(WARNING, DISASSEMBLY, "Both base and index registers are protected\n");
-			} else if (dw_is_protected_index((void *) index_addr)) {
+			} else if (dw_is_protected((void *) index_addr)) {
 				nb_protected++;
 				entry->arg_m[arg_m].index_taint = index_addr;
 			}
@@ -888,7 +888,7 @@ void dw_unprotect_context(struct patch_exec_context *ctx)
 			if (arg->base_taint == 0)
 				dw_log(INFO, DISASSEMBLY, "Newly tainted base for mem arg %d\n", i);
 
-			if (dw_is_protected_index((void *) valuei))
+			if (dw_is_protected((void *) valuei))
 				dw_log(WARNING, DISASSEMBLY, "Both index and base tainted for mem arg %d\n", i);
 
 			arg->base_taint = valueb;
@@ -904,7 +904,7 @@ void dw_unprotect_context(struct patch_exec_context *ctx)
 					   entry->insn, dw_get_reg_entry(regb)->name);
 		}
 
-		else if (dw_is_protected_index((void *) valuei)) {
+		else if (dw_is_protected((void *) valuei)) {
 			if (arg->index_taint == 0)
 				dw_log(INFO, DISASSEMBLY, "Newly tainted index for mem arg %d\n", i);
 
@@ -1032,7 +1032,7 @@ void dw_reprotect_context(struct patch_exec_context *ctx)
 			re = dw_get_reg_entry(reg);
 			value = dw_get_register(ctx, re->libpatch_index);
 			dw_set_register(ctx, re->libpatch_index,
-						   (uint64_t) dw_retaint((void *) value, (void *) arg->base_taint));
+						   (uint64_t) dw_reprotect((void *) value, (void *) arg->base_taint));
 		}
 
 		if (arg->index_taint && ((arg->index_access & CS_AC_WRITE) == 0)) {
@@ -1040,7 +1040,7 @@ void dw_reprotect_context(struct patch_exec_context *ctx)
 			re = dw_get_reg_entry(reg);
 			value = dw_get_register(ctx, re->libpatch_index);
 			dw_set_register(ctx, re->libpatch_index,
-						   (uint64_t) dw_retaint((void *) value, (void *) arg->index_taint));
+						   (uint64_t) dw_reprotect((void *) value, (void *) arg->index_taint));
 		}
 
 		/*
@@ -1074,7 +1074,7 @@ void dw_reprotect_context(struct patch_exec_context *ctx)
 					saved_taint = arg->index_taint;
 
 				*((void **) arg->saved_address) =
-					dw_retaint(*((void **) arg->saved_address), (void *) saved_taint);
+					dw_reprotect(*((void **) arg->saved_address), (void *) saved_taint);
 			}
 		}
 	}
