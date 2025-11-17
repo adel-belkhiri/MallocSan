@@ -96,12 +96,12 @@ static enum dw_strategies do_patch(struct insn_entry *entry, enum dw_strategies 
  * Some runtimes (e.g., Fortran) may have installed their own handlers. Therefore, the role
  * of this function is to forward the signal to one of them.
  */
-static void forward_to_saved_handler(int sig, siginfo_t *info, void *uctx)
+static bool forward_to_saved_handler(int sig, siginfo_t *info, void *uctx)
 {
 	struct sigaction saved;
 
 	if (!dw_sigaction_get_saved(sig, &saved))
-		return;
+		return false;
 
 	/* If the handler expects the 3-argument form */
 	if ((saved.sa_flags & SA_SIGINFO) &&
@@ -110,24 +110,25 @@ static void forward_to_saved_handler(int sig, siginfo_t *info, void *uctx)
 		saved.sa_sigaction != (void *)SIG_IGN)
 	{
 		saved.sa_sigaction(sig, info, uctx);
-		return;
+		return true;
 	}
 
 	/* Otherwise fall back to the classic one-argument handler */
 	sighandler_t handler = saved.sa_handler;
 
 	if (handler == SIG_IGN || handler == NULL)
-		return;
+		return false;
 
 	if (handler == SIG_DFL)
 	{
 		/* Hand control back to the kernel’s default behaviour */
 		dw_libc_sigaction(sig, &saved);
 		raise(sig);
-		return;
+		return true;
 	}
 
 	handler(sig);
+	return true;
 }
 
 /*
@@ -172,7 +173,10 @@ void signal_protected(int sig, siginfo_t *info, void *context)
 		// The faulting instruction does not have any tainted pointers as operands. Therefore, we
 		// forward the signal to the previously saved handler (if there is any).
 		dw_protect_active = save_active;
-		forward_to_saved_handler(sig, info, context);
+		if (!forward_to_saved_handler(sig, info, context))
+			dw_log(ERROR, MAIN,
+			    "Segfault on instruction (0x%llx) without protected memory arguments, no saved handler\n",
+			    fault_insn);
 		return;
 	}
 
