@@ -527,74 +527,6 @@ int vasprintf(char **strp, const char *format, va_list ap)
 {
 	sin();
 
-	char **nstrp = (char **)dw_untaint((void *)strp);
-	dw_check_access((void *)strp, sizeof(*strp));
-
-	va_list ap2;
-	va_copy(ap2, ap);
-	int len = dw_vsnprintf(NULL, 0, format, ap2);
-	va_end(ap2);
-
-	if (len < 0)
-	{
-		*nstrp = NULL;
-		sout();
-		return -1;
-	}
-
-	char *buf = (char *)__libc_malloc((size_t)len + 1);
-	if (buf == NULL)
-	{
-		*nstrp = NULL;
-		sout();
-		return -1;
-	}
-
-	(void)dw_vsnprintf(buf, (size_t)len + 1, format, ap);
-	*nstrp = buf;
-
-	sout();
-	return len;
-}
-
-int vasprintf(char **strp, const char *format, va_list ap)
-{
-	sin();
-
-	char **nstrp = (char **)dw_untaint((void *)strp);
-	dw_check_access((void *)strp, sizeof(*strp));
-
-	va_list ap2;
-	va_copy(ap2, ap);
-	int len = dw_vsnprintf(NULL, 0, format, ap2);
-	va_end(ap2);
-
-	if (len < 0)
-	{
-		*nstrp = NULL;
-		sout();
-		return -1;
-	}
-
-	char *buf = (char *)__libc_malloc((size_t)len + 1);
-	if (buf == NULL)
-	{
-		*nstrp = NULL;
-		sout();
-		return -1;
-	}
-
-	(void)dw_vsnprintf(buf, (size_t)len + 1, format, ap);
-	*nstrp = buf;
-
-	sout();
-	return len;
-}
-
-int vasprintf(char **strp, const char *format, va_list ap)
-{
-	sin();
-
 	char **nstrp = (char **)dw_unprotect((void *)strp);
 	dw_check_access((void *)strp, sizeof(*strp));
 
@@ -664,7 +596,7 @@ int open64(const char *pathname, int flags, ...)
 		mode = va_arg(arg, mode_t);
 		va_end(arg);
 	}
-	char *npathname = dw_untaint((void *)pathname);
+	char *npathname = dw_unprotect((void *)pathname);
 	dw_check_access((void *)pathname, libc_strlen(npathname) + 1);
 	int ret;
 	if (libc_open64)
@@ -678,9 +610,9 @@ int open64(const char *pathname, int flags, ...)
 FILE *fopen(const char *restrict pathname, const char *restrict mode)
 {
 	sin();
-	char *npathname = dw_untaint((void *)pathname);
+	char *npathname = dw_unprotect((void *)pathname);
 	dw_check_access((void *)pathname, libc_strlen(npathname) + 1);
-	char *nmode = dw_untaint((void *)mode);
+	char *nmode = dw_unprotect((void *)mode);
 	dw_check_access((void *)mode, libc_strlen(nmode) + 1);
 	FILE *ret = libc_fopen ? libc_fopen(npathname, nmode) : NULL;
 	sout();
@@ -690,9 +622,9 @@ FILE *fopen(const char *restrict pathname, const char *restrict mode)
 FILE *fopen64(const char *restrict pathname, const char *restrict mode)
 {
 	sin();
-	char *npathname = dw_untaint((void *)pathname);
+	char *npathname = dw_unprotect((void *)pathname);
 	dw_check_access((void *)pathname, libc_strlen(npathname) + 1);
-	char *nmode = dw_untaint((void *)mode);
+	char *nmode = dw_unprotect((void *)mode);
 	dw_check_access((void *)mode, libc_strlen(nmode) + 1);
 	FILE *ret = NULL;
 	if (libc_fopen64)
