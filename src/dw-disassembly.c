@@ -1014,6 +1014,7 @@ void dw_unprotect_context(struct patch_exec_context *ctx)
 		}
 	}
 
+
 	if (dw_check_handling) {
 		dw_log(INFO, DISASSEMBLY, "After unprotecting instruction 0x%llx\n", entry->insn);
 		for (i = 0; i < dw_nb_saved_registers; i++) {
@@ -1027,6 +1028,62 @@ void dw_unprotect_context(struct patch_exec_context *ctx)
 	entry->hit_count++;
 }
 
+static void check_updated_regs (struct insn_entry *entry, struct patch_exec_context *ctx) {
+	struct reg_entry *re;
+	bool should_check[dw_nb_saved_registers];
+	memset(should_check, 0, sizeof(should_check));
+
+	if (!entry->deferred_post_handler) {
+		for (size_t i = 0; i < dw_nb_saved_registers; i++)
+			should_check[i] = true;
+	} else {
+		for (int m = 0; m < entry->nb_arg_m; m++) {
+			struct memory_arg *arg = &(entry->arg_m[m]);
+
+			if (arg->base_taint) {
+				re = dw_get_reg_entry(arg->base);
+				if (re && re->ucontext_index >= 0) {
+					for (size_t i = 0; i < dw_nb_saved_registers; i++) {
+						struct reg_entry *saved_re = dw_get_reg_entry(dw_saved_registers[i]);
+						if (saved_re->ucontext_index == re->ucontext_index) {
+							should_check[i] = true;
+							break;
+						}
+					}
+				}
+			}
+
+			re = dw_get_reg_entry(arg->index);
+			if (re->ucontext_index >= 0 && arg->index_taint) {
+				for (size_t i = 0; i < dw_nb_saved_registers; i++) {
+					struct reg_entry *saved_re = dw_get_reg_entry(dw_saved_registers[i]);
+					if (saved_re->ucontext_index == re->ucontext_index) {
+						should_check[i] = true;
+						break;
+					}
+				}
+			}
+		}
+	}
+
+	for (size_t i = 0; i < dw_nb_saved_registers; i++) {
+		if (!should_check[i])
+			continue;
+
+		unsigned reg = dw_saved_registers[i];
+		re = dw_get_reg_entry(reg);
+		if (!re || re->libpatch_index < 0)
+			continue;
+
+		uintptr_t value = dw_get_register(ctx, re->libpatch_index);
+		if (dw_save_regs[i] != value && !dw_reg_written(entry, reg)) {
+			dw_log(WARNING, DISASSEMBLY,
+				"Instruction 0x%llx, register %s modified but should not, now 0x%llx vs 0x%llx\n",
+				entry->insn, re->name, value, dw_save_regs[i]);
+		}
+	}
+}
+
 /*
  * In the post handler, we normally retaint all registers which were untainted
  * in the pre handler. There are a few special cases when the same register is
@@ -1037,25 +1094,14 @@ void dw_reprotect_context(struct patch_exec_context *ctx)
 	struct insn_entry *entry = ctx->user_data;
 	struct memory_arg *arg;
 	struct reg_entry *re;
-	unsigned i, reg;
+	unsigned reg;
 	uintptr_t value;
 
 	if (dw_check_handling) {
 		dw_log(INFO, DISASSEMBLY, "Reprotect instruction 0x%llx: %s\n",
 			   entry->insn, entry->disasm_insn);
 		dw_print_regs(ctx);
-		for (i = 0; i < dw_nb_saved_registers; i++) {
-			// dw_log(INFO, MAIN, "%s = 0x%llx\n",
-			// dw_get_patch_reg_name(i), ctx->gregs[i]);
-			reg = dw_saved_registers[i];
-			re = dw_get_reg_entry(reg);
-			value = dw_get_register(ctx, re->libpatch_index);
-
-			if ((dw_save_regs[i] != value) && dw_reg_written(entry, reg) == false)
-				dw_log(WARNING, MAIN,
-					   "Instruction 0x%llx, register %s modified but should not, now 0x%llx vs 0x%llx\n",
-					   entry->insn, re->name, value, dw_save_regs[i]);
-		}
+		check_updated_regs(entry, ctx);
 	}
 
 	for (int i = 0; i < entry->nb_arg_m; i++) {
