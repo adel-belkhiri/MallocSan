@@ -614,6 +614,14 @@ dw_create_instruction_entry(instruction_table *table,
 	cs_detail *detail = table->insn->detail;
 	cs_x86 *x86 = &(detail->x86);
 
+	// TODO: Remove once libpatch supports immediate execution of post-handlers
+	// for call instructions.
+	if (cs_insn_group(table->handle, table->insn, X86_GRP_CALL)) {
+		dw_log(WARNING, DISASSEMBLY,
+		    "Call instruction %llx with protected memory operands, post handler cannot be used\n", fault);
+		entry->post_handler = false;
+	}
+
 	entry->repeat = (x86->prefix[0] == X86_PREFIX_REP ||
 					 x86->prefix[0] == X86_PREFIX_REPE ||
 					 x86->prefix[0] == X86_PREFIX_REPNE);
