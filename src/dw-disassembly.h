@@ -85,6 +85,7 @@ struct insn_entry {
 	bool repeat;
 	bool post_handler;
 	bool deferred_post_handler;
+	bool pending_post_handler;
 	uintptr_t insn;
 	uintptr_t next_insn;
 	uintptr_t olx_buffer;

@@ -902,6 +902,8 @@ void dw_unprotect_context(struct patch_exec_context *ctx)
 		dw_print_regs(ctx);
 	}
 
+	entry->pending_post_handler = true;
+
 	// Untaint all possibly tainted memory arguments
 	for (i = 0; i < entry->nb_arg_m; i++) {
 		arg = &(entry->arg_m[i]);
@@ -1096,6 +1098,11 @@ void dw_reprotect_context(struct patch_exec_context *ctx)
 	struct reg_entry *re;
 	unsigned reg;
 	uintptr_t value;
+
+	if (!entry->pending_post_handler)
+		return;
+
+	entry->pending_post_handler = false;
 
 	if (dw_check_handling) {
 		dw_log(INFO, DISASSEMBLY, "Reprotect instruction 0x%llx: %s\n",
