@@ -27,6 +27,8 @@ struct reg_entry {
 };
 
 struct reg_entry *dw_get_reg_entry(unsigned reg);
+size_t decode_extended_states(unsigned reg, void *fp, uint8_t *out);
+size_t save_extended_states(unsigned reg, void *fp, const uint8_t *in);
 
 extern unsigned dw_saved_registers[];
 extern const unsigned dw_nb_saved_registers;
@@ -37,5 +39,12 @@ extern uintptr_t dw_save_regs[];
 
 #define dw_set_register(base, index, value) \
 	*((uintptr_t *) ((void *) (base) + (index))) = value
+
+#define reg_is_sse(reg) ((reg) >= X86_REG_XMM0 && (reg) <= X86_REG_XMM31)
+#define reg_is_avx2(reg) ((reg) >= X86_REG_YMM0 && (reg) <= X86_REG_YMM31)
+#define reg_is_avx512(reg) ((reg) >= X86_REG_ZMM0 && (reg) <= X86_REG_ZMM31)
+#define reg_is_avx512_opmask(reg) ((reg) >= X86_REG_K0 && (reg) <= X86_REG_K7)
+
+#define reg_is_avx(reg) ((reg) >= X86_REG_XMM0 && (reg) <= X86_REG_ZMM31)
 
 #endif /* DW_REGISTERS_H */

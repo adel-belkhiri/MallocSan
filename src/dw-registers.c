@@ -2,6 +2,8 @@
 
 #include <capstone/capstone.h>
 #include <libpatch/patch.h>
+#include <stdbool.h>
+#include <string.h>
 #include <ucontext.h>
 
 #include "dw-registers.h"
@@ -125,14 +127,14 @@ struct reg_entry reg_table[] = {
 	{ X86_REG_FP5, "fp5", 10, 1, -1, -1, -1, 0, {} },
 	{ X86_REG_FP6, "fp6", 10, 1, -1, -1, -1, 0, {} },
 	{ X86_REG_FP7, "fp7", 10, 1, -1, -1, -1, 0, {} },
-	{ X86_REG_K0, "k0", 2, 1, -1, -1, -1, 0, {} },
-	{ X86_REG_K1, "k1", 2, 1, -1, -1, -1, 0, {} },
-	{ X86_REG_K2, "k2", 2, 1, -1, -1, -1, 0, {} },
-	{ X86_REG_K3, "k3", 2, 1, -1, -1, -1, 0, {} },
-	{ X86_REG_K4, "k4", 2, 1, -1, -1, -1, 0, {} },
-	{ X86_REG_K5, "k5", 2, 1, -1, -1, -1, 0, {} },
-	{ X86_REG_K6, "k6", 2, 1, -1, -1, -1, 0, {} },
-	{ X86_REG_K7, "k7", 2, 1, -1, -1, -1, 0, {} },
+	{ X86_REG_K0, "k0", 8, 1, -1, -1, -1, 0, {} },
+	{ X86_REG_K1, "k1", 8, 1, -1, -1, -1, 0, {} },
+	{ X86_REG_K2, "k2", 8, 1, -1, -1, -1, 0, {} },
+	{ X86_REG_K3, "k3", 8, 1, -1, -1, -1, 0, {} },
+	{ X86_REG_K4, "k4", 8, 1, -1, -1, -1, 0, {} },
+	{ X86_REG_K5, "k5", 8, 1, -1, -1, -1, 0, {} },
+	{ X86_REG_K6, "k6", 8, 1, -1, -1, -1, 0, {} },
+	{ X86_REG_K7, "k7", 8, 1, -1, -1, -1, 0, {} },
 	{ X86_REG_MM0, "mm0", 8, 1, -1, -1, -1, 0, {} },
 	{ X86_REG_MM1, "mm1", 8, 1, -1, -1, -1, 0, {} },
 	{ X86_REG_MM2, "mm2", 8, 1, -1, -1, -1, 0, {} },
@@ -285,9 +287,189 @@ struct reg_entry reg_table[] = {
 
 static unsigned reg_table_size = sizeof(reg_table) / sizeof(struct reg_entry);
 
-struct reg_entry *dw_get_reg_entry(unsigned reg)
+inline struct reg_entry *dw_get_reg_entry(unsigned reg)
 {
 	if (reg >= reg_table_size)
 		return NULL;
 	return (reg_table + reg);
+}
+
+/*
+ * Helper structure and function for decode_extended_states and save_extended_states,
+ * whose role is to decode/encode AVX registers
+ */
+struct xstate_slice {
+	uint8_t *ptr;
+	size_t len;
+};
+
+static bool gather_xstate_slices(unsigned reg, void *fp, struct patch_x86_64_xsave_header *hdr,
+						    struct xstate_slice *slices, size_t *slice_count, size_t *total_len)
+{
+	size_t count = 0;
+	size_t total = 0;
+
+	if (!fp || !hdr || !slices || !slice_count || !total_len)
+		return false;
+
+	if (reg_is_avx512(reg)) {
+		if (reg <= X86_REG_ZMM15) {
+			if (!(hdr->xstate_bv & (1ull << PATCH_X86_64_AVX512_ZMM_HI256_STATE)))
+				return false;
+
+			struct patch_x86_64_legacy *sse;
+			struct patch_x86_64_avx *avx;
+			struct patch_x86_64_avx512_zmm_hi256 *zmm_hi;
+
+			if (patch_x86_sse_state(fp, &sse) != PATCH_OK ||
+			    patch_x86_avx_state(fp, &avx) != PATCH_OK ||
+			    patch_x86_avx512_zmm_hi256_state(fp, &zmm_hi) != PATCH_OK)
+				return false;
+
+			int reg_idx = reg - X86_REG_ZMM0;
+
+			slices[count++] = (struct xstate_slice){ (uint8_t *)&sse->xmm0 + reg_idx * 16, 16 };
+			slices[count++] = (struct xstate_slice){ (uint8_t *)&avx->ymm0 + reg_idx * 16, 16 };
+			slices[count++] = (struct xstate_slice){ (uint8_t *)&zmm_hi->zmm0 + reg_idx * 32, 32 };
+		} else {
+			if (!(hdr->xstate_bv & (1ull << PATCH_X86_64_AVX512_HI16_ZMM_STATE)))
+				return false;
+
+			struct patch_x86_64_avx512_hi16_zmm *hi16_zmm;
+			if (patch_x86_avx512_hi16_zmm_state(fp, &hi16_zmm) != PATCH_OK)
+				return false;
+
+			int reg_idx = reg - X86_REG_ZMM16;
+			slices[count++] = (struct xstate_slice){ (uint8_t *)&hi16_zmm->zmm16 + reg_idx * 64, 64 };
+		}
+	} else if (reg_is_avx2(reg)) {
+		if (!(hdr->xstate_bv & (1ull << PATCH_X86_64_AVX_STATE)))
+			return false;
+
+		if (reg <= X86_REG_YMM15) {
+			struct patch_x86_64_legacy *sse;
+			struct patch_x86_64_avx *avx;
+
+			if (patch_x86_sse_state(fp, &sse) != PATCH_OK ||
+			    patch_x86_avx_state(fp, &avx) != PATCH_OK)
+				return false;
+
+			int reg_idx = reg - X86_REG_YMM0;
+
+			slices[count++] = (struct xstate_slice){ (uint8_t *)&sse->xmm0 + reg_idx * 16, 16 };
+			slices[count++] = (struct xstate_slice){ (uint8_t *)&avx->ymm0 + reg_idx * 16, 16 };
+		} else {
+			struct patch_x86_64_avx512_hi16_zmm *hi16_zmm;
+
+			if (patch_x86_avx512_hi16_zmm_state(fp, &hi16_zmm) != PATCH_OK)
+				return false;
+
+			int reg_idx = reg - X86_REG_YMM16;
+			slices[count++] = (struct xstate_slice){ (uint8_t *)&hi16_zmm->zmm16 + reg_idx * 64, 32 };
+		}
+	} else if (reg_is_sse(reg)) {
+		if (!(hdr->xstate_bv & (1ull << PATCH_X86_64_SSE_STATE)))
+			return false;
+
+		if (reg <= X86_REG_XMM15) {
+			struct patch_x86_64_legacy *sse;
+
+			if (patch_x86_sse_state(fp, &sse) != PATCH_OK)
+				return false;
+
+			int reg_idx = reg - X86_REG_XMM0;
+			slices[count++] = (struct xstate_slice){ (uint8_t *)&sse->xmm0 + reg_idx * 16, 16 };
+		} else {
+			struct patch_x86_64_avx512_hi16_zmm *hi16_zmm;
+
+			if (patch_x86_avx512_hi16_zmm_state(fp, &hi16_zmm) != PATCH_OK)
+				return false;
+
+			int reg_idx = reg - X86_REG_XMM16;
+			slices[count++] = (struct xstate_slice){ (uint8_t *)&hi16_zmm->zmm16 + reg_idx * 64, 16 };
+		}
+	} else {
+		return false;
+	}
+
+	for (size_t i = 0; i < count; ++i)
+		total += slices[i].len;
+
+	*slice_count = count;
+	*total_len = total;
+	return count > 0;
+}
+
+/*
+ * Decode an AVX register from signal or libpatch ucontext.
+ *
+ * This function decodes XMM, YMM, and ZMM registers. It uses helper functions from libpatch
+ * to locate the different state components (SSE, AVX, AVX-512) within the fpregs save area.
+ *
+ * The register value is reconstructed from different parts of the floating-point register save area
+ * (fpregs) in the ucontext. The layout of this area is defined by the x86-64 XSAVE feature set.
+ *
+ * - XMM registers (128 bits) are the base
+ * - YMM register (256 bits) is composed of an XMM register (lower 128 bits) and an upper 128 bits part
+ * - ZMM register (512 bits) is composed of a YMM register (lower 256 bits) and an upper 256 bits part
+ */
+size_t decode_extended_states(unsigned reg, void *fp, uint8_t *out)
+{
+	if (!fp || !out)
+		return 0;
+
+	struct patch_x86_64_xsave_header *hdr = (void *)((char *)fp + sizeof(struct patch_x86_64_legacy));
+
+	if (reg_is_avx512_opmask(reg)) {
+		if (!(hdr->xstate_bv & (1ull << PATCH_X86_64_AVX512_OPMASK_STATE)))
+			return 0;
+
+		struct patch_x86_64_avx512_opmask *opmask;
+
+		if (patch_x86_avx512_opmask_state(fp, &opmask) == PATCH_OK) {
+			unsigned reg_idx = reg - X86_REG_K0;
+
+			memcpy(out, (uint8_t *)&opmask->k0 + reg_idx * sizeof(opmask->k0), sizeof(opmask->k0));
+			return sizeof(opmask->k0);
+		}
+
+		return 0;
+	}
+
+	struct xstate_slice slices[3];
+	size_t slice_count = 0, total_len = 0;
+
+	if (!gather_xstate_slices(reg, fp, hdr, slices, &slice_count, &total_len))
+		return 0;
+
+	for (size_t i = 0; i < slice_count; ++i) {
+		memcpy(out, slices[i].ptr, slices[i].len);
+		out += slices[i].len;
+	}
+
+	return total_len;
+}
+
+/*
+ * Encode an AVX register value into a signal or libpatch ucontext.
+ */
+size_t save_extended_states(unsigned reg, void *fp, const uint8_t *in)
+{
+	if (!fp || !in) return 0;
+
+	struct patch_x86_64_xsave_header *hdr = (void *)((char *)fp + sizeof(struct patch_x86_64_legacy));
+
+	struct xstate_slice slices[3];
+	size_t slice_count = 0;
+	size_t total_len = 0;
+
+	if (!gather_xstate_slices(reg, fp, hdr, slices, &slice_count, &total_len))
+		return 0;
+
+	for (size_t i = 0; i < slice_count; ++i) {
+		memcpy(slices[i].ptr, in, slices[i].len);
+		in += slices[i].len;
+	}
+
+	return total_len;
 }

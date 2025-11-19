@@ -1,5 +1,5 @@
-AM_CFLAGS   = -Wall -fPIC -g
-AM_CPPFLAGS =
+AM_CFLAGS   = -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-builtin -Wall -fPIC -O0 -g3 -fno-omit-frame-pointer -fvar-tracking -fvar-tracking-assignments -fno-inline -fno-optimize-sibling-calls
+AM_CPPFLAGS = $(AM_CFLAGS)
 
 lib_LTLIBRARIES = libmallocsan.la
 libmallocsan_la_SOURCES = \
@@ -13,6 +13,7 @@ libmallocsan_la_SOURCES = \
 
 # Library versioning: current:revision:age
 libmallocsan_la_LDFLAGS = -no-undefined -version-info 0:0:0
+#libmallocsan_la_LDFLAGS += -Wl,--version-script=$(srcdir)/libmallocsan.map
 
 # Dependencies discovered by configure
 AM_CPPFLAGS += $(CAPSTONE_CFLAGS) $(UNWIND_CFLAGS)
@@ -36,3 +37,4 @@ libmallocsan_la_LIBADD += $(LIBPATCH_LIBS)
 endif
 
 CLEANFILES = *.so
+EXTRA_DIST = libmallocsan.map
