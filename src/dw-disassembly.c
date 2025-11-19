@@ -148,30 +148,42 @@ static bool reg_check_access(uint32_t reg, cs_regs regs, uint8_t count)
  * different. If the latter is the case, we check that the resulting address is
  * within bounds. This is used for deferring further the post-handler.
  */
-static inline bool similar_memory_access(const cs_x86_op *arg,
-		const struct memory_arg *m,
-		ucontext_t *uctx,
-		bool repeat)
+static bool similar_memory_access(unsigned int ins_id, const cs_x86_op *arg,
+		const struct memory_arg *m, ucontext_t *uctx, bool repeat)
 {
-	// Take the fast path if the new memory access is similar to the one in entry
+	uintptr_t addr;
+
+	/* Fast path: same addressing mode (base/index/scale/disp) and size. */
 	if (arg->mem.base != m->base || arg->mem.index != m->index)
 		return false;
 
-	if (arg->mem.scale == m->scale && arg->mem.disp == m->displacement &&
-		   arg->size == m->length)
+	if (arg->mem.scale == m->scale &&
+	    arg->mem.disp  == m->displacement &&
+	    arg->size      == m->length)
 		return true;
 
-	// Slow path: compute the effective address for this new memory access
-	uintptr_t addr = m->base_addr + m->index_addr * arg->mem.scale + arg->mem.disp;
+	/*
+	 * Slow path: recompute the effective addresses for the new memory
+	 * access and check that they stay within the bounds of the original
+	 * protected object.
+	 */
 
-	// Compute access size, considering repeat prefix, then check if the access if valid
+	/*
+	 * SIB case: base + index * scale + disp.
+	 */
+	uintptr_t index_addr = (m->index != X86_REG_INVALID) ? m->index_addr : 0;
 	size_t access_size = arg->size;
+
+	addr = m->base_addr + index_addr * arg->mem.scale + arg->mem.disp;
+
 	if (repeat) {
-		size_t count = dw_get_register(uctx, dw_get_reg_entry(X86_REG_RCX)->ucontext_index);
+		size_t count = dw_get_register(uctx,
+				dw_get_reg_entry(X86_REG_RCX)->ucontext_index);
 		access_size *= count;
 	}
 
-	return dw_check_access((void *) addr, access_size) == 0;
+	return dw_check_access((void *) addr, access_size);
+
 }
 
 #define UNW_LOCAL_ONLY
@@ -297,7 +309,7 @@ static uintptr_t dw_defer_post_handler(instruction_table *table,
 				pending_same_access = 0;
 			}
 
-			dw_log(WARNING, DISASSEMBLY, "Skipping instruction at 0x%llx -> %s %s\n",
+			dw_log(INFO, DISASSEMBLY, "Skipping instruction at 0x%llx -> %s %s\n",
 				   table->insn->address, table->insn->mnemonic, table->insn->op_str);
 			count_innocuous_inst++;
 			++n;
@@ -400,7 +412,7 @@ static uintptr_t dw_defer_post_handler(instruction_table *table,
 		}
 
 		// Otherwise, we can safely skip the instruction
-		dw_log(WARNING, DISASSEMBLY, "Skipping instruction at 0x%llx -> %s %s\n",
+		dw_log(INFO, DISASSEMBLY, "Skipping instruction at 0x%llx -> %s %s\n",
 			   table->insn->address, table->insn->mnemonic, table->insn->op_str);
 
 		n++;
@@ -409,7 +421,7 @@ static uintptr_t dw_defer_post_handler(instruction_table *table,
 
 stop_return:
 	if (n == MAX_SCAN_INST_COUNT)
-		dw_log(WARNING, DISASSEMBLY,
+		dw_log(INFO, DISASSEMBLY,
 			   "Max instruction scan count reached while deferring post-handler for 0x%llx!\n",
 			   start_addr);
 
@@ -738,7 +750,7 @@ dw_create_instruction_entry(instruction_table *table,
 	// If all tainted registers are overwritten by the instruction,
 	// there is no point in installing a post handler
 	if (all_tainted_overwritten) {
-		dw_log(WARNING, DISASSEMBLY,
+		dw_log(INFO, DISASSEMBLY,
 			   "Disabling post-handler at 0x%llx because all tainted registers were overwritten.\n",
 			   entry->insn, table->insn->mnemonic, table->insn->op_str);
 		entry->post_handler = false;
@@ -754,17 +766,17 @@ dw_create_instruction_entry(instruction_table *table,
 				instr_addr, uctx, &scanned_count,
 				&similar_acess_count);
 
-		dw_log(WARNING, DISASSEMBLY,
+		dw_log(INFO, DISASSEMBLY,
 			   "Forward scan has stopped at 0x%llx (%s %s), after (%u) instructions.\n",
 			   table->insn->address, table->insn->mnemonic, table->insn->op_str, scanned_count);
 
 		if (!entry->post_handler)
-		    dw_log(WARNING, DISASSEMBLY, "Post-handler has been DISABLED as a result!\n");
+		    dw_log(INFO, DISASSEMBLY, "Post-handler has been DISABLED as a result!\n");
 		else if (similar_acess_count > 0) {
 			entry->deferred_post_handler = true;
 			entry->next_insn = last_safe_addr;
 
-			dw_log(WARNING, DISASSEMBLY,
+			dw_log(INFO, DISASSEMBLY,
 				   "Post-handler DEFERRED to 0x%llx - skipped (%u) similar memory accesses!\n",
 				   last_safe_addr, similar_acess_count);
 		}
@@ -905,7 +917,7 @@ void dw_unprotect_context(struct patch_exec_context *ctx)
 	uintptr_t valueb, valuei, addr;
 
 	if (dw_check_handling) {
-		dw_log(INFO, DISASSEMBLY, "Before unprotecting instruction 0x%llx: %s\n",
+		dw_log(DEBUG, DISASSEMBLY, "(-) Before unprotecting instruction 0x%llx: %s\n",
 			   entry->insn, entry->disasm_insn);
 		dw_print_regs(ctx);
 	}
@@ -1026,12 +1038,12 @@ void dw_unprotect_context(struct patch_exec_context *ctx)
 
 
 	if (dw_check_handling) {
-		dw_log(INFO, DISASSEMBLY, "After unprotecting instruction 0x%llx\n", entry->insn);
+		dw_log(DEBUG, DISASSEMBLY, "-- After unprotecting instruction 0x%llx\n", entry->insn);
 		for (i = 0; i < dw_nb_saved_registers; i++) {
 			reg = dw_saved_registers[i];
 			re = dw_get_reg_entry(reg);
 			dw_save_regs[i] = dw_get_register(ctx, re->libpatch_index);
-			dw_log(INFO, DISASSEMBLY, "%s, %llx\n", re->name, ctx->general_purpose_registers[i]);
+			dw_log(DEBUG, DISASSEMBLY, "%s, %llx\n", re->name, ctx->general_purpose_registers[i]);
 		}
 	}
 
@@ -1113,7 +1125,7 @@ void dw_reprotect_context(struct patch_exec_context *ctx)
 	entry->pending_post_handler = false;
 
 	if (dw_check_handling) {
-		dw_log(INFO, DISASSEMBLY, "Reprotect instruction 0x%llx: %s\n",
+		dw_log(DEBUG, DISASSEMBLY, "(+) Reprotect instruction 0x%llx: %s\n",
 			   entry->insn, entry->disasm_insn);
 		dw_print_regs(ctx);
 		check_updated_regs(entry, ctx);

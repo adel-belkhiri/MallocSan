@@ -378,13 +378,13 @@ static void *malloc2(size_t size, void *caller)
 			if (check_candidate(size))
 				ret = dw_malloc_protect(size);
 		} else
-			dw_log(INFO, MAIN, "Not tainting malloc, caller from library\n");
+			dw_log(DEBUG, MAIN, "Not tainting malloc, caller from library\n");
 	}
 	if (ret == NULL)
 		ret = __libc_malloc(size);
 
 	dw_protect_active = save_active;
-	dw_log(INFO, MAIN, "Malloc %p, size %lu, nb_candidates %lu\n", ret,
+	dw_log(DEBUG, MAIN, "Malloc %p, size %lu, nb_candidates %lu\n", ret,
 		   size, nb_protected_candidates);
 	return ret;
 }
@@ -431,7 +431,7 @@ void free(void *ptr)
 		__libc_free(ptr);
 	}
 	dw_protect_active = save_active;
-	dw_log(INFO, MAIN, "Free %p\n", ptr);
+	dw_log(DEBUG, MAIN, "Free %p\n", ptr);
 }
 
 void *memalign(size_t alignment, size_t size)
@@ -446,7 +446,7 @@ void *memalign(size_t alignment, size_t size)
 		ret = __libc_memalign(alignment, size);
 
 	dw_protect_active = save_active;
-	dw_log(INFO, MAIN, "Memalign %p, size %lu, nb_candidates %lu\n", ret,
+	dw_log(DEBUG, MAIN, "Memalign %p, size %lu, nb_candidates %lu\n", ret,
 		   size, nb_protected_candidates);
 	return ret;
 }
