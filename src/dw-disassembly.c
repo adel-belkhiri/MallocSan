@@ -189,6 +189,15 @@ static bool similar_memory_access(unsigned int ins_id, const cs_x86_op *arg,
 	if (arg->mem.base != m->base || arg->mem.index != m->index)
 		return false;
 
+	/*
+	 * LEA instructions compute a new pointer from a (possibly tainted) base/index register
+	 * without performing a memory access. When the pre-handler has already unprotected the
+	 * base/index register, an instruction like `lea rX, [rY + z]` produces a new, untagged
+	 * alias in rX. This alias can then escape the post-handler’s taint-tracking logic.
+	 */
+	if (ins_id == X86_INS_LEA)
+		return false;
+
 	if (arg->mem.scale == m->scale &&
 	    arg->mem.disp  == m->displacement &&
 	    arg->size      == m->length)
