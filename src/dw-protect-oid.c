@@ -62,13 +62,13 @@ bool dw_check_access(const void *ptr, size_t size)
 	if (oid == 0) return true;
 
 	if (oid > (oids_size - 1) || oids[oid].base_addr == 0) {
-		dw_log(WARNING, PROTECT, "Invalid taint value %u for %p\n", oid, ptr);
+		DW_LOG(WARNING, PROTECT, "Invalid taint value %u for %p\n", oid, ptr);
 		return false;
 	}
 
 	if (real_addr < oids[oid].base_addr ||
 		real_addr + size > oids[oid].base_addr + oids[oid].size) {
-		dw_log(ERROR, PROTECT, "Invalid access (oid %x): %p size %d not between %p and %p\n",
+		DW_LOG(ERROR, PROTECT, "Invalid access (oid %x): %p size %d not between %p and %p\n",
 			   oid, real_addr, size, oids[oid].base_addr,
 			   oids[oid].base_addr + oids[oid].size);
 		return false;
@@ -84,7 +84,7 @@ size_t dw_get_size(void *ptr)
 		return malloc_usable_size(ptr);
 
 	if (oid > oids_size - 1 || oids[oid].base_addr == 0) {
-		dw_log(WARNING, PROTECT, "Invalid taint value %u for %p\n", oid, ptr);
+		DW_LOG(WARNING, PROTECT, "Invalid taint value %u for %p\n", oid, ptr);
 		return 0;
 	}
 	return oids[oid].size;
@@ -96,7 +96,7 @@ size_t dw_get_size(void *ptr)
 static void *dw_protect(void *ptr, size_t size)
 {
 	if (oids_head == 0) {
-		dw_log(WARNING, PROTECT, "OID table full, cannot taint pointer %p\n", ptr);
+		DW_LOG(WARNING, PROTECT, "OID table full, cannot taint pointer %p\n", ptr);
 		return ptr;
 	}
 
@@ -134,7 +134,7 @@ inline void *dw_reprotect(const void *ptr, const void *old_ptr)
 	uintptr_t oid = taint_bits >> 48;
 
 	if (oid >= oids_size || oids[oid].base_addr == 0) {
-		dw_log(ERROR, PROTECT, "Invalid taint bits %p from old pointer %p\n", (void *)taint_bits, old_ptr);
+		DW_LOG(ERROR, PROTECT, "Invalid taint bits %p from old pointer %p\n", (void *)taint_bits, old_ptr);
 		return (void *)ptr;
 	}
 
@@ -188,7 +188,7 @@ void dw_free_protect(void *ptr)
 	unsigned oid = (uintptr_t) ptr >> 48;
 	if (oid != 0) {
 		if (oid > oids_size - 1 || oids[oid].base_addr == 0)
-			dw_log(WARNING, PROTECT, "Invalid taint value %u for %p\n", oid, ptr);
+			DW_LOG(WARNING, PROTECT, "Invalid taint value %u for %p\n", oid, ptr);
 		else {
 			oids[oid].size = oids_head;
 			oids[oid].base_addr = NULL;

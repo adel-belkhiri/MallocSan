@@ -24,10 +24,10 @@ void dw_protect_init()
 int dw_check_access(const void *ptr, size_t size)
 {
 	if (ptr == NULL)
-		dw_log(WARNING, PROTECT, "Null pointer access\n");
+		DW_LOG(WARNING, PROTECT, "Null pointer access\n");
 
 	if (size == 0)
-		dw_log(WARNING, PROTECT, "Zero size access\n");
+		DW_LOG(WARNING, PROTECT, "Zero size access\n");
 
 	return 0;
 }
@@ -65,7 +65,7 @@ int dw_is_protected(const void *ptr)
 	if(taint == 0) return 0;
 	if(taint == 1) return 1;
 
-	dw_log(WARNING, MAIN, "Taint should be 1, pointer %p\n", ptr);
+	DW_LOG(WARNING, MAIN, "Taint should be 1, pointer %p\n", ptr);
 	return 1;
 }
 

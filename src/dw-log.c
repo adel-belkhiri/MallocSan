@@ -2,7 +2,6 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdbool.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -145,4 +144,11 @@ void dw_set_log_level(enum dw_log_level level)
 
 	for (int i = 0; i < (sizeof(dw_log_categories) / sizeof(dw_log_categories[0])); i++)
 		dw_log_categories[i].level = level;
+}
+
+inline bool dw_log_enabled(enum dw_log_level level, enum dw_log_category_name topic)
+{
+	if (level < ERROR || level > DEBUG)
+		return false;
+	return dw_log_categories[topic].active && level <= dw_log_categories[topic].level;
 }

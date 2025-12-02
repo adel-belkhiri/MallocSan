@@ -63,7 +63,7 @@ void *dlsym_check(void *restrict handle, const char *restrict symbol)
 {
 	void *ret = dlsym(handle, symbol);
 	if (ret == NULL)
-		dw_log(WARNING, WRAP, "Symbol %s not found\n", symbol);
+		DW_LOG(WARNING, WRAP, "Symbol %s not found\n", symbol);
 
 	return ret;
 }
@@ -360,7 +360,7 @@ int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
 			return ret;
 		}
 
-		dw_log(WARNING, WRAP, "Blocked attempt to overwrite the SIGTRAP handler\n");
+		DW_LOG(WARNING, WRAP, "Blocked attempt to overwrite the SIGTRAP handler\n");
 		int ret = libc_sigaction(signum, saved, NULL);
 		sout();
 		return ret;
@@ -380,7 +380,7 @@ int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
 		*valid = true;
 	}
 
-	dw_log(WARNING, WRAP,
+	DW_LOG(WARNING, WRAP,
 		    "Blocked attempt to overwrite MallocSan %s handler\n", signum == SIGSEGV ? "SIGSEGV" : "SIGBUS");
 
 	struct sigaction replacement = *act;

@@ -41,10 +41,10 @@ static void patch_handler(struct patch_exec_context *ctx, uint8_t post)
 {
 	struct insn_entry *entry = ctx->user_data;
 	if (post || ctx->program_counter != entry->insn) {
-		//dw_log(WARNING, MAIN, "REprotect @ 0x%lx\n", ctx->program_counter);
+		//DW_LOG(WARNING, MAIN, "REprotect @ 0x%lx\n", ctx->program_counter);
 		dw_reprotect_context(ctx);
 	} else {
-		// dw_log(WARNING, MAIN, "UNprotect @ 0x%lx\n", ctx->program_counter);
+		// DW_LOG(WARNING, MAIN, "UNprotect @ 0x%lx\n", ctx->program_counter);
 		dw_unprotect_context(ctx);
 	}
 }
@@ -81,10 +81,10 @@ static enum dw_strategies do_patch(struct insn_entry *entry, enum dw_strategies 
 	}
 
 	if (chosen_strategy == DW_PATCH_UNKNOWN)
-		dw_log(ERROR, MAIN, "Patching %s location 0x%llx failed (origin 0x%llx).\n",
+		DW_LOG(ERROR, MAIN, "Patching %s location 0x%llx failed (origin 0x%llx).\n",
 			   patch_type, patch_addr, entry->insn);
 
-	dw_log(INFO, MAIN, "Successfully patched %s site 0x%llx with %s strategy.\n",
+	DW_LOG(INFO, MAIN, "Successfully patched %s site 0x%llx with %s strategy.\n",
 		   patch_type, patch_addr, strategy_name(chosen_strategy));
 
 	return chosen_strategy;
@@ -150,7 +150,7 @@ void signal_protected(int sig, siginfo_t *info, void *context)
 	 * should not happen
 	 */
 	if (!save_active)
-		dw_log(WARNING, MAIN, "Signal received while within wrappers\n");
+		DW_LOG(WARNING, MAIN, "Signal received while within wrappers\n");
 
 	// Get the instruction address
 	ucontext_t *uctx = ((ucontext_t *) context);
@@ -164,7 +164,7 @@ void signal_protected(int sig, siginfo_t *info, void *context)
 	 */
 	entry = dw_get_instruction_entry(insn_table, fault_insn);
 	if (entry != NULL)
-		dw_log(ERROR, MAIN, "SIGSEGV handler called for already patched instruction 0x%llx\n",
+		DW_LOG(ERROR, MAIN, "SIGSEGV handler called for already patched instruction 0x%llx\n",
 			   entry->insn);
 
 	// New address, create an entry in the table
@@ -174,13 +174,13 @@ void signal_protected(int sig, siginfo_t *info, void *context)
 		// forward the signal to the previously saved handler (if there is any).
 		dw_protect_active = save_active;
 		if (!forward_to_saved_handler(sig, info, context))
-			dw_log(ERROR, MAIN,
+			DW_LOG(ERROR, MAIN,
 			    "Segfault on instruction (0x%llx) without protected memory arguments, no saved handler\n",
 			    fault_insn);
 		return;
 	}
 
-	dw_log(INFO, MAIN, "Created entry for instruction 0x%llx\n", entry->insn);
+	DW_LOG(INFO, MAIN, "Created entry for instruction 0x%llx\n", entry->insn);
 
 	/*
 	 * Here we patch the instruction that involves tainted registers. If the post-handler
@@ -195,7 +195,7 @@ void signal_protected(int sig, siginfo_t *info, void *context)
 			entry->strategy = DW_PATCH_MIXED;
 	}
 
-	dw_log(INFO, MAIN,
+	DW_LOG(INFO, MAIN,
 		"Patch summary for 0x%llx: Post-handler: %s, Deferred: %s, Strategy: %s\n",
 		entry->insn, entry->post_handler ? "Yes" : "No", entry->deferred_post_handler ? "Yes" : "No",
 		strategy_name(entry->strategy));
@@ -266,11 +266,11 @@ dw_init()
 	arg = getenv("DW_CHECK_HANDLING");
 	if (arg != NULL && atoi(arg) == 1) { check_handling = true; dw_set_check_handling(check_handling); }
 
-	dw_log(INFO, MAIN, "Starting program dw\n");
-	dw_log(INFO, MAIN,
+	DW_LOG(INFO, MAIN, "Starting program dw\n");
+	DW_LOG(INFO, MAIN,
 		   "Min protect size %lu, max protect size %lu, max nb protected %lu, first protected %lu\n",
 		   min_protect_size, max_protect_size, max_nb_protected, first_protected);
-	dw_log(INFO, MAIN,
+	DW_LOG(INFO, MAIN,
 		   "Instruction entries %lu, log level %d, stats file %s, strategy %d, check handling %d\n",
 		   nb_insn_olx_entries, log_level, stats_file, dw_strategy, check_handling);
 
@@ -278,7 +278,7 @@ dw_init()
 	insn_table = dw_init_instruction_table(nb_insn_olx_entries);
 	dw_protect_init();
 	dw_patch_init();
-	dw_log(INFO, MAIN, "Patch init\n");
+	DW_LOG(INFO, MAIN, "Patch init\n");
 
 	/*
 	 * Insert the SIGSEGV signal handler to catch protected pointers. We use
@@ -296,7 +296,7 @@ dw_init()
 	ss.ss_flags = 0;
 	ret = sigaltstack(&ss, NULL);
 	if (ret < 0)
-		dw_log(ERROR, MAIN, "Sigaltstack failed\n");
+		DW_LOG(ERROR, MAIN, "Sigaltstack failed\n");
 
 	sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
 	sigfillset(&sa.sa_mask);
@@ -304,11 +304,11 @@ dw_init()
 
 	ret = sigaction(SIGSEGV, &sa, NULL);
 	if (ret < 0)
-		dw_log(ERROR, MAIN, "Sigaction SIGSEGV failed\n");
+		DW_LOG(ERROR, MAIN, "Sigaction SIGSEGV failed\n");
 
 	ret = sigaction(SIGBUS, &sa, NULL);
 	if(ret < 0)
-		dw_log(ERROR, MAIN, "Sigaction SIGBUS failed\n");
+		DW_LOG(ERROR, MAIN, "Sigaction SIGBUS failed\n");
 
 	// start intercepting allocation functions
 	dw_protect_active = true;
@@ -321,7 +321,7 @@ extern void __attribute__((destructor)) dw_fini()
 		int fd = open(stats_file, O_WRONLY | O_CREAT | O_TRUNC,
 				S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 		if (fd < 0)
-			dw_log(WARNING, MAIN, "Cannot open file '%s' to write statistics\n", stats_file);
+			DW_LOG(WARNING, MAIN, "Cannot open file '%s' to write statistics\n", stats_file);
 		else {
 			dw_fprintf(fd, "There was a total of %d protected malloc on %d candidates\n\n",
 				   nb_protected, nb_protected_candidates);
@@ -378,13 +378,13 @@ static void *malloc2(size_t size, void *caller)
 			if (check_candidate(size))
 				ret = dw_malloc_protect(size);
 		} else
-			dw_log(DEBUG, MAIN, "Not tainting malloc, caller from library\n");
+			DW_LOG(DEBUG, MAIN, "Not tainting malloc, caller from library\n");
 	}
 	if (ret == NULL)
 		ret = __libc_malloc(size);
 
 	dw_protect_active = save_active;
-	dw_log(DEBUG, MAIN, "Malloc %p, size %lu, nb_candidates %lu\n", ret,
+	DW_LOG(DEBUG, MAIN, "Malloc %p, size %lu, nb_candidates %lu\n", ret,
 		   size, nb_protected_candidates);
 	return ret;
 }
@@ -431,7 +431,7 @@ void free(void *ptr)
 		__libc_free(ptr);
 	}
 	dw_protect_active = save_active;
-	dw_log(DEBUG, MAIN, "Free %p\n", ptr);
+	DW_LOG(DEBUG, MAIN, "Free %p\n", ptr);
 }
 
 void *memalign(size_t alignment, size_t size)
@@ -446,7 +446,7 @@ void *memalign(size_t alignment, size_t size)
 		ret = __libc_memalign(alignment, size);
 
 	dw_protect_active = save_active;
-	dw_log(DEBUG, MAIN, "Memalign %p, size %lu, nb_candidates %lu\n", ret,
+	DW_LOG(DEBUG, MAIN, "Memalign %p, size %lu, nb_candidates %lu\n", ret,
 		   size, nb_protected_candidates);
 	return ret;
 }
