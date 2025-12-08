@@ -1,8 +1,9 @@
 #include <malloc.h>
+#include <stdint.h>
 
 #include "dw-protect.h"
 #include "dw-log.h"
-#include "stdint.h"
+
 
 const uintptr_t taint_mask =    (uintptr_t)0xffff000000000000;
 const uintptr_t untaint_mask =  (uintptr_t)0x0000ffffffffffff;
@@ -56,23 +57,36 @@ void dw_protect_init()
 
 bool dw_check_access(const void *ptr, size_t size)
 {
-	unsigned oid = (uintptr_t) ptr >> 48;
-	void *real_addr = (void *) ((uintptr_t) ptr & untaint_mask);
+	uintptr_t raw_addr = (uintptr_t)ptr;
 
-	if (oid == 0) return true;
+	/* Skip checking for pointers with MSB set */
+	if (raw_addr & (1ULL << 63))
+		return true;
 
-	if (oid > (oids_size - 1) || oids[oid].base_addr == 0) {
-		DW_LOG(WARNING, PROTECT, "Invalid taint value %u for %p\n", oid, ptr);
+	unsigned oid = raw_addr >> 48;
+	uintptr_t real_addr = raw_addr & untaint_mask;
+
+	/* Skip checking when the pointer does not hold a taint */
+	if (oid == 0)
+		return true;
+
+	if (oid >= oids_size || oids[oid].base_addr == NULL) {
+		DW_LOG(WARNING, PROTECT,
+			   "Invalid taint value %u for %p\n", oid, ptr);
 		return false;
 	}
 
-	if (real_addr < oids[oid].base_addr ||
-		real_addr + size > oids[oid].base_addr + oids[oid].size) {
-		DW_LOG(ERROR, PROTECT, "Invalid access (oid %x): %p size %d not between %p and %p\n",
-			   oid, real_addr, size, oids[oid].base_addr,
-			   oids[oid].base_addr + oids[oid].size);
+	uintptr_t base = (uintptr_t)oids[oid].base_addr;
+	size_t sz = oids[oid].size;
+
+	/* Check [real_addr, real_addr + size) ⊆ [base, base + sz). */
+	if (size > sz || real_addr < base || real_addr > base + sz - size) {
+		DW_LOG(ERROR, PROTECT,
+			   "Invalid access (oid %u): 0x%llx size %zu not between 0x%llx and 0x%llx\n",
+			   oid, real_addr, size, base, (base + sz));
 		return false;
 	}
+
 	return true;
 }
 
@@ -90,6 +104,20 @@ size_t dw_get_size(void *ptr)
 	return oids[oid].size;
 }
 
+void* dw_get_base_addr(void *ptr)
+{
+	unsigned oid = (uintptr_t) ptr >> 48;
+
+	if (oid == 0)
+		return 0;
+
+	if (oid > oids_size - 1 || oids[oid].base_addr == 0) {
+		DW_LOG(WARNING, PROTECT, "Invalid taint value %u for %p\n", oid, ptr);
+		return 0;
+	}
+	return oids[oid].base_addr;
+}
+
 /*
  * Add the object to the oid table and taint the pointer.
  */
@@ -100,17 +128,17 @@ static void *dw_protect(void *ptr, size_t size)
 		return ptr;
 	}
 
+	unsigned oid       = oids_head;
 	unsigned next_head = oids[oids_head].size;
+
 	oids[oids_head].base_addr = ptr;
 	oids[oids_head].size = size;
+	oids_head = next_head;
 
 	uintptr_t p   = (uintptr_t)ptr & ~taint_mask;       // clear tag field
-	uintptr_t tag = (uintptr_t)oids_head << 48;
+	uintptr_t tag = (uintptr_t)oid << 48;
 
-	//void *result = (void *) ((uintptr_t) ptr | ((uintptr_t) oids_head) << 48);
-	void *result = (void *) (p | tag);
-	oids_head = next_head;
-	return result;
+	return (void *) (p | tag);
 }
 
 /*
@@ -155,6 +183,9 @@ inline void *dw_unprotect(const void *ptr)
 
 inline bool dw_is_protected(const void *ptr)
 {
+	if (!ptr)
+		return false;
+
 	if ((uintptr_t)ptr & (1ULL << 63)) /*MSB*/
 		return false;
 

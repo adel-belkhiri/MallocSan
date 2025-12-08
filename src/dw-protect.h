@@ -31,6 +31,9 @@ bool dw_check_access(const void *ptr, size_t size);
 /* Get the allocated size of a protected object */
 size_t dw_get_size(void *ptr);
 
+/* Get the base address of a protected object */
+void* dw_get_base_addr(void *ptr);
+
 /* Return the untainted pointer */
 void* dw_unprotect(const void *ptr);
 
