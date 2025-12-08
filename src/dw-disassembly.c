@@ -35,7 +35,7 @@ instruction_table *dw_init_instruction_table(size_t size)
 	instruction_table *table = malloc(sizeof(instruction_table));
 	// have a hash table about twice as large, and a power of two -1
 	table->size = 2 * size - 1;
-	table->entries = calloc(sizeof(struct insn_entry), table->size);
+	table->entries = calloc(table->size, sizeof(struct insn_entry));
 
 	cs_err csres = cs_open(CS_ARCH_X86, CS_MODE_64, &(table->handle));
 	if (csres != CS_ERR_OK)
@@ -873,7 +873,7 @@ dw_create_instruction_entry(instruction_table *table, uintptr_t fault, uintptr_t
  	// If all tainted registers are overwritten by the instruction, there is no point in installing a post handler
 	if (all_tainted_overwritten) {
 		DW_LOG(INFO, DISASSEMBLY,
-			   "Disabling post-handler at 0x%llx because all tainted registers were overwritten.\n",
+			   "Disabling post-handler at 0x%llx (%s %s) because all tainted registers were overwritten.\n",
 			   entry->insn, table->insn->mnemonic, table->insn->op_str);
 		entry->post_handler = false;
 	}
