@@ -113,6 +113,7 @@ static int (*libc_clock_gettime)(clockid_t clockid, struct timespec *tp);
 static int (*libc_stat)(const char *restrict pathname, struct stat *restrict statbuf);
 static int (*libc_fstat)(int fd, struct stat *statbuf);
 static int (*libc_lstat)(const char *restrict pathname, struct stat *restrict statbuf);
+static int (*libc_newfstatat)(int dirfd, const char *pathname, struct stat *statbuf, int flags);
 static int (*libc_fstatat)(int dirfd, const char *restrict pathname, struct stat *restrict statbuf, int flags);
 static int (*libc_stat64)(const char *restrict pathname, struct stat64 *restrict statbuf);
 static int (*libc_fstat64)(int fd, struct stat64 *statbuf);
@@ -211,6 +212,7 @@ void dw_init_syscall_stubs()
 	libc_stat = dlsym_check(RTLD_NEXT, "stat");
 	libc_fstat = dlsym_check(RTLD_NEXT, "fstat");
 	libc_lstat = dlsym_check(RTLD_NEXT, "lstat");
+	libc_newfstatat = dlsym_check(RTLD_NEXT, "newfstatat");
 	libc_fstatat = dlsym_check(RTLD_NEXT, "fstatat");
 	libc_stat64 = dlsym_check(RTLD_NEXT, "stat64");
 	libc_fstat64 = dlsym_check(RTLD_NEXT, "fstat64");
@@ -687,6 +689,7 @@ int fstat(int fd, struct stat *statbuf) { sin(); dw_check_access((void *)statbuf
 int fstat64(int fd, struct stat64 *statbuf) { sin(); dw_check_access((void *)statbuf, sizeof(struct stat64)); int ret = libc_fstat64 ? libc_fstat64(fd, (struct stat64 *)dw_unprotect(statbuf)) : libc_fstat(fd, (struct stat *)dw_unprotect(statbuf)); sout(); return ret; }
 int lstat(const char *restrict pathname, struct stat *restrict statbuf) { sin(); char *npathname = dw_unprotect((void *)pathname); dw_check_access((void *)pathname, libc_strlen(npathname) + 1); dw_check_access((void *)statbuf, sizeof(struct stat)); int ret = libc_lstat(npathname, (struct stat *)dw_unprotect((void *)statbuf)); sout(); return ret; }
 int fstatat(int dirfd, const char *restrict pathname, struct stat *restrict statbuf, int flags) { sin(); char *npathname = dw_unprotect((void *)pathname); dw_check_access((void *)pathname, libc_strlen(npathname) + 1); dw_check_access((void *)statbuf, sizeof(struct stat)); int ret = libc_fstatat(dirfd, npathname, (struct stat *)dw_unprotect((void *)statbuf), flags); sout(); return ret; }
+int newfstatat(int dirfd, const char *pathname, struct stat *statbuf, int flags) { sin(); char *npathname = dw_unprotect((void *)pathname); dw_check_access((void *)pathname, libc_strlen(npathname) + 1); dw_check_access((void *)statbuf, sizeof(struct stat)); int ret = libc_newfstatat(dirfd, npathname, (struct stat *)dw_unprotect((void *)statbuf), flags); sout(); return ret; }
 
 size_t fread(void *ptr, size_t size, size_t nmemb, FILE *stream) { sin(); dw_check_access(ptr, size * nmemb); size_t ret = libc_fread(dw_unprotect(ptr), size, nmemb, stream); sout(); return ret; }
 size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream) { sin(); dw_check_access(ptr, size * nmemb); size_t ret = libc_fwrite((const void *)dw_unprotect(ptr), size, nmemb, stream); sout(); return ret; }
