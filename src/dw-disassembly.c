@@ -83,15 +83,13 @@ struct insn_entry *dw_get_instruction_entry(instruction_table *table, uintptr_t 
  */
 static bool dw_reg_written(struct insn_entry *entry, unsigned reg)
 {
-	if (reg == X86_REG_INVALID)
+	struct reg_entry *re = dw_get_reg_entry(reg);
+	if (!re)
 		return false;
 
-	int reg_uctx_idx = dw_get_reg_entry(reg)->ucontext_index;
-	if (reg_uctx_idx < 0)
-		return false;
-
+	int canon_index = re->canonical_index;
 	for (int i = 0; i < entry->gregs_write_count; i++)
-		if (dw_get_reg_entry(entry->gregs_written[i])->ucontext_index == reg_uctx_idx)
+		if (dw_get_reg_entry(entry->gregs_written[i])->canonical_index == canon_index)
 			return true;
 
 	return false;
@@ -133,13 +131,16 @@ static inline bool read_as_regular_operand(uint32_t reg, const cs_x86 *x86)
 	return false;
 }
 
-static bool reg_check_access(uint32_t reg, cs_regs regs, uint8_t count)
+static inline bool reg_check_access(uint32_t reg, const uint16_t *regs, uint8_t count)
 {
-	if (reg == X86_REG_INVALID || count == 0)
+	struct reg_entry *re = dw_get_reg_entry(reg);
+	if (!re)
 		return false;
 
+	int reg_canon_idx = re->canonical_index;
+
 	for (uint8_t i = 0; i < count; i++)
-		if (dw_get_reg_entry(regs[i])->ucontext_index == dw_get_reg_entry(reg)->ucontext_index)
+		if (dw_get_reg_entry(regs[i])->canonical_index == reg_canon_idx)
 			return true;
 
 	return false;
@@ -300,7 +301,6 @@ static uintptr_t dw_defer_post_handler(instruction_table *table,
 
 	uintptr_t func_start = 0, func_end = 0;
 	size_t max_bytes = (size_t)MAX_SCAN_INST_COUNT * 15;
-
 
 	if (get_function_bounds(start_addr, &func_start, &func_end) && func_end > start_addr) {
 		size_t func_bytes_left = (size_t)(func_end - start_addr);
@@ -524,10 +524,10 @@ fill_memory_operand(struct memory_arg* arg, const cs_x86_op *op, const csh handl
 	arg->index = index = op->mem.index;
 
 	// Handle the base register
-	if (base != X86_REG_INVALID) {
-		re = dw_get_reg_entry(base);
-		if (re->ucontext_index < 0)
-			DW_LOG(ERROR, DISASSEMBLY, "Base register %s not general register\n", re->name);
+	re = dw_get_reg_entry(base);
+	if (re && base != X86_REG_INVALID) {
+		if (!reg_is_gpr(base))
+			DW_LOG(ERROR, DISASSEMBLY, "Base register %s is not a General-Purpose Register\n", re->name);
 
 		arg->base_addr = base_addr = dw_get_register(uctx, re->ucontext_index);
 		if (dw_is_protected((void *) base_addr)) {
@@ -547,7 +547,7 @@ fill_memory_operand(struct memory_arg* arg, const cs_x86_op *op, const csh handl
 
 	// Handle the index register according to SIB/VSIB access modes
 	re = dw_get_reg_entry(index);
-	if (re->ucontext_index >= 0) {
+	if (reg_is_gpr(index)) {
 		arg->index_addr = index_addr = dw_get_register(uctx, re->ucontext_index);
 		if (dw_is_protected((void *) index_addr)) {
 			arg->index_taint = index_addr;
@@ -596,7 +596,7 @@ static void assign_base_index_access(struct insn_entry *entry)
 			re_index = dw_get_reg_entry(entry->arg_m[i].index);
 			re_arg_r = dw_get_reg_entry(entry->arg_r[j].reg);
 
-			if (re_base->ucontext_index == re_arg_r->ucontext_index) {
+			if (re_base->canonical_index == re_arg_r->canonical_index) {
 				entry->arg_m[i].base_access = entry->arg_r[j].access;
 
 				if (entry->arg_m[i].access == (CS_AC_READ | CS_AC_WRITE))
@@ -606,7 +606,7 @@ static void assign_base_index_access(struct insn_entry *entry)
 					DW_LOG(WARNING, DISASSEMBLY, "More than one register argument, may be ambiguous\n");
 			}
 
-			if (re_index->ucontext_index == re_arg_r->ucontext_index) {
+			if (re_index->canonical_index == re_arg_r->canonical_index) {
 				entry->arg_m[i].index_access = entry->arg_r[j].access;
 
 				if (entry->arg_m[i].access == (CS_AC_READ | CS_AC_WRITE))
@@ -643,7 +643,7 @@ fill_instruction_operands(struct insn_entry *entry, const csh handle, const cs_i
 		{
 		case X86_OP_REG:
 			re = dw_get_reg_entry(op->reg);
-			if (re->ucontext_index >= 0) {
+			if (re && re->canonical_index != X86_REG_INVALID) {
 				if (arg_r >= MAX_REG_ARG)
 					DW_LOG(ERROR, DISASSEMBLY, "Too many destination register arguments\n");
 
@@ -1291,10 +1291,12 @@ void dw_unprotect_context(struct patch_exec_context *ctx)
 
 		// Handle the index register
 		regi = arg->index;
-		if (reg_is_avx(regi))
+		if (regi == X86_REG_INVALID || reg_is_gpr(regi))
+			check_sib_access(entry->insn, arg, regi, arg->base, valueb, i, entry->repeat, ctx);
+		else if (reg_is_avx(regi))
 			check_vsib_access(arg, regi, valueb, i, ctx->extended_states);
 		else
-			check_sib_access(entry->insn, arg, regi, arg->base, valueb, i, entry->repeat, ctx);
+			DW_LOG(ERROR, DISASSEMBLY, "Invalid index register %u for mem arg %u\n", regi, i);
 	}
 
 	if (dw_check_handling) {
@@ -1323,10 +1325,10 @@ static void check_updated_regs (struct insn_entry *entry, struct patch_exec_cont
 
 			if (arg->base_taint) {
 				re = dw_get_reg_entry(arg->base);
-				if (re && re->ucontext_index >= 0) {
+				if (re) {
 					for (size_t i = 0; i < dw_nb_saved_registers; i++) {
 						struct reg_entry *saved_re = dw_get_reg_entry(dw_saved_registers[i]);
-						if (saved_re->ucontext_index == re->ucontext_index) {
+						if (saved_re->canonical_index == re->canonical_index) {
 							should_check[i] = true;
 							break;
 						}
@@ -1335,10 +1337,10 @@ static void check_updated_regs (struct insn_entry *entry, struct patch_exec_cont
 			}
 
 			re = dw_get_reg_entry(arg->index);
-			if (re->ucontext_index >= 0 && arg->index_taint) {
+			if (re && re->canonical_index != X86_REG_INVALID && arg->index_taint) {
 				for (size_t i = 0; i < dw_nb_saved_registers; i++) {
 					struct reg_entry *saved_re = dw_get_reg_entry(dw_saved_registers[i]);
-					if (saved_re->ucontext_index == re->ucontext_index) {
+					if (saved_re->canonical_index == re->canonical_index) {
 						should_check[i] = true;
 						break;
 					}

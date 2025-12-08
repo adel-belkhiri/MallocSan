@@ -17,6 +17,8 @@
 struct reg_entry {
 	int index;
 	char *name;
+	bool is_gpr;
+	int canonical_index;
 	int size;
 	int vector_size;
 	int ucontext_index;
@@ -39,6 +41,8 @@ extern uintptr_t dw_save_regs[];
 
 #define dw_set_register(base, index, value) \
 	*((uintptr_t *) ((void *) (base) + (index))) = value
+
+bool reg_is_gpr(unsigned reg);
 
 #define reg_is_sse(reg) ((reg) >= X86_REG_XMM0 && (reg) <= X86_REG_XMM31)
 #define reg_is_avx2(reg) ((reg) >= X86_REG_YMM0 && (reg) <= X86_REG_YMM31)
