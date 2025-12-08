@@ -1424,7 +1424,7 @@ static int vsnprintf_impl(output_gadget_t* output, const char* format, va_list a
 
   // Note: The library only calls vsnprintf_impl() with output->pos being 0. However, it is
   // possible to call this function with a non-zero pos value for some "remedial printing".
-  format_string_loop(output, format, args);
+  format_string_loop(output, nformat, args);
 
   // termination
   append_termination_with_gadget(output);
@@ -1455,8 +1455,35 @@ int vsnprintf_(char* s, size_t n, const char* format, va_list arg)
 
 int vsprintf_(char* s, const char* format, va_list arg)
 {
-  size_t n = __glibc_objsize((char *)dw_unprotect((void *)s));
-  if(n > PRINTF_MAX_POSSIBLE_BUFFER_SIZE) n = PRINTF_MAX_POSSIBLE_BUFFER_SIZE;
+  size_t n;
+  // Getting size at compile time (e.g., char buf[128])
+  size_t osz = __glibc_objsize(s);
+
+  if (osz != (size_t)-1) {
+    n = osz;
+  } else if (dw_is_protected(s)) {
+    size_t size = dw_get_size((void *)s);
+    void *base_addr = dw_get_base_addr((void *)s);
+    uintptr_t start = (uintptr_t)dw_unprotect((void *)s);
+
+    if (base_addr != NULL && size > 0) {
+      uintptr_t base = (uintptr_t)base_addr;
+
+      if (start >= base && (size_t)(start - base) <= size)
+        n = size - (size_t)(start - base);
+      else
+        n = PRINTF_MAX_POSSIBLE_BUFFER_SIZE;
+    } else {
+      n = PRINTF_MAX_POSSIBLE_BUFFER_SIZE;
+    }
+  } else {
+    /* Unknown origin/size, fall back to our global max */
+    n = PRINTF_MAX_POSSIBLE_BUFFER_SIZE;
+  }
+
+  if (n > PRINTF_MAX_POSSIBLE_BUFFER_SIZE)
+    n = PRINTF_MAX_POSSIBLE_BUFFER_SIZE;
+
   return vsnprintf_(s, n, format, arg);
 }
 
