@@ -34,7 +34,7 @@ unsigned dw_saved_registers[] = {
 
 const unsigned dw_nb_saved_registers = sizeof(dw_saved_registers) / sizeof(unsigned);
 
-uintptr_t dw_save_regs[sizeof(dw_saved_registers) / sizeof(unsigned)];
+__thread uintptr_t dw_save_regs[sizeof(dw_saved_registers) / sizeof(unsigned)];
 
 struct reg_entry reg_table[] = {
 	{ X86_REG_INVALID, NULL, false, X86_REG_INVALID, 0, 1, -1, -1, -1, 0, {} },

@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 
 #include <fcntl.h>
+#include <pthread.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -24,9 +25,54 @@
 struct insn_table {
 	size_t size;
 	struct insn_entry *entries;
+};
+
+__thread struct insn_entry_runtime insn_rt_slots[MAX_SCAN_INST_COUNT];
+
+struct capstone_context {
 	csh handle;
 	cs_insn *insn;
+	bool ready;
 };
+
+__thread struct capstone_context cs_ctx;
+static pthread_key_t cs_key;
+static pthread_once_t cs_key_once = PTHREAD_ONCE_INIT;
+
+static void capstone_context_cleanup(void *arg)
+{
+	(void) arg;
+	if (!cs_ctx.ready)
+		return;
+	cs_free(cs_ctx.insn, 1);
+	cs_close(&cs_ctx.handle);
+	cs_ctx.ready = false;
+}
+
+static void dw_capstone_make_key(void)
+{
+	pthread_key_create(&cs_key, capstone_context_cleanup);
+}
+
+static inline struct capstone_context *capstone_get_context(void)
+{
+	pthread_once(&cs_key_once, dw_capstone_make_key);
+
+	if (!cs_ctx.ready) {
+		if (cs_open(CS_ARCH_X86, CS_MODE_64, &cs_ctx.handle) != CS_ERR_OK)
+			DW_LOG(ERROR, DISASSEMBLY, "cs_open failed!\n");
+
+		cs_option(cs_ctx.handle, CS_OPT_DETAIL, CS_OPT_ON);
+		cs_ctx.insn = cs_malloc(cs_ctx.handle);
+		if (!cs_ctx.insn) {
+			cs_close(&cs_ctx.handle);
+			DW_LOG(ERROR, DISASSEMBLY, "cs_malloc failed!\n");
+		}
+		cs_ctx.ready = true;
+		pthread_setspecific(cs_key, (void *)1);
+	}
+	return &cs_ctx;
+}
 
 /*
  * Allocate the instruction hash table and initialize libcapstone.
@@ -38,12 +84,6 @@ instruction_table *dw_init_instruction_table(size_t size)
 	table->size = 2 * size - 1;
 	table->entries = calloc(table->size, sizeof(struct insn_entry));
 
-	cs_err csres = cs_open(CS_ARCH_X86, CS_MODE_64, &(table->handle));
-	if (csres != CS_ERR_OK)
-		DW_LOG(ERROR, DISASSEMBLY, "cs_open failed, returned %d\n", csres);
-
-	csres = cs_option(table->handle, CS_OPT_DETAIL, CS_OPT_ON);
-	table->insn = cs_malloc(table->handle);
 	return table;
 }
 
@@ -53,8 +93,6 @@ instruction_table *dw_init_instruction_table(size_t size)
 void dw_fini_instruction_table(instruction_table *table)
 {
 	free(table->entries);
-	cs_free(table->insn, 1);
-	cs_close(&(table->handle));
 	free(table);
 }
 
@@ -67,14 +105,63 @@ struct insn_entry *dw_get_instruction_entry(instruction_table *table, uintptr_t 
 	size_t cursor = hash;
 
 	while ((void *) table->entries[cursor].insn != NULL) {
-		if (table->entries[cursor].insn == fault)
-			return &(table->entries[cursor]);
+		struct insn_entry *e = &table->entries[cursor];
+		int state = atomic_load_explicit(&e->state, memory_order_acquire);
+
+		if (state == ENTRY_EMPTY)
+			return NULL;
+
+		if (table->entries[cursor].insn == fault) {
+			if (state == ENTRY_READY)
+				return &(table->entries[cursor]);
+			else
+				return NULL;
+		}
 
 		cursor = (cursor + 1) % table->size;
 		if (cursor == hash)
 			break;
 	}
 	return NULL;
+}
+
+static bool dw_acquire_runtime_slot(struct insn_entry *entry, int *idx_out)
+{
+	for (int i = 0; i < MAX_SCAN_INST_COUNT; ++i) {
+		if (insn_rt_slots[i].entry == entry && insn_rt_slots[i].used)
+			DW_LOG(ERROR, DISASSEMBLY, "Runtime slot %d for instruction 0x%llx shouldn't be used!\n", i, entry->insn);
+
+		if (!insn_rt_slots[i].used) {
+			*idx_out = i;
+			dw_memset(&insn_rt_slots[i], 0, sizeof(insn_rt_slots[i]));
+			insn_rt_slots[i].used = true;
+			insn_rt_slots[i].entry = entry;
+			return true;
+		}
+	}
+	// Out of slots
+	DW_LOG(ERROR, DISASSEMBLY, "Runtime slots shouldn't be exhausted!\n");
+	return false;
+}
+
+static bool dw_find_runtime_slot(struct insn_entry *entry, int *idx_out)
+{
+	for (int i = 0; i < MAX_SCAN_INST_COUNT; ++i) {
+		if (insn_rt_slots[i].used && insn_rt_slots[i].entry == entry)
+		{
+			if (idx_out)
+				*idx_out = i;
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static void dw_release_rt_slot(int idx)
+{
+	insn_rt_slots[idx].used = false;
+	insn_rt_slots[idx].entry = NULL;
 }
 
 /*
@@ -189,7 +276,7 @@ static inline uint8_t vsib_index_width(x86_insn id)
  * case, we check that the resulting address is within bounds.
  */
 static bool similar_memory_access(unsigned int ins_id, const cs_x86_op *arg,
-		const struct memory_arg *m, ucontext_t *uctx, bool repeat)
+		const struct memory_arg *m, const struct memory_arg_runtime *m_rt, ucontext_t *uctx, bool repeat)
 {
 	uintptr_t addr;
 
@@ -224,10 +311,10 @@ static bool similar_memory_access(unsigned int ins_id, const cs_x86_op *arg,
 	/*
 	 * SIB case: base + index * scale + disp.
 	 */
-	uintptr_t index_addr = (m->index != X86_REG_INVALID) ? m->index_addr : 0;
+	uintptr_t index_addr = (m->index != X86_REG_INVALID) ? m_rt->index_addr : 0;
 	size_t access_size = arg->size;
 
-	addr = m->base_addr + index_addr * arg->mem.scale + arg->mem.disp;
+	addr = m_rt->base_addr + index_addr * arg->mem.scale + arg->mem.disp;
 
 	if (repeat) {
 		size_t count = dw_get_register(uctx, dw_get_reg_entry(X86_REG_RCX)->ucontext_index);
@@ -284,7 +371,9 @@ static void dw_lookup_symbol(uintptr_t ip, char *proc_name, size_t name_len, unw
  * case returns the address where the post-handler should be installed
  */
 static uintptr_t dw_defer_post_handler(instruction_table *table,
+		struct capstone_context * cs,
 		struct insn_entry *entry,
+		struct insn_entry_runtime *entry_rt,
 		uintptr_t start_addr,
 		ucontext_t *uctx,
 		unsigned *scanned_count,
@@ -300,6 +389,9 @@ static uintptr_t dw_defer_post_handler(instruction_table *table,
 	int error_code;
 	uint16_t tainted_regs[MAX_MEM_ARG * 2] = {0};
 	uint8_t tainted_regs_count = 0;
+	struct memory_arg *mem;
+	struct memory_arg_runtime *mem_rt;
+
 
 	uintptr_t func_start = 0, func_end = 0;
 	size_t max_bytes = (size_t)MAX_SCAN_INST_COUNT * 15;
@@ -311,29 +403,29 @@ static uintptr_t dw_defer_post_handler(instruction_table *table,
 		// Fallback if libunwind can't provide bounds
 		buff_size = max_bytes;
 		DW_LOG(WARNING, DISASSEMBLY,
-			   "Cannot get function bounds for address 0x%llx, using max scan size %lu\n",
-			   start_addr, buff_size);
+		   "Cannot get function bounds for address 0x%llx, using max scan size %lu\n",
+		   start_addr, buff_size);
 	}
 
-		/* Identify which registers from the original instructions are tainted */
+	/* Identify which registers from the original instructions are tainted */
 	for (int i = 0; i < entry->nb_arg_m; i++) {
-		struct memory_arg *mem = &entry->arg_m[i];
+		mem = &entry->arg_m[i];
+		mem_rt = &entry_rt->arg_m[i];
 
-		if (mem->base_taint)
+		if (mem_rt->base_taint)
 			reg_set_add(tainted_regs, &tainted_regs_count, sizeof(tainted_regs)/sizeof(tainted_regs[0]), mem->base);
 
-		if (reg_is_gpr(mem->index) && mem->index_taint)
+		if (reg_is_gpr(mem->index) && mem_rt->index_taint)
 			reg_set_add(tainted_regs, &tainted_regs_count, sizeof(tainted_regs)/sizeof(tainted_regs[0]), mem->index);
 
-		else if (reg_is_avx(mem->index) && mem->index_is_tainted)
+		else if (reg_is_avx(mem->index) && mem_rt->index_is_tainted)
 			reg_set_add(tainted_regs, &tainted_regs_count, sizeof(tainted_regs)/sizeof(tainted_regs[0]), mem->index);
 	}
 
 	while (n < MAX_SCAN_INST_COUNT && buff_size > 0) {
-		bool success = cs_disasm_iter(table->handle, &code, &buff_size, &instr_addr,
-								   table->insn);
+		bool success = cs_disasm_iter(cs->handle, &code, &buff_size, &instr_addr, cs->insn);
 		if (!success) {
-			error_code = cs_errno(table->handle);
+			error_code = cs_errno(cs->handle);
 			if (error_code != CS_ERR_OK)
 				DW_LOG(ERROR, DISASSEMBLY, "Capstone cannot decode instruction 0x%llx, error %d\n",
 					    instr_addr, error_code);
@@ -341,7 +433,7 @@ static uintptr_t dw_defer_post_handler(instruction_table *table,
 			goto stop_return;   // End of buffer
 		}
 
-		cs_insn *insn = table->insn;
+		cs_insn *insn = cs->insn;
 		cs_detail *detail = insn->detail;
 		cs_x86 *x86 = &detail->x86;
 		cs_regs regs_read, regs_write;
@@ -350,7 +442,7 @@ static uintptr_t dw_defer_post_handler(instruction_table *table,
 		uint8_t reg_ops_count = 0, mem_ops_count = 0;
 		bool is_memory_access_instruction = false;
 
-		error_code = cs_regs_access(table->handle, insn, regs_read, &read_count,
+		error_code = cs_regs_access(cs->handle, insn, regs_read, &read_count,
 								   regs_write, &write_count);
 		if (error_code != CS_ERR_OK)
 			DW_LOG(ERROR, DISASSEMBLY, "Capstone cannot give register accesses\n");
@@ -377,7 +469,7 @@ static uintptr_t dw_defer_post_handler(instruction_table *table,
 				 */
 				if ((last_safe_addr <= last_same_access_addr) &&
 					(insn->id != X86_INS_INT3) && (insn->id != X86_INS_JMP)) {
-					last_safe_addr = table->insn->address;
+					last_safe_addr = cs->insn->address;
 					count_same_access += pending_same_access;
 				}
 
@@ -400,13 +492,13 @@ static uintptr_t dw_defer_post_handler(instruction_table *table,
 		if (!taint_involved) {
 			// We cannot patch memory access instructions as they might fault and require to be repatched
 			if (!is_memory_access_instruction && (last_safe_addr <= last_same_access_addr)) {
-				last_safe_addr = table->insn->address;
+				last_safe_addr = cs->insn->address;
 				count_same_access += pending_same_access;
 				pending_same_access = 0;
 			}
 
 			DW_LOG(INFO, DISASSEMBLY, "Skipping instruction at 0x%llx -> %s %s\n",
-				   table->insn->address, table->insn->mnemonic, table->insn->op_str);
+				   cs->insn->address, cs->insn->mnemonic, cs->insn->op_str);
 			++n;
 			continue;
 		}
@@ -428,12 +520,13 @@ static uintptr_t dw_defer_post_handler(instruction_table *table,
 
 			if (uses_taint) {
 				for (int j = 0; j < entry->nb_arg_m; j++) {
-					struct memory_arg *mem = &entry->arg_m[j];
+					mem = &entry->arg_m[j];
+					mem_rt = &entry_rt->arg_m[j];
 
-					if (!similar_memory_access(insn->id, op, mem, uctx, repeat))
+					if (!similar_memory_access(insn->id, op, mem, mem_rt, uctx, repeat))
 						goto stop_return;
 				}
-				last_same_access_addr = table->insn->address;
+				last_same_access_addr = cs->insn->address;
 				pending_same_access++;
 			}
 		}
@@ -456,7 +549,7 @@ static uintptr_t dw_defer_post_handler(instruction_table *table,
 				}
 
 				if (!is_memory_access_instruction && (last_safe_addr <= last_same_access_addr)) {
-					last_safe_addr = table->insn->address;
+					last_safe_addr = cs->insn->address;
 					count_same_access += pending_same_access;
 				}
 				goto stop_return;
@@ -465,7 +558,7 @@ static uintptr_t dw_defer_post_handler(instruction_table *table,
 			// The tainted base or index register is read
 			if (read) {
 				if (!is_memory_access_instruction && (last_safe_addr <= last_same_access_addr)) {
-					last_safe_addr = table->insn->address;
+					last_safe_addr = cs->insn->address;
 					count_same_access += pending_same_access;
 				}
 				goto stop_return;
@@ -478,7 +571,7 @@ static uintptr_t dw_defer_post_handler(instruction_table *table,
 		// All tainted registers are overwritten, so we can skip the post-handler
 		if (every_tainted_reg_written) {
 			if (!is_memory_access_instruction && (last_safe_addr <= last_same_access_addr)) {
-				last_safe_addr = table->insn->address;
+				last_safe_addr = cs->insn->address;
 				count_same_access += pending_same_access;
 			}
 
@@ -489,7 +582,7 @@ static uintptr_t dw_defer_post_handler(instruction_table *table,
 
 		// Otherwise, we can safely skip the instruction
 		DW_LOG(INFO, DISASSEMBLY, "Skipping instruction at 0x%llx -> %s %s\n",
-			    table->insn->address, table->insn->mnemonic, table->insn->op_str);
+			    cs->insn->address, cs->insn->mnemonic, cs->insn->op_str);
 
 		n++;
 		continue;
@@ -511,7 +604,7 @@ stop_return:
 }
 
 static bool
-fill_memory_operand(struct memory_arg* arg, const cs_x86_op *op, const csh handle,
+fill_memory_operand(struct memory_arg* m, struct memory_arg_runtime* m_rt, const cs_x86_op *op, const csh handle,
 				    const cs_insn *insn, const cs_x86 *x86, const ucontext_t *uctx)
 {
 	struct reg_entry *re;
@@ -521,24 +614,24 @@ fill_memory_operand(struct memory_arg* arg, const cs_x86_op *op, const csh handl
 	int64_t displacement;
 	bool register_is_protected = false;
 
-	arg->scale = scale = op->mem.scale;
-	arg->displacement = displacement = op->mem.disp;
-	arg->length = op->size;
-	arg->access = op->access;
+	m->scale = scale = op->mem.scale;
+	m->displacement = displacement = op->mem.disp;
+	m->length = op->size;
+	m->access = op->access;
 
-	arg->base = base = op->mem.base;
-	arg->index = index = op->mem.index;
+	m->base = base = op->mem.base;
+	m->index = index = op->mem.index;
 
 	// Handle the base register
 	re = dw_get_reg_entry(base);
 	if (re && base != X86_REG_INVALID) {
 		if (!reg_is_gpr(base))
-			DW_LOG(ERROR, DISASSEMBLY, "Base register %s is not a General-Purpose Register\n", re->name);
+			DW_LOG(ERROR, DISASSEMBLY, "Base register %s not a General-Purpose Register\n", re->name);
 
-		arg->base_addr = base_addr = dw_get_register(uctx, re->ucontext_index);
+		m_rt->base_addr = base_addr = dw_get_register(uctx, re->ucontext_index);
 		if (dw_is_protected((void *) base_addr)) {
 			register_is_protected = true;
-			arg->base_taint = base_addr;
+			m_rt->base_taint = base_addr;
 		}
 	}
 
@@ -554,9 +647,9 @@ fill_memory_operand(struct memory_arg* arg, const cs_x86_op *op, const csh handl
 	// Handle the index register according to SIB/VSIB access modes
 	re = dw_get_reg_entry(index);
 	if (reg_is_gpr(index)) {
-		arg->index_addr = index_addr = dw_get_register(uctx, re->ucontext_index);
+		m_rt->index_addr = index_addr = dw_get_register(uctx, re->ucontext_index);
 		if (dw_is_protected((void *) index_addr)) {
-			arg->index_taint = index_addr;
+			m_rt->index_taint = index_addr;
 			register_is_protected = true;
 		}
 
@@ -573,15 +666,18 @@ fill_memory_operand(struct memory_arg* arg, const cs_x86_op *op, const csh handl
 			DW_LOG(ERROR, DISASSEMBLY, "Index register %s not AVX or GP register\n", re->name);
 
 		/* Calculate the width of each of the indices and their count */
-		uint8_t index_width = arg->index_width = vsib_index_width(insn->id);
+		uint8_t index_width = m->index_width = vsib_index_width(insn->id);
 		if (index_width != MIN_VSIB_INDEX_WIDTH && index_width != MAX_VSIB_INDEX_WIDTH)
 			DW_LOG(ERROR, DISASSEMBLY, "Invalid width (%d) for the indices within the %s register\n",
-				   arg->index_width, dw_get_reg_entry(index)->name);
+				   m->index_width, dw_get_reg_entry(index)->name);
 
-		arg->indices_count = re->size / index_width;
+		m->indices_count = re->size / index_width;
 
-		if (index_width == MAX_VSIB_INDEX_WIDTH)
+		// This is just a heuristic: we consider the index tainted if its width is equal to 8 bytes
+		if (index_width == MAX_VSIB_INDEX_WIDTH) {
+			m_rt->index_is_tainted = true;
 			register_is_protected = true;
+		}
 	}
 
 	return register_is_protected;
@@ -596,8 +692,9 @@ static void assign_base_index_access(struct insn_entry *entry)
 {
 	for (unsigned i = 0; i < entry->nb_arg_m; i++) {
 		struct memory_arg *arg_m = &entry->arg_m[i];
-		struct reg_entry *base_re = dw_get_reg_entry(arg_m->base);
+		struct reg_entry *base_re  = dw_get_reg_entry(arg_m->base);
 		struct reg_entry *index_re = dw_get_reg_entry(arg_m->index);
+
 		for (unsigned j = 0; j < entry->nb_arg_r; j++) {
 			struct reg_entry *re_arg_r = dw_get_reg_entry(entry->arg_r[j].reg);
 
@@ -634,7 +731,7 @@ static inline unsigned int get_avx512_mask_register(unsigned int gregs_reads[],
 }
 
 static unsigned
-fill_instruction_operands(struct insn_entry *entry, const csh handle, const cs_insn *insn,
+fill_instruction_operands(struct insn_entry *entry, struct insn_entry_runtime* entry_rt, const csh handle, const cs_insn *insn,
 						  const cs_x86 *x86, const ucontext_t *uctx)
 {
 	struct reg_entry *re;
@@ -666,7 +763,7 @@ fill_instruction_operands(struct insn_entry *entry, const csh handle, const cs_i
 			if (arg_m >= MAX_MEM_ARG)
 				DW_LOG(ERROR, DISASSEMBLY, "Too many memory arguments\n");
 
-			if (fill_memory_operand(&entry->arg_m[arg_m], op, handle, insn, x86, uctx)) {
+			if (fill_memory_operand(&entry->arg_m[arg_m], &entry_rt->arg_m[arg_m], op, handle, insn, x86, uctx)) {
 				nb_protected++;
 
 				// For AVX-512 scatter/gather operations, the mask register (k0..k1) is optional
@@ -693,7 +790,8 @@ fill_instruction_operands(struct insn_entry *entry, const csh handle, const cs_i
 			break;
 
 		default:
-			DW_LOG(WARNING, DISASSEMBLY, "Invalid operand %lu\n", i);
+			DW_LOG(WARNING, DISASSEMBLY, "Instruction 0x%llx: Invalid operand %lu (type %d)\n",
+				    entry->insn, i, op->type);
 			break;
 		}
 	}
@@ -706,47 +804,31 @@ fill_instruction_operands(struct insn_entry *entry, const csh handle, const cs_i
 }
 
 /*
- * Create a new entry for this instruction address
+ * Disassembles a faulted instruction, and populates the entry with register and memory operand
+ * information.
  */
-struct insn_entry*
-dw_create_instruction_entry(instruction_table *table, uintptr_t fault, uintptr_t *next, ucontext_t *uctx)
+static bool dw_populate_instruction_entry(instruction_table *table, struct insn_entry *entry, uintptr_t fault, ucontext_t *uctx)
 {
-	size_t hash = fault % table->size;
-	size_t cursor = hash;
-
-	while ((void *) table->entries[cursor].insn != NULL) {
-		if (table->entries[cursor].insn == fault)
-			DW_LOG(ERROR, DISASSEMBLY, "Trying to add existing instruction in hash table\n");
-
-		cursor = (cursor + 1) % table->size;
-		if (cursor == hash)
-			DW_LOG(ERROR, DISASSEMBLY, "Instruction hash table full\n");
-	}
-
-	// We insert the new entry at the first empty location following the hash code index
-	table->entries[cursor].insn = fault;
-	struct insn_entry *entry = &(table->entries[cursor]);
-
 	size_t sizeds = 15; /* x86 max insn length */
-	const uint8_t *code = (uint8_t *)fault;
-	uint64_t instr_addr = (uint64_t) fault;
-
 	bool success;
 	int error_code;
+	const uint8_t *code = (uint8_t *)fault;
+	uint64_t insn_addr = (uint64_t) fault;
 
 	// Disassemble the instruction with Capstone
-	success = cs_disasm_iter(table->handle, &code, &sizeds, &instr_addr, table->insn);
-	error_code = cs_errno(table->handle);
+	struct capstone_context * cs = capstone_get_context();
+	success = cs_disasm_iter(cs->handle, &code, &sizeds, &insn_addr, cs->insn);
+	error_code = cs_errno(cs->handle);
 	if (!success)
 		DW_LOG(ERROR, DISASSEMBLY, "Capstone cannot decode instruction 0x%llx, error %d\n",
 			   fault, error_code);
 
-	entry->insn_length = table->insn->size;
-	entry->next_insn = *next = instr_addr;
+	entry->insn = fault;
+	entry->insn_length = cs->insn->size;
+	entry->next_insn = insn_addr;
 	entry->post_handler = true;
 	entry->deferred_post_handler = false;
-	snprintf(entry->disasm_insn, sizeof(entry->disasm_insn),
-			   "%.11s %.51s", table->insn->mnemonic, table->insn->op_str);
+	snprintf(entry->disasm_insn, sizeof(entry->disasm_insn), "%.11s %.51s", cs->insn->mnemonic, cs->insn->op_str);
 
 	if (dw_log_enabled(WARNING, DISASSEMBLY)) {
 		code = (uint8_t *) fault;
@@ -767,18 +849,19 @@ dw_create_instruction_entry(instruction_table *table, uintptr_t fault, uintptr_t
 		// This is info, not a warning, but we need it for debug purposes for now
 		dw_log(WARNING, DISASSEMBLY,
 			"==> Instruction 0x%llx (%s+0x%lx), entry %lu, disasm -> %s %s, (%hu), %s\n",
-			fault, proc_name, offset, (entry - table->entries), table->insn->mnemonic,
-			table->insn->op_str, table->insn->size, insn_code);
+			fault, proc_name, offset, (entry - table->entries), cs->insn->mnemonic,
+			cs->insn->op_str, cs->insn->size, insn_code);
 	}
 
-	cs_detail *detail = table->insn->detail;
+	cs_detail *detail = cs->insn->detail;
 	cs_x86 *x86 = &(detail->x86);
 
-	// TODO: Remove once libpatch supports immediate execution of post-handlers
+	// TODO: To be removed once libpatch supports immediate execution of post-handlers
 	// for call instructions.
-	if (cs_insn_group(table->handle, table->insn, X86_GRP_CALL)) {
+	if (cs_insn_group(cs->handle, cs->insn, X86_GRP_CALL)) {
 		DW_LOG(WARNING, DISASSEMBLY,
-		    "Call instruction %llx with protected memory operands, post handler cannot be used\n", fault);
+		    "Call instruction %llx (%s %s) has protected memory operands, post handler cannot be used\n",
+		    fault, cs->insn->mnemonic, cs->insn->op_str);
 		entry->post_handler = false;
 	}
 
@@ -790,7 +873,7 @@ dw_create_instruction_entry(instruction_table *table, uintptr_t fault, uintptr_t
 	unsigned reg;
 	cs_regs regs_read, regs_write;
 	uint8_t read_count = 0, write_count = 0;
-	error_code = cs_regs_access(table->handle, table->insn,
+	error_code = cs_regs_access(cs->handle, cs->insn,
 							   regs_read, &read_count, regs_write, &write_count);
 
 	if (error_code != CS_ERR_OK)
@@ -809,21 +892,22 @@ dw_create_instruction_entry(instruction_table *table, uintptr_t fault, uintptr_t
 
 	for (int i = 0; i < min(read_count, MAX_MOD_REG); i++) {
 		reg = entry->gregs_read[i] = regs_read[i];
-		DW_LOG(INFO, DISASSEMBLY, "read: %s; (%d)\n", cs_reg_name(table->handle, reg), reg);
+		DW_LOG(INFO, DISASSEMBLY, "read: %s; (%d)\n", cs_reg_name(cs->handle, reg), reg);
 	}
 
 	for (int i = 0; i < min(write_count, MAX_MOD_REG); i++) {
 		reg = entry->gregs_written[i] = regs_write[i];
-		DW_LOG(INFO, DISASSEMBLY, "write: %s; (%d)\n", cs_reg_name(table->handle, reg), reg);
+		DW_LOG(INFO, DISASSEMBLY, "write: %s; (%d)\n", cs_reg_name(cs->handle, reg), reg);
 	}
 
-	unsigned nb_protected = fill_instruction_operands(entry, table->handle, table->insn, x86, uctx);
+	struct insn_entry_runtime entry_rt = {0};
+	entry_rt.entry = entry;
+	unsigned nb_protected = fill_instruction_operands(entry, &entry_rt, cs->handle, cs->insn, x86, uctx);
 	if (nb_protected == 0) {
 		DW_LOG(WARNING, DISASSEMBLY,
-			   "Instruction 0x%llx generated a fault but no protected memory argument\n",
-			   entry->insn);
+			   "Instruction 0x%llx generated a fault but no protected memory argument\n", entry->insn);
 		dw_memset((void *)entry, 0, sizeof(struct insn_entry));
-		return NULL;
+		return false;
 	}
 
 	if (nb_protected > 1)
@@ -833,21 +917,27 @@ dw_create_instruction_entry(instruction_table *table, uintptr_t fault, uintptr_t
 	bool need_immediate_reprotection = false;
 	bool all_tainted_overwritten = true;
 	for (int i = 0; i < entry->nb_arg_m; i++) {
+		bool is_vsib = reg_is_avx(entry->arg_m[i].index);
+		bool base_overwritten = (entry->arg_m[i].base_access & CS_AC_WRITE) ||
+				dw_reg_written(entry, entry->arg_m[i].base);
+		bool index_overwritten = (entry->arg_m[i].index_access & CS_AC_WRITE) ||
+				dw_reg_written(entry, entry->arg_m[i].index);
 
 		// If the base or index registers is also a register argument, we need
 		// to retaint it immediatly, unless it is overwritten by the instruction.
-		if ((entry->arg_m[i].base_access && entry->arg_m[i].base_taint) ||
-			(!reg_is_avx(entry->arg_m[i].index) && entry->arg_m[i].index_access && entry->arg_m[i].index_taint) ||
-			(reg_is_avx(entry->arg_m[i].index) && entry->arg_m[i].index_access && entry->arg_m[i].index_is_tainted)) {
+		if ((entry->arg_m[i].base_access && entry_rt.arg_m[i].base_taint) ||
+			(!is_vsib && entry->arg_m[i].index_access && entry_rt.arg_m[i].index_taint) ||
+			(is_vsib && entry->arg_m[i].index_access && entry_rt.arg_m[i].index_is_tainted)) {
 			need_immediate_reprotection = true;
-			DW_LOG(INFO, DISASSEMBLY, "Immediate reprotection is required at 0x%llx\n", entry->insn);
 		}
 
 		// Is there a tainted register that is not overwritten?
-		if ((entry->arg_m[i].base_taint && (!(entry->arg_m[i].base_access) ||
-			   (entry->arg_m[i].base_access & CS_AC_READ))) ||
-			(entry->arg_m[i].index_taint && (!(entry->arg_m[i].index_access) ||
-			   (entry->arg_m[i].index_access & CS_AC_READ)))) {
+		if ((entry_rt.arg_m[i].base_taint && !base_overwritten &&
+				(!(entry->arg_m[i].base_access) || (entry->arg_m[i].base_access & CS_AC_READ))) ||
+			(!is_vsib && entry_rt.arg_m[i].index_taint && !index_overwritten &&
+				(!(entry->arg_m[i].index_access) || (entry->arg_m[i].index_access & CS_AC_READ))) ||
+			(is_vsib && entry_rt.arg_m[i].index_is_tainted && !index_overwritten &&
+				(!(entry->arg_m[i].index_access) || (entry->arg_m[i].index_access & CS_AC_READ)))) {
 			all_tainted_overwritten = false;
 		}
 
@@ -862,7 +952,7 @@ dw_create_instruction_entry(instruction_table *table, uintptr_t fault, uintptr_t
 				   entry->insn, dw_get_reg_entry(entry->arg_m[i].base)->name);
 
 		if (dw_reg_written(entry, entry->arg_m[i].index) && !(entry->arg_m[i].index_access & CS_AC_WRITE) &&
-			!dw_reg_si_di(entry, entry->arg_m[i].index)) //FIXME: to check for AVX index_is_tainted
+			!dw_reg_si_di(entry, entry->arg_m[i].index))
 			DW_LOG(WARNING, DISASSEMBLY, "Instruction 0x%llx, index register %s implicitly modified\n",
 				   entry->insn, dw_get_reg_entry(entry->arg_m[i].index)->name);
 	}
@@ -871,7 +961,7 @@ dw_create_instruction_entry(instruction_table *table, uintptr_t fault, uintptr_t
 	if (all_tainted_overwritten) {
 		DW_LOG(INFO, DISASSEMBLY,
 			   "Disabling post-handler at 0x%llx (%s %s) because all tainted registers were overwritten.\n",
-			   entry->insn, table->insn->mnemonic, table->insn->op_str);
+			   entry->insn, cs->insn->mnemonic, cs->insn->op_str);
 		entry->post_handler = false;
 	}
 
@@ -885,14 +975,15 @@ dw_create_instruction_entry(instruction_table *table, uintptr_t fault, uintptr_t
 	 */
 
 	if (entry->post_handler && !need_immediate_reprotection) {
-		unsigned insn_scan_count, similar_acess_count;
-		uintptr_t last_safe_addr = dw_defer_post_handler(table, entry,
-				instr_addr, uctx, &insn_scan_count,
-				&similar_acess_count);
+		unsigned int insn_scan_count, similar_acess_count;
+		uintptr_t last_safe_addr;
+
+		last_safe_addr = dw_defer_post_handler(table, cs, entry, &entry_rt, insn_addr, uctx, &insn_scan_count,
+											    &similar_acess_count);
 
 		DW_LOG(INFO, DISASSEMBLY,
 			   "Forward scan has stopped at 0x%llx (%s %s), after (%u) instructions.\n",
-			   table->insn->address, table->insn->mnemonic, table->insn->op_str, insn_scan_count);
+			   cs->insn->address, cs->insn->mnemonic, cs->insn->op_str, insn_scan_count);
 
 		if (entry->post_handler && similar_acess_count > 0) {
 			entry->deferred_post_handler = true;
@@ -903,7 +994,33 @@ dw_create_instruction_entry(instruction_table *table, uintptr_t fault, uintptr_t
 				   last_safe_addr, similar_acess_count);
 		}
 	}
-	return entry;
+	return true;
+}
+
+static inline const char *strategy_name(enum dw_strategies s)
+{
+	switch (s) {
+		case DW_PATCH_TRAP: return "TRAP";
+		case DW_PATCH_JUMP: return "JUMP";
+		case DW_PATCH_MIXED: return "MIXED";
+		default: return "UNKNOWN";
+	}
+}
+
+/*
+ * Handler executed before and after instructions that possibly access tainted
+ * pointers when an instruction is "patched" to insert pre and post probes.
+ */
+static void patch_handler(struct patch_exec_context *ctx, uint8_t post)
+{
+	struct insn_entry *entry = ctx->user_data;
+	if (post || ctx->program_counter != entry->insn) {
+		//DW_LOG(WARNING, MAIN, "REprotect @ 0x%lx\n", ctx->program_counter);
+		dw_reprotect_context(ctx);
+	} else {
+		// DW_LOG(WARNING, MAIN, "UNprotect @ 0x%lx\n", ctx->program_counter);
+		dw_unprotect_context(ctx);
+	}
 }
 
 static void check_patch(patch_status s, char *msg)
@@ -1014,6 +1131,114 @@ bool dw_instruction_entry_patch(struct insn_entry *entry,
 	return true;
 }
 
+/*
+ * This function patches an instruction and returns the strategy that finally worked,
+ * or exit on failure.
+ */
+static enum dw_strategies do_patch(struct insn_entry *entry, enum dw_strategies strategy,
+								   dw_patch_probe handler, bool is_deferred)
+{
+	const char *patch_type = is_deferred ? "deferred" : "initial";
+	uintptr_t patch_addr = is_deferred ? entry->next_insn : entry->insn;
+	enum dw_strategies chosen_strategy = DW_PATCH_UNKNOWN;
+
+	const enum dw_strategies fallback_strategy =
+				(strategy == DW_PATCH_JUMP) ? DW_PATCH_TRAP : DW_PATCH_UNKNOWN;
+
+	if (dw_instruction_entry_patch(entry, strategy, handler, is_deferred)) {
+		chosen_strategy = strategy;
+	} else if (fallback_strategy != DW_PATCH_UNKNOWN) {
+		if (dw_instruction_entry_patch(entry, fallback_strategy, handler, is_deferred))
+			chosen_strategy = fallback_strategy;
+	}
+
+	if (chosen_strategy == DW_PATCH_UNKNOWN)
+		DW_LOG(ERROR, MAIN, "Patching %s location 0x%llx failed (origin 0x%llx).\n",
+			   patch_type, patch_addr, entry->insn);
+
+	DW_LOG(INFO, MAIN, "Successfully patched %s site 0x%llx with %s strategy.\n",
+		   patch_type, patch_addr, strategy_name(chosen_strategy));
+
+	return chosen_strategy;
+}
+
+/*
+ * Create a new entry for this instruction address
+ */
+struct insn_entry *
+dw_create_instruction_entry(instruction_table *table, uintptr_t fault, ucontext_t *uctx, bool *created_out)
+{
+	size_t hash   = fault % table->size;
+	size_t cursor = hash;
+
+	*created_out = false;
+
+	while (1) {
+		struct insn_entry *e = &table->entries[cursor];
+		int entry_state = atomic_load_explicit(&e->state, memory_order_acquire);
+
+		if (entry_state == ENTRY_EMPTY) {
+			int expected = ENTRY_EMPTY;
+			/* Try to become the creator for this entry slot */
+			if (atomic_compare_exchange_strong_explicit(&e->state, &expected, ENTRY_INITIALIZING,
+				    memory_order_acq_rel, memory_order_relaxed)) {
+
+				bool ok = dw_populate_instruction_entry(table, e, fault, uctx);
+				if (!ok) {
+					atomic_store_explicit(&e->state, ENTRY_FAILED, memory_order_release);
+					DW_LOG(WARNING, MAIN, "Problem creating entry for instruction 0x%llx\n", fault);
+					return NULL;
+				}
+
+				/*
+				* Here we patch the instruction that involves tainted registers. If the post-handler
+				* is deferred, we also patch the deferred location. If we cannot install a patch with
+				* a given strategy, we fall back to the trap strategy.
+				*/
+				e->strategy = do_patch(e, dw_strategy, patch_handler, false);
+
+				if (e->post_handler && e->deferred_post_handler) {
+					if (e->strategy != do_patch(e, dw_strategy, patch_handler, true))
+						e->strategy = DW_PATCH_MIXED;
+				}
+
+				DW_LOG(INFO, MAIN, "Patch summary for 0x%llx: Post-handler: %s, Deferred: %s, Strategy: %s\n",
+					e->insn, e->post_handler ? "Yes" : "No", e->deferred_post_handler ? "Yes" : "No",
+					strategy_name(e->strategy));
+
+				atomic_store_explicit(&e->state, ENTRY_READY, memory_order_release);
+				*created_out = true;
+				return e;
+			}
+			/* lost the race, go around and re-read the entry's state */
+			continue;
+		}
+
+		if (entry_state == ENTRY_INITIALIZING) {
+			/* Another thread is creating this slot; wait until it finishes. */
+			do {
+				entry_state = atomic_load_explicit(&e->state, memory_order_acquire);
+			} while (entry_state == ENTRY_INITIALIZING);
+
+			if ((e->insn == fault) && (entry_state == ENTRY_READY || entry_state == ENTRY_FAILED))
+				return (entry_state == ENTRY_READY) ? e : NULL;
+		}
+		else if (entry_state == ENTRY_READY)
+		{
+			if (e->insn == fault)
+				return e;
+		}
+
+		cursor = (cursor + 1) % table->size;
+		if (cursor == hash) {
+			DW_LOG(ERROR, DISASSEMBLY, "Instruction hash table full\n");
+			break;
+		}
+	}
+
+	return NULL;
+}
+
 void dw_print_regs(struct patch_exec_context *ctx)
 {
 	for (int i = 0; i < dw_nb_saved_registers; i++)
@@ -1049,16 +1274,17 @@ done:
 	*out_bits = bits;
 }
 
-static void check_vsib_access(struct memory_arg *arg, unsigned index, uintptr_t valueb,
-					    unsigned idx, void *xsave_ptr)
+static void check_vsib_access(struct memory_arg *mem, struct memory_arg_runtime *mem_rt,
+					    uintptr_t valueb, unsigned idx, void *xsave_ptr)
 {
 	uint8_t width, count;
 	uint8_t index_buffer[64] = {0}; /* ZMM registers are 64 bytes */
 	size_t bytes_count, index_size, mask_size = 0;
-	const int mask_reg = arg->mask;
+	unsigned index = mem->index;
+	const int mask_reg = mem->mask;
 
-	width = arg->index_width;
-	count = arg->indices_count;
+	width = mem->index_width;
+	count = mem->indices_count;
 
 	if (!width || (width != MIN_VSIB_INDEX_WIDTH && width != MAX_VSIB_INDEX_WIDTH)) {
 		DW_LOG(ERROR, DISASSEMBLY, "Invalid VSIB index width %u for mem arg %u\n", width, idx);
@@ -1076,7 +1302,7 @@ static void check_vsib_access(struct memory_arg *arg, unsigned index, uintptr_t 
 		DW_LOG(WARNING, DISASSEMBLY, "Unexpected index register size %zu (width %u, lanes %u) for mem arg %u\n",
 			index_size, width, count, idx);
 
-	arg->index_is_tainted = false;
+	mem_rt->index_is_tainted = false;
 
 	/* Decode the indices from the XSAVE area. */
 	bytes_count = decode_extended_states(index, xsave_ptr, index_buffer);
@@ -1086,7 +1312,7 @@ static void check_vsib_access(struct memory_arg *arg, unsigned index, uintptr_t 
 			dw_get_reg_entry(index)->name, bytes_count, index_size);
 
 	/* Save the original indices as they might be tainted. */
-	memcpy(arg->indices, index_buffer, bytes_count);
+	memcpy(mem_rt->indices, index_buffer, bytes_count);
 
 	/*
 	 * Decode the mask register:
@@ -1095,11 +1321,11 @@ static void check_vsib_access(struct memory_arg *arg, unsigned index, uintptr_t 
 	 * - AVX2/XMM|YMM: derive a bit mask from MSB of each lane.
 	 */
 	if (mask_reg == X86_REG_INVALID || mask_reg == X86_REG_K0) {
-		arg->mask_bv = ~0ULL; /* all lanes enabled */
+		mem_rt->mask_bv = ~0ULL; /* all lanes enabled */
 	} else if (reg_is_avx512_opmask(mask_reg)) {
 		mask_size = dw_get_reg_entry(mask_reg)->size;
 		bytes_count = decode_extended_states(mask_reg, xsave_ptr,
-						     (uint8_t *)&arg->mask_bv);
+						     (uint8_t *)&mem_rt->mask_bv);
 
 		if (bytes_count != mask_size)
 			DW_LOG(ERROR, DISASSEMBLY, "Failed to decode mask register %s (decoded %zu / expected %zu)\n",
@@ -1114,7 +1340,7 @@ static void check_vsib_access(struct memory_arg *arg, unsigned index, uintptr_t 
 				"Failed to decode mask register %s (decoded %zu / expected %zu)\n",
 				dw_get_reg_entry(mask_reg)->name, bytes_count, mask_size);
 
-		decode_avx_mask(mask_buffer, count, width * 8, &arg->mask_bv);
+		decode_avx_mask(mask_buffer, count, width * 8, &mem_rt->mask_bv);
 	} else {
 		DW_LOG(ERROR, DISASSEMBLY, "Invalid mask register %s for mem arg %u\n",
 			dw_get_reg_entry(mask_reg)->name, idx);
@@ -1129,69 +1355,62 @@ static void check_vsib_access(struct memory_arg *arg, unsigned index, uintptr_t 
 			valuei = *((uint64_t *)(index_buffer + i * width));
 
 		/* Check whether the access is valid for each enabled lane. */
-		if (arg->mask_bv & (1ull << i)) {
-			uintptr_t addr = valueb + valuei * arg->scale + arg->displacement;
-			dw_check_access((void *) addr, arg->length);
+		if (mem_rt->mask_bv & (1ull << i)) {
+			uintptr_t addr = valueb + valuei * mem->scale + mem->displacement;
+			dw_check_access((void *) addr, mem->length);
 		}
 
 		/* If the index width is 8 bytes, it might be a protected absolute address. */
 		if (width != MAX_VSIB_INDEX_WIDTH ||
-		    !(arg->mask_bv & (1ull << i)) ||
+		    !(mem_rt->mask_bv & (1ull << i)) ||
 		    !dw_is_protected((void *) valuei))
 			continue;
 
-		arg->index_is_tainted = true;
+		mem_rt->index_is_tainted = true;
 		*((uint64_t *)(index_buffer + i * width)) = (uint64_t) dw_unprotect((void *) valuei);
 
 		if (dw_is_protected((void *) valueb))
-			DW_LOG(WARNING, DISASSEMBLY,
-				"Both index and base tainted for mem arg %u\n", idx);
+			DW_LOG(WARNING, DISASSEMBLY, "Both index and base tainted for mem arg %u\n", idx);
 	}
 
-	if (arg->index_is_tainted) {
+	if (mem_rt->index_is_tainted) {
 		bytes_count = save_extended_states(index, xsave_ptr, index_buffer);
 		if (bytes_count != index_size)
 			DW_LOG(ERROR, DISASSEMBLY,
-				"Failed to save indices to register %s (encoded %zu / expected %zu)\n",
-				dw_get_reg_entry(index)->name, bytes_count, index_size);
+				    "Failed to save indices to register %s (encoded %zu / expected %zu)\n",
+				    dw_get_reg_entry(index)->name, bytes_count, index_size);
 	}
 }
 
 
-static void check_sib_access(uintptr_t insn, struct memory_arg *arg, unsigned regi, unsigned regb,
-					uintptr_t valueb, unsigned idx, bool repeat, struct patch_exec_context *ctx)
+static void check_sib_access(struct memory_arg *mem, struct memory_arg_runtime* mem_rt,
+					uintptr_t valueb, unsigned idx, bool repeat,
+					struct patch_exec_context *ctx)
 {
 	struct reg_entry *re;
 	bool index_is_protected, base_is_protected;
 	uintptr_t valuei = 0, valuei_clean = 0, addr;
+	unsigned regi = mem->index;
 
 	index_is_protected = false;
 	base_is_protected = dw_is_protected((void *) valueb);
 
-	if (regi != X86_REG_INVALID) {
-		re = dw_get_reg_entry(regi);
+	re = dw_get_reg_entry(regi);
+	if (re != NULL && regi != X86_REG_INVALID) {
 		valuei = dw_get_register(ctx, re->libpatch_index);
-		arg->index_addr = valuei_clean = valuei;
+		mem_rt->index_addr = valuei_clean = valuei;
 		index_is_protected = dw_is_protected((void *) valuei);
 
 		if (index_is_protected) {
 			if (base_is_protected)
 				DW_LOG(WARNING, DISASSEMBLY, "Both index and base tainted for mem arg %u\n", idx);
 
-			if (arg->index_taint == 0)
-				DW_LOG(INFO, DISASSEMBLY, "Newly tainted index for mem arg %u\n", idx);
-
-			arg->index_taint = valuei;
+			mem_rt->index_taint = valuei;
 			valuei_clean = (uintptr_t) dw_unprotect((void *) valuei);
 			dw_set_register(ctx, re->libpatch_index, valuei_clean);
 
-			// The index register is a pointer, so if less than 8 bytes are read, this is suspicious.
-			if ((arg->index_access & CS_AC_READ) && (arg->length < sizeof(uintptr_t)))
-				DW_LOG(ERROR, DISASSEMBLY, "index register %s only partially copied to/from memory\n",
-					dw_get_reg_entry(regi)->name);
-
 		} else {
-			arg->index_taint = 0;
+			mem_rt->index_taint = 0;
 		}
 	}
 
@@ -1199,14 +1418,14 @@ static void check_sib_access(uintptr_t insn, struct memory_arg *arg, unsigned re
 		return;
 
 	// The effective address computed from tainted base and/or tainted index
-	addr = valueb + valuei * arg->scale + arg->displacement;
+	addr = valueb + valuei * mem->scale + mem->displacement;
 
 	// Check if the access is valid, and use the repeat count if present.
 	if (repeat) {
 		size_t count = dw_get_register(ctx, dw_get_reg_entry(X86_REG_RCX)->libpatch_index);
-		dw_check_access((void *) addr, arg->length * count);
+		dw_check_access((void *) addr, mem->length * count);
 	} else {
-		dw_check_access((void *) addr, arg->length);
+		dw_check_access((void *) addr, mem->length);
 	}
 
 	/*
@@ -1226,18 +1445,19 @@ static void check_sib_access(uintptr_t insn, struct memory_arg *arg, unsigned re
 	* retaint memory?
 	*/
 
-	if ((arg->length == sizeof(uintptr_t)) &&
-		((arg->base_access && arg->base_taint != 0) || (arg->index_access && arg->index_taint != 0))) {
+	if ((mem->length == sizeof(uintptr_t)) &&
+	    ((mem->base_access && mem_rt->base_taint != 0) || (mem->index_access && mem_rt->index_taint != 0))) {
 
+		/* Saving memory address must be done in the pre-handler. e.g., mov rdi, qword ptr [rdi+0x10] */
 		uintptr_t valueb_clean = (uintptr_t) dw_unprotect((void *) valueb);
-		arg->saved_address = valueb_clean + valuei_clean * arg->scale + arg->displacement;
+		mem_rt->saved_address = valueb_clean + valuei_clean * mem->scale + mem->displacement;
 
-		if ((arg->access & CS_AC_READ) &&
-			    (((arg->base_access & CS_AC_READ) && arg->base_taint) ||
-			    ((arg->index_access & CS_AC_READ) && arg->index_taint))) {
+		if ((mem->access & CS_AC_READ) &&
+			    (((mem->base_access & CS_AC_READ) && mem_rt->base_taint) ||
+			    ((mem->index_access & CS_AC_READ) && mem_rt->index_taint))) {
 
-			arg->saved_value = (uintptr_t) *((void **)arg->saved_address);
-			*((void **)arg->saved_address) = dw_unprotect((void *)(arg->saved_value));
+			mem_rt->saved_value = (uintptr_t) *((void **)mem_rt->saved_address);
+			*((void **)mem_rt->saved_address) = dw_unprotect((void *)(mem_rt->saved_value));
 		}
 	}
 }
@@ -1246,9 +1466,11 @@ void dw_unprotect_context(struct patch_exec_context *ctx)
 {
 	struct insn_entry *entry = ctx->user_data;
 	struct reg_entry *reb;
-	struct memory_arg *arg;
-	unsigned regb, regi;
+	struct memory_arg *mem;
+	struct memory_arg_runtime *mem_rt;
+	unsigned regb;
 	uintptr_t valueb;
+	struct insn_entry_runtime rt_slot, *rt_slot_p;
 
 	if (dw_check_handling) {
 		DW_LOG(DEBUG, DISASSEMBLY, "(-) Before unprotecting instruction 0x%llx: %s\n",
@@ -1256,45 +1478,51 @@ void dw_unprotect_context(struct patch_exec_context *ctx)
 		dw_print_regs(ctx);
 	}
 
-	entry->pending_post_handler = true;
+	if (entry->post_handler) {
+		int rt_idx = 0;
+		if (!dw_acquire_runtime_slot(entry, &rt_idx))
+			DW_LOG(ERROR, DISASSEMBLY, "Problem getting a runtime slot for instruction 0x%llx\n", entry->insn);
+
+		rt_slot_p = &insn_rt_slots[rt_idx];
+	} else {
+		dw_memset(&rt_slot, 0, sizeof(struct insn_entry_runtime));
+		rt_slot.entry = entry;
+		rt_slot_p = &rt_slot;
+	}
 
 	for (int i = 0; i < entry->nb_arg_m; i++) {
-		arg = &(entry->arg_m[i]);
-		regb = arg->base;
+		mem = &(entry->arg_m[i]);
+		mem_rt = &(rt_slot_p->arg_m[i]);
+		regb = mem->base;
 
 		// Handle the base register
 		valueb = 0;
 		if (regb != X86_REG_INVALID) {
 			reb = dw_get_reg_entry(regb);
 			valueb = dw_get_register(ctx, reb->libpatch_index);
-			arg->base_addr = valueb;
+			mem_rt->base_addr = valueb;
 
 			if (dw_is_protected((void *) valueb)) {
-				if (arg->base_taint == 0)
-					DW_LOG(INFO, DISASSEMBLY, "Newly tainted base for mem arg %d\n", i);
-
-				arg->base_taint = valueb;
+				mem_rt->base_taint = valueb;
 				dw_set_register(ctx, reb->libpatch_index, (uintptr_t) dw_unprotect((void *) valueb));
-
-				// The base register is a pointer, so if less than 8 bytes are read, this is suspicious.
-				if ((arg->base_access & CS_AC_READ) && (arg->length < sizeof(uintptr_t)))
-					DW_LOG(WARNING, DISASSEMBLY,
-					    "Instruction 0x%llx, base register %s only partially copied to/from memory\n",
-					    entry->insn, dw_get_reg_entry(regb)->name);
 			} else {
-				arg->base_taint = 0;
+				mem_rt->base_taint = 0;
 			}
 		}
 
 		// Handle the index register
-		regi = arg->index;
-		if (regi == X86_REG_INVALID || reg_is_gpr(regi))
-			check_sib_access(entry->insn, arg, regi, arg->base, valueb, i, entry->repeat, ctx);
-		else if (reg_is_avx(regi))
-			check_vsib_access(arg, regi, valueb, i, ctx->extended_states);
+		if (mem->index == X86_REG_INVALID || reg_is_gpr(mem->index))
+			check_sib_access(mem, mem_rt, valueb, i, entry->repeat, ctx);
+		else if (reg_is_avx(mem->index))
+			check_vsib_access(mem, mem_rt, valueb, i, ctx->extended_states);
 		else
-			DW_LOG(ERROR, DISASSEMBLY, "Invalid index register %u for mem arg %u\n", regi, i);
+			DW_LOG(ERROR, DISASSEMBLY, "Invalid index register %u for mem arg %u\n", mem->index, i);
 	}
+
+	if (entry->post_handler)
+		rt_slot_p->pending_post_handler = true;
+
+	atomic_fetch_add_explicit(&entry->hit_count, 1, memory_order_relaxed);
 
 	if (dw_check_handling) {
 		DW_LOG(DEBUG, DISASSEMBLY, "-- After unprotecting instruction 0x%llx\n", entry->insn);
@@ -1304,24 +1532,25 @@ void dw_unprotect_context(struct patch_exec_context *ctx)
 			DW_LOG(DEBUG, DISASSEMBLY, "%s, %llx\n", re->name, ctx->general_purpose_registers[i]);
 		}
 	}
-
-	entry->hit_count++;
 }
 
-static void check_updated_regs (struct insn_entry *entry, struct patch_exec_context *ctx) {
+static void check_updated_regs (struct insn_entry *entry, struct insn_entry_runtime *entry_rt, struct patch_exec_context *ctx) {
 	struct reg_entry *re;
+	struct memory_arg *mem;
+	struct memory_arg_runtime *mem_rt;
 	bool should_check[dw_nb_saved_registers];
 	dw_memset(should_check, 0, sizeof(should_check));
 
 	if (!entry->deferred_post_handler) {
-		for (size_t i = 0; i < dw_nb_saved_registers; i++)
+		for (int i = 0; i < dw_nb_saved_registers; i++)
 			should_check[i] = true;
 	} else {
-		for (int m = 0; m < entry->nb_arg_m; m++) {
-			struct memory_arg *arg = &(entry->arg_m[m]);
+		for (int i = 0; i < entry->nb_arg_m; i++) {
+			mem = &(entry->arg_m[i]);
+			mem_rt = &(entry_rt->arg_m[i]);
 
-			if (arg->base_taint) {
-				re = dw_get_reg_entry(arg->base);
+			if (mem_rt->base_taint) {
+				re = dw_get_reg_entry(mem->base);
 				if (re) {
 					for (size_t i = 0; i < dw_nb_saved_registers; i++) {
 						struct reg_entry *saved_re = dw_get_reg_entry(dw_saved_registers[i]);
@@ -1333,8 +1562,8 @@ static void check_updated_regs (struct insn_entry *entry, struct patch_exec_cont
 				}
 			}
 
-			re = dw_get_reg_entry(arg->index);
-			if (re && re->canonical_index != X86_REG_INVALID && arg->index_taint) {
+			re = dw_get_reg_entry(mem->index);
+			if (re && re->canonical_index != X86_REG_INVALID && mem_rt->index_taint) {
 				for (size_t i = 0; i < dw_nb_saved_registers; i++) {
 					struct reg_entry *saved_re = dw_get_reg_entry(dw_saved_registers[i]);
 					if (saved_re->canonical_index == re->canonical_index) {
@@ -1346,7 +1575,7 @@ static void check_updated_regs (struct insn_entry *entry, struct patch_exec_cont
 		}
 	}
 
-	for (size_t i = 0; i < dw_nb_saved_registers; i++) {
+	for (int i = 0; i < dw_nb_saved_registers; i++) {
 		if (!should_check[i])
 			continue;
 
@@ -1357,7 +1586,7 @@ static void check_updated_regs (struct insn_entry *entry, struct patch_exec_cont
 
 		uintptr_t value = dw_get_register(ctx, re->libpatch_index);
 		if (dw_save_regs[i] != value && !dw_reg_written(entry, reg)) {
-			DW_LOG(WARNING, DISASSEMBLY,
+			DW_LOG(ERROR, DISASSEMBLY,
 				"Instruction 0x%llx, register %s modified but should not, now 0x%llx vs 0x%llx\n",
 				entry->insn, re->name, value, dw_save_regs[i]);
 		}
@@ -1372,101 +1601,108 @@ static void check_updated_regs (struct insn_entry *entry, struct patch_exec_cont
 void dw_reprotect_context(struct patch_exec_context *ctx)
 {
 	struct insn_entry *entry = ctx->user_data;
-	struct memory_arg *arg;
+	struct memory_arg *mem;
+	struct memory_arg_runtime *mem_rt;
 	struct reg_entry *re;
 	unsigned reg;
+	int slot_idx;
 
-	if (!entry->pending_post_handler)
+	/* If the runtime slot was not found, it means we jumped into an address between the
+	   pre- and post-handler. Therefore, we simply ignore the post-handler invocation */
+	if (!dw_find_runtime_slot(entry, &slot_idx))
 		return;
 
-	entry->pending_post_handler = false;
+	struct insn_entry_runtime *runtime_slot = &insn_rt_slots[slot_idx];
+
+	if (runtime_slot->entry != entry || !runtime_slot->pending_post_handler)
+		DW_LOG(ERROR, DISASSEMBLY,
+			"Post-handler runtime slot mismatch for instruction 0x%llx\n", entry->insn);
 
 	if (dw_check_handling) {
 		DW_LOG(INFO, DISASSEMBLY, "(+) Before reprotecting instruction 0x%llx: %s\n",
 				    entry->insn, entry->disasm_insn);
 		dw_print_regs(ctx);
-		check_updated_regs(entry, ctx);
+		check_updated_regs(entry, runtime_slot, ctx);
 	}
 
 	for (int i = 0; i < entry->nb_arg_m; i++) {
-		arg = &(entry->arg_m[i]);
+		mem = &(entry->arg_m[i]);
+		mem_rt = &runtime_slot->arg_m[i];
 
+		// Continue if neither base nor index were tainted
+		if (!mem_rt->base_taint &&
+			((reg_is_gpr(mem->index) && !mem_rt->index_taint) ||
+			 (reg_is_avx(mem->index) && !mem_rt->index_is_tainted)))
+			continue;
 		/*
 		 * The tainted register, base or index, is retainted unless the same register was also
 		 * an overwritten register argument.
 		 */
-		if (arg->base_taint && ((arg->base_access & CS_AC_WRITE) == 0)) {
-			reg = arg->base;
+		if (mem_rt->base_taint && ((mem->base_access & CS_AC_WRITE) == 0)) {
+			reg = mem->base;
 			re = dw_get_reg_entry(reg);
 			const void* valueb_new = (const void*) dw_get_register(ctx, re->libpatch_index);
-			dw_set_register(ctx, re->libpatch_index, (uint64_t) dw_reprotect(valueb_new, (void *) arg->base_taint));
+			dw_set_register(ctx, re->libpatch_index, (uint64_t) dw_reprotect(valueb_new, (void *) mem_rt->base_taint));
 		}
 
 		// Handle the VSIB case
-		if (arg->index != X86_REG_INVALID && reg_is_avx(arg->index)) {
-			if (arg->index_is_tainted) {
-				reg = arg->index;
-				size_t saved_bytes = save_extended_states(reg, ctx->extended_states, arg->indices);
-				if (saved_bytes != (arg->indices_count * arg->index_width))
+		if (mem->index != X86_REG_INVALID && reg_is_avx(mem->index)) {
+			if (mem_rt->index_is_tainted) {
+				reg = mem->index;
+				size_t saved_bytes = save_extended_states(reg, ctx->extended_states, mem_rt->indices);
+				if (saved_bytes != (mem->indices_count * mem->index_width))
 					DW_LOG(ERROR, DISASSEMBLY,
 						"Failed to save the indices from register %s into the XSAVE area!\n",
 						dw_get_reg_entry(reg)->name);
 				// Reset this flag as it will be set again in the pre-handler
-				arg->index_is_tainted = false;
+				mem_rt->index_is_tainted = false;
 			}
 			continue;
 		}
 
 		// Handle the SIB case
-		if (arg->index_taint && ((arg->index_access & CS_AC_WRITE) == 0)) {
-			reg = arg->index;
+		if (mem_rt->index_taint && ((mem->index_access & CS_AC_WRITE) == 0)) {
+			reg = mem->index;
 			re = dw_get_reg_entry(reg);
 			const void* valuei_new = (const void*) dw_get_register(ctx, re->libpatch_index);
 			dw_set_register(ctx, re->libpatch_index,
-					(uint64_t) dw_reprotect((void *) valuei_new, (void *) arg->index_taint));
+					(uint64_t) dw_reprotect((void *) valuei_new, (void *) mem_rt->index_taint));
 		}
 
 		/*
 		* If the tainted register, base or index, was also a register argument, we have special
 		* cases to consider.
 		*/
-		if ((arg->length == sizeof(uintptr_t)) &&
-			((arg->base_access && arg->base_taint) || (arg->index_access && arg->index_taint))) {
+		if ((mem->length == sizeof(uintptr_t)) && ((mem->base_access && mem_rt->base_taint) || (mem->index_access && mem_rt->index_taint))) {
 			/*
 			* If the memory was read and the tainted register, base or index, was a read register
 			* argument, we presumably have a comparison. The memory value was untainted in
 			* the pre handler and should be restored here.
 			*/
 
-			/* arg->saved_address must be set in the pre-handler. e.g., cmovne rdi, qword ptr [rdi + 0x10]*/
+			if (mem->access & CS_AC_READ) {
+				if (((mem->base_access & CS_AC_READ) && mem_rt->base_taint) ||
+					((mem->index_access & CS_AC_READ) && mem_rt->index_taint))
+					*((void **) mem_rt->saved_address) = (void *) (mem_rt->saved_value);
 
-			if (arg->access & CS_AC_READ) {
-				if (((arg->base_access & CS_AC_READ) && arg->base_taint) ||
-					((arg->index_access & CS_AC_READ) && arg->index_taint))
-					*((void **) arg->saved_address) = (void *) (arg->saved_value);
 			}
 			/*
 			* If the memory was written and the tainted register, base or index, was also a
 			* register argument we suppose that the untainted register was stored in memory and we
 			* need to retaint the memory with the saved register taint.
 			*/
-			else if (arg->access & CS_AC_WRITE) {
+			else if (mem->access & CS_AC_WRITE) {
 				uintptr_t saved_taint;
-				if(arg->base_taint) saved_taint = arg->base_taint;
-				else saved_taint = arg->index_taint;
+				if(mem_rt->base_taint) saved_taint = mem_rt->base_taint;
+				else saved_taint = mem_rt->index_taint;
 
-				if (saved_taint != 0) {
-					*((void **) arg->saved_address) =
-						    dw_reprotect(*((void **) arg->saved_address), (void *) saved_taint);
-
-				} else {
-					DW_LOG(ERROR, DISASSEMBLY,
-						"Instruction 0x%llx: cannot retaint memory at 0x%llx with unprotected taint 0x%llx\n",
-						entry->insn, arg->saved_address, saved_taint);
-				}
+				*((void **) mem_rt->saved_address) =
+						dw_reprotect(*((void **) mem_rt->saved_address), (void *) saved_taint);
 			}
 		}
 	}
+
+	dw_release_rt_slot(slot_idx);
 
 	if (dw_check_handling) {
 		DW_LOG(DEBUG, DISASSEMBLY, "-- After reprotecting instruction 0x%llx: %s\n",
@@ -1489,7 +1725,7 @@ void dw_print_instruction_entries(instruction_table *table, int fd)
 		entry = &(table->entries[i]);
 		if ((void *) entry->insn != NULL) {
 			dw_fprintf(fd, "%4d 0x%lx: %9u: %2u: %1u %s;\n",
-					   count, entry->insn, entry->hit_count, entry->insn_length,
+					   count, entry->insn, atomic_load(&entry->hit_count), entry->insn_length,
 					   entry->strategy, entry->disasm_insn);
 			count++;
 		}

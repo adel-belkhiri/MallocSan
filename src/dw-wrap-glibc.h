@@ -1,6 +1,7 @@
 #ifndef DW_WRAP_GLIBC_H
 #define DW_WRAP_GLIBC_H
 
+#include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
 
@@ -24,7 +25,7 @@ void *dw_memset(void *s, int c, size_t n);
  * Upon exit, sout() restores the state of pointer tainting.
  */
 
-extern int dw_init_stubs;
+extern pthread_once_t dw_init_stubs;
 
 void dw_init_syscall_stubs();
 int dw_libc_sigaction(int signum, const struct sigaction *act);
@@ -33,8 +34,7 @@ bool dw_sigaction_get_saved(int signum, struct sigaction *sa);
 #define dw_sin()                       \
 	bool sin_save = dw_protect_active; \
 	dw_protect_active = false;         \
-	if (!dw_init_stubs)                \
-	dw_init_syscall_stubs()
+	pthread_once(&dw_init_stubs, dw_init_syscall_stubs);
 
 #define dw_sout() dw_protect_active = sin_save
 

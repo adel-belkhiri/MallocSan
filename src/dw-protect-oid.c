@@ -1,4 +1,6 @@
 #include <malloc.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 
 #include "dw-protect.h"
@@ -23,8 +25,8 @@ const uintptr_t untaint_mask =  (uintptr_t)0x0000ffffffffffff;
  */
 
 struct object_id {
-	void *base_addr;
-	size_t size;
+	_Atomic(void *) base_addr;
+	_Atomic size_t size;
 };
 
 /*
@@ -41,9 +43,10 @@ struct object_id {
 static const unsigned oids_size = 32767;
 static unsigned oids_head = 0;
 static struct object_id oids[32767];
+static pthread_mutex_t oids_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Start without protecting objects, wait until libdw is fully initialized. */
-bool dw_protect_active = false;
+__thread bool dw_protect_active = false;
 
 void dw_protect_init()
 {
@@ -123,8 +126,10 @@ void* dw_get_base_addr(void *ptr)
  */
 static void *dw_protect(void *ptr, size_t size)
 {
+	pthread_mutex_lock(&oids_lock);
 	if (oids_head == 0) {
-		DW_LOG(WARNING, PROTECT, "OID table full, cannot taint pointer %p\n", ptr);
+		DW_LOG(ERROR, PROTECT, "OID table full, cannot taint pointer %p\n", ptr);
+		pthread_mutex_unlock(&oids_lock);
 		return ptr;
 	}
 
@@ -134,6 +139,8 @@ static void *dw_protect(void *ptr, size_t size)
 	oids[oids_head].base_addr = ptr;
 	oids[oids_head].size = size;
 	oids_head = next_head;
+
+	pthread_mutex_unlock(&oids_lock);
 
 	uintptr_t p   = (uintptr_t)ptr & ~taint_mask;       // clear tag field
 	uintptr_t tag = (uintptr_t)oid << 48;
@@ -218,6 +225,7 @@ void dw_free_protect(void *ptr)
 {
 	unsigned oid = (uintptr_t) ptr >> 48;
 	if (oid != 0) {
+		pthread_mutex_lock(&oids_lock);
 		if (oid > oids_size - 1 || oids[oid].base_addr == 0)
 			DW_LOG(WARNING, PROTECT, "Invalid taint value %u for %p\n", oid, ptr);
 		else {
@@ -225,6 +233,7 @@ void dw_free_protect(void *ptr)
 			oids[oid].base_addr = NULL;
 			oids_head = oid;
 		}
+		pthread_mutex_unlock(&oids_lock);
 	}
 	__libc_free(dw_unprotect(ptr));
 }

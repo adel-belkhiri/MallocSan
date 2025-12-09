@@ -2,7 +2,9 @@
 
 #include <fcntl.h>
 #include <limits.h>
+#include <errno.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -14,6 +16,8 @@
 #include "dw-log.h"
 #include "dw-protect.h"
 #include "dw-wrap-glibc.h"
+
+_Atomic int dw_fully_initialized = 0;
 
 /* Number of instructions accessing tainted pointers that we can track. */
 static size_t nb_insn_olx_entries = 30000;
@@ -29,66 +33,9 @@ static size_t nb_insn_olx_entries = 30000;
  * ymm10
  */
 
-static enum dw_strategies dw_strategy = DW_PATCH_TRAP;
+enum dw_strategies dw_strategy = DW_PATCH_TRAP;
 
 static instruction_table *insn_table;
-
-/*
- * Handler executed before and after instructions that possibly access tainted
- * pointers when an instruction is "patched" to insert pre and post probes.
- */
-static void patch_handler(struct patch_exec_context *ctx, uint8_t post)
-{
-	struct insn_entry *entry = ctx->user_data;
-	if (post || ctx->program_counter != entry->insn) {
-		//DW_LOG(WARNING, MAIN, "REprotect @ 0x%lx\n", ctx->program_counter);
-		dw_reprotect_context(ctx);
-	} else {
-		// DW_LOG(WARNING, MAIN, "UNprotect @ 0x%lx\n", ctx->program_counter);
-		dw_unprotect_context(ctx);
-	}
-}
-
-static inline const char *strategy_name(enum dw_strategies s)
-{
-	switch (s) {
-		case DW_PATCH_TRAP: return "TRAP";
-		case DW_PATCH_JUMP: return "JUMP";
-		case DW_PATCH_MIXED: return "MIXED";
-		default: return "UNKNOWN";
-	}
-}
-
-/*
- * This function patches an instruction and returns the strategy that finally worked,
- * or exit on failure.
- */
-static enum dw_strategies do_patch(struct insn_entry *entry, enum dw_strategies strategy,
-								   dw_patch_probe handler, bool is_deferred)
-{
-	const char *patch_type = is_deferred ? "deferred" : "initial";
-	uintptr_t patch_addr = is_deferred ? entry->next_insn : entry->insn;
-	enum dw_strategies chosen_strategy = DW_PATCH_UNKNOWN;
-
-	const enum dw_strategies fallback_strategy =
-				(strategy == DW_PATCH_JUMP) ? DW_PATCH_TRAP : DW_PATCH_UNKNOWN;
-
-	if (dw_instruction_entry_patch(entry, strategy, handler, is_deferred)) {
-		chosen_strategy = strategy;
-	} else if (fallback_strategy != DW_PATCH_UNKNOWN) {
-		if (dw_instruction_entry_patch(entry, fallback_strategy, handler, is_deferred))
-			chosen_strategy = fallback_strategy;
-	}
-
-	if (chosen_strategy == DW_PATCH_UNKNOWN)
-		DW_LOG(ERROR, MAIN, "Patching %s location 0x%llx failed (origin 0x%llx).\n",
-			   patch_type, patch_addr, entry->insn);
-
-	DW_LOG(INFO, MAIN, "Successfully patched %s site 0x%llx with %s strategy.\n",
-		   patch_type, patch_addr, strategy_name(chosen_strategy));
-
-	return chosen_strategy;
-}
 
 /*
  * Forward a signal to any previously installed handler.
@@ -150,58 +97,37 @@ void signal_protected(int sig, siginfo_t *info, void *context)
 	 * should not happen
 	 */
 	if (!save_active)
-		DW_LOG(WARNING, MAIN, "Signal received while within wrappers\n");
+		DW_LOG(ERROR, MAIN, "Signal received while within wrappers\n");
 
 	// Get the instruction address
 	ucontext_t *uctx = ((ucontext_t *) context);
 	uintptr_t fault_insn = uctx->uc_mcontext.gregs[REG_RIP];
-	uintptr_t next_insn;
 
 	/*
-	 * Check if it is the first time that we encounter this address. Once
-	 * the instruction is patched, we should not get this handler called any
-	 * more.
+	 * On the first fault at this address, we patch the instruction and create an entry for it in
+	 * the instruction table and. After the entry is created, this SIGSEGV handler should no longer be
+	 * invoked for that instruction. However, if multiple threads hit the same instruction concurrently
+	 * before the entry reaches ENTRY_READY, they can all be in this handler.
 	 */
-	entry = dw_get_instruction_entry(insn_table, fault_insn);
-	if (entry != NULL)
-		DW_LOG(ERROR, MAIN, "SIGSEGV handler called for already patched instruction 0x%llx\n",
-			   entry->insn);
-
-	// New address, create an entry in the table
-	entry = dw_create_instruction_entry(insn_table, fault_insn, &next_insn, uctx);
+	bool created_out;
+	entry = dw_create_instruction_entry(insn_table, fault_insn, uctx, &created_out);
 	if (entry == NULL) {
 		// The faulting instruction does not have any tainted pointers as operands. Therefore, we
 		// forward the signal to the previously saved handler (if there is any).
-		dw_protect_active = save_active;
-		if (!forward_to_saved_handler(sig, info, context))
+		if (!forward_to_saved_handler(sig, info, context)) {
 			DW_LOG(ERROR, MAIN,
 			    "Segfault on instruction (0x%llx) without protected memory arguments, no saved handler\n",
 			    fault_insn);
+		}
+		dw_protect_active = save_active;
 		return;
 	}
 
-	DW_LOG(INFO, MAIN, "Created entry for instruction 0x%llx\n", entry->insn);
+	if (created_out)
+		DW_LOG(INFO, MAIN,
+			    "Thread %u has created a new entry for instruction 0x%llx\n", gettid(), entry->insn);
 
-	/*
-	 * Here we patch the instruction that involves tainted registers. If the post-handler
-	 * is deferred, we also patch the deferred location. If we cannot install a patch with
-	 * a given strategy, we fall back to the trap strategy.
-	 */
-
-	entry->strategy = do_patch(entry, dw_strategy, patch_handler, false);
-
-	if (entry->post_handler && entry->deferred_post_handler) {
-		if (entry->strategy != do_patch(entry, dw_strategy, patch_handler, true))
-			entry->strategy = DW_PATCH_MIXED;
-	}
-
-	DW_LOG(INFO, MAIN,
-		"Patch summary for 0x%llx: Post-handler: %s, Deferred: %s, Strategy: %s\n",
-		entry->insn, entry->post_handler ? "Yes" : "No", entry->deferred_post_handler ? "Yes" : "No",
-		strategy_name(entry->strategy));
-
-	// We return and it will trap again, but this time libpatch will call
-	// the patch_handler
+	// We return and it will trap again, but this time libpatch will call the patch_handler
 	dw_protect_active = save_active;
 }
 
@@ -217,8 +143,8 @@ static size_t min_protect_size = 0, max_protect_size = ULONG_MAX;
  * What objects in sequence to protect, from (first) to (first + max)
  * By default protect all
  */
-static long unsigned nb_protected = 0, nb_protected_candidates = 0,
-		   first_protected = 0, max_nb_protected = ULONG_MAX;
+static atomic_ulong nb_protected = 0, nb_protected_candidates = 0;
+static long unsigned first_protected = 0, max_nb_protected = ULONG_MAX;
 
 /* Use extended checking of coherency */
 static bool check_handling = false;
@@ -311,6 +237,7 @@ dw_init()
 		DW_LOG(ERROR, MAIN, "Sigaction SIGBUS failed\n");
 
 	// start intercepting allocation functions
+	atomic_store_explicit(&dw_fully_initialized, 1, memory_order_release);
 	dw_protect_active = true;
 }
 
@@ -342,10 +269,10 @@ extern void __attribute__((destructor)) dw_fini()
 static bool check_candidate(size_t size)
 {
 	if (size >= min_protect_size && size <= max_protect_size) {
-		nb_protected_candidates++;
+		atomic_fetch_add(&nb_protected_candidates, 1);
 		if (nb_protected_candidates > first_protected &&
 				nb_protected < max_nb_protected) {
-			nb_protected++;
+			atomic_fetch_add(&nb_protected, 1);;
 			return true;
 		}
 	}
@@ -369,6 +296,10 @@ static bool check_caller(void *caller)
  */
 static void *malloc2(size_t size, void *caller)
 {
+	if (!atomic_load_explicit(&dw_fully_initialized, memory_order_acquire)) {
+		return __libc_malloc(size);
+	}
+
 	void *ret = NULL;
 	bool save_active = dw_protect_active;
 	dw_protect_active = false;
@@ -386,6 +317,7 @@ static void *malloc2(size_t size, void *caller)
 	dw_protect_active = save_active;
 	DW_LOG(DEBUG, MAIN, "Malloc %p, size %lu, nb_candidates %lu\n", ret,
 		   size, nb_protected_candidates);
+
 	return ret;
 }
 
@@ -420,22 +352,52 @@ void *realloc(void *ptr, size_t size)
 	return ret;
 }
 
-void free(void *ptr)
+int posix_memalign(void **memptr, size_t alignment, size_t size)
 {
+	*memptr = NULL;
+
+	if (!(alignment >= sizeof(void *) && (alignment & (alignment - 1)) == 0))
+		return EINVAL;
+
+	if (!atomic_load_explicit(&dw_fully_initialized, memory_order_acquire)) {
+		void *ret = __libc_memalign(alignment, size);
+		if (!ret)
+			return ENOMEM;
+		*memptr = ret;
+		return 0;
+	}
+
+	void *ret = NULL;
 	bool save_active = dw_protect_active;
 	dw_protect_active = false;
 
-	if (dw_is_protected(ptr)) {
-		dw_free_protect(ptr);
-	} else {
-		__libc_free(ptr);
+	if (save_active && check_caller(__builtin_return_address(0))) {
+		if (check_candidate(size))
+			ret = dw_memalign_protect(alignment, size);
+		else
+			ret = NULL;
 	}
+
+	if (ret == NULL)
+		ret = __libc_memalign(alignment, size);
+
 	dw_protect_active = save_active;
-	DW_LOG(DEBUG, MAIN, "Free %p\n", ptr);
+
+	if (!ret)
+		return ENOMEM;
+
+	*memptr = ret;
+	DW_LOG(DEBUG, MAIN, "posix_memalign %p, size %lu, nb_candidates %lu\n", ret,
+		   size, nb_protected_candidates);
+	return 0;
 }
 
 void *memalign(size_t alignment, size_t size)
 {
+	if (!atomic_load_explicit(&dw_fully_initialized, memory_order_acquire)) {
+		return __libc_memalign(alignment, size);
+	}
+
 	void *ret;
 	bool save_active = dw_protect_active;
 	dw_protect_active = false;
@@ -448,6 +410,7 @@ void *memalign(size_t alignment, size_t size)
 	dw_protect_active = save_active;
 	DW_LOG(DEBUG, MAIN, "Memalign %p, size %lu, nb_candidates %lu\n", ret,
 		   size, nb_protected_candidates);
+
 	return ret;
 }
 
@@ -457,4 +420,28 @@ void *calloc(size_t nmemb, size_t size)
 	if (ret != NULL)
 		bzero(ret, nmemb * size);
 	return ret;
+}
+
+void free(void *ptr)
+{
+	/*
+	 * We intentionally avoid using TLS variables (i.e., dw_protect_active) in this free() wrapper.
+	 * During MallocSan startup, glibc's TLS machinery may call free() while setting up per-thread
+	 * TLS blocks; if our wrapper then accesses __thread variables, that TLS access triggers another
+	 * free(), causing infinite recursion.
+	 *
+	 * A global recursion guard (e.g., static int in_free) would prevent this but would let other
+	 * threads skip MallocSan while the guard is set, which let dangling records in oids[] array.
+	 */
+	if (!atomic_load_explicit(&dw_fully_initialized, memory_order_acquire)) {
+		__libc_free(ptr);
+		return;
+	}
+
+	if (dw_is_protected(ptr))
+		dw_free_protect(ptr);
+	else
+		__libc_free(ptr);
+
+	DW_LOG(DEBUG, MAIN, "Free %p\n", ptr);
 }
