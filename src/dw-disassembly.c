@@ -216,52 +216,25 @@ static bool similar_memory_access(unsigned int ins_id, const cs_x86_op *arg,
 	 * access and check that they stay within the bounds of the original
 	 * protected object.
 	 *
-	 * VSIB case: base + index[i] * scale + disp.
+	 * TODO: For now, we do not check similar accesses for VSIB instructions.
 	 */
-	if (reg_is_avx(m->index)) {
-		uint8_t index_width = vsib_index_width(ins_id);
-		uint8_t count       = m->indices_count;
-
-		if (index_width != m->index_width || !count)
-			return false;
-
-		for (uint8_t i = 0; i < count; i++) {
-			uint64_t index_val;
-
-			/* Skip lanes that are masked out. */
-			if (!(m->mask_bv & (1ull << i)))
-				continue;
-
-			if (index_width == MIN_VSIB_INDEX_WIDTH)
-				index_val = *((uint32_t *)(m->indices + i * index_width));
-			else
-				index_val = *((uint64_t *)(m->indices + i * index_width));
-
-			addr = m->base_addr + index_val * arg->mem.scale + arg->mem.disp;
-
-			if (!dw_check_access((void *) addr, arg->size))
-				return false;
-		}
-		return true;
-	}
+	if (reg_is_avx(m->index))
+		return false;
 
 	/*
 	 * SIB case: base + index * scale + disp.
 	 */
-	{
-		uintptr_t index_addr = (m->index != X86_REG_INVALID) ? m->index_addr : 0;
-		size_t access_size = arg->size;
+	uintptr_t index_addr = (m->index != X86_REG_INVALID) ? m->index_addr : 0;
+	size_t access_size = arg->size;
 
-		addr = m->base_addr + index_addr * arg->mem.scale + arg->mem.disp;
+	addr = m->base_addr + index_addr * arg->mem.scale + arg->mem.disp;
 
-		if (repeat) {
-			size_t count = dw_get_register(uctx,
-					dw_get_reg_entry(X86_REG_RCX)->ucontext_index);
-			access_size *= count;
-		}
-
-		return dw_check_access((void *) addr, access_size);
+	if (repeat) {
+		size_t count = dw_get_register(uctx, dw_get_reg_entry(X86_REG_RCX)->ucontext_index);
+		access_size *= count;
 	}
+
+	return dw_check_access((void *) addr, access_size);
 }
 
 #define UNW_LOCAL_ONLY
