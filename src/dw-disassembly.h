@@ -1,6 +1,7 @@
 #ifndef DW_DISASSEMBLY_H
 #define DW_DISASSEMBLY_H
 
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -18,6 +19,8 @@
 
 
 enum dw_strategies {DW_PATCH_TRAP=0, DW_PATCH_JUMP, DW_PATCH_MIXED, DW_PATCH_UNKNOWN};
+
+enum entry_state {ENTRY_EMPTY = 0, ENTRY_INITIALIZING /* one thread is creating this entry */, ENTRY_READY /* fully initialized */, ENTRY_FAILED /* creation failed, don't retry */};
 
 /*
  * The instruction table contains all the information about the instructions
@@ -52,12 +55,23 @@ struct memory_arg {
 	unsigned access;
 	int base, index;
 
-	/* If the same register as the base or index is also a register
-	 * argument, base_access or index_access will be non zero and set
-	 * to CS_AC_READ / CS_AC_WRITE. In that case, some care is needed when
-	 * untainting and retainting that register. */
+	/* If the same register as the base or index is also a register argument, base_access or
+	 * index_access will be non zero and set to CS_AC_READ / CS_AC_WRITE. In that case, some care
+	 * is needed when untainting and retainting that register. */
 	unsigned base_access, index_access;
 
+	/* Size of the memory operand in bytes */
+	unsigned length;
+
+	/* VSIB only: width of each index within the register. It can be 32 bits or 64 bits */
+	uint8_t index_width;
+	/* VSIB only: number of indices within the index register */
+	uint8_t indices_count;
+	/* VSIB only: the mask register (i.e., YMM0..YMM15 for AVX2, and k0..k7 for AVX-512). */
+	int mask;
+};
+
+struct memory_arg_runtime {
 	/* When the unprotect handler is called, if the base or index register
 	 * is tainted, this taint is saved, otherwise the field is set to zero.
 	 * It will be used to retaint the register in the reprotect handler,
@@ -71,10 +85,8 @@ struct memory_arg {
 	 * original, but with different displacement, scale and/or size. */
 	uintptr_t base_addr;
 
-	/* Size of the memory operand in bytes */
-	unsigned length;
 	union {
-		/* SIB (scalar index) */
+		//SIB:
 		struct {
 			/* If the index register is tainted, the taint is saved here, otherwise
 			 * the field is set to zero */
@@ -89,27 +101,29 @@ struct memory_arg {
 			 */
 			uintptr_t saved_address, saved_value;
 		};
-
-		/*  VSIB (vector index: AVX2 gather, AVX-512 gather/scatter) */
+		//VSIB:
 		struct {
-			/* Width of each index within the vector register. It can be 32 bits or 64 bits */
-			uint8_t index_width;
-			/* Number of indices within the index register */
-			uint8_t indices_count;
 			/* The index register is a vector register, so we can have multiple indices */
-			uint8_t indices[64]; /* 512 bits */
+			uint8_t indices[64];
 			/* set to true is the index is tainted */
 			bool index_is_tainted;
-			/*
-			 * The mask register (for AVX2 it can be YMM0..YMM15, and for AVX-512 it can be k0..k7).
-			 */
-			int mask;
-			/* Stores the decoded mask register value. One bit per lane to indicate whether the
+			/* per-execution mask bits: Stores the decoded mask register value. One bit per lane to indicate whether the
 			 * corresponding memory access must be performed or not */
 			uint64_t mask_bv;
 		};
 	};
 };
+
+struct insn_entry_runtime {
+	struct insn_entry *entry;
+	struct memory_arg_runtime arg_m[MAX_MEM_ARG];
+	bool pending_post_handler;
+	bool used;
+};
+
+extern enum dw_strategies dw_strategy;
+
+extern __thread struct insn_entry_runtime insn_rt_slots[MAX_SCAN_INST_COUNT];
 
 struct reg_arg {
 	unsigned reg;
@@ -118,6 +132,7 @@ struct reg_arg {
 };
 
 struct insn_entry {
+	_Atomic int state;
 	struct memory_arg arg_m[MAX_MEM_ARG];
 	struct reg_arg arg_r[MAX_REG_ARG];
 	unsigned nb_arg_m;
@@ -125,11 +140,10 @@ struct insn_entry {
 	bool repeat;
 	bool post_handler;
 	bool deferred_post_handler;
-	bool pending_post_handler;
 	uintptr_t insn;
 	uintptr_t next_insn;
 	uintptr_t olx_buffer;
-	unsigned hit_count;
+	atomic_ulong hit_count;
 	char disasm_insn[64];
 	unsigned strategy;
 	unsigned insn_length;
@@ -153,8 +167,8 @@ struct insn_entry *dw_get_instruction_entry(
 /* Create a new entry for that instruction address */
 struct insn_entry *dw_create_instruction_entry(instruction_table *table,
 		uintptr_t fault,
-		uintptr_t *next,
-		ucontext_t *uctx);
+		ucontext_t *uctx,
+		bool *created_out);
 
 /* Initialize libpatch */
 void dw_patch_init();

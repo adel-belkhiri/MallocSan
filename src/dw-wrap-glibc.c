@@ -113,7 +113,6 @@ static int (*libc_clock_gettime)(clockid_t clockid, struct timespec *tp);
 static int (*libc_stat)(const char *restrict pathname, struct stat *restrict statbuf);
 static int (*libc_fstat)(int fd, struct stat *statbuf);
 static int (*libc_lstat)(const char *restrict pathname, struct stat *restrict statbuf);
-static int (*libc_newfstatat)(int dirfd, const char *pathname, struct stat *statbuf, int flags);
 static int (*libc_fstatat)(int dirfd, const char *restrict pathname, struct stat *restrict statbuf, int flags);
 static int (*libc_stat64)(const char *restrict pathname, struct stat64 *restrict statbuf);
 static int (*libc_fstat64)(int fd, struct stat64 *statbuf);
@@ -173,6 +172,14 @@ static int (*libc_execv)(const char *pathname, char *const argv[]);
 static int (*libc_execvp)(const char *file, char *const argv[]);
 static int (*libc_execvpe)(const char *file, char *const argv[], char *const envp[]);
 static ssize_t (*libc_readlink)(const char *pathname, char *buf, size_t bufsiz);
+static int (*libc_pthread_create)(pthread_t *, const pthread_attr_t *, void *(*)(void *), void *);
+static int (*libc_pthread_mutex_init)(pthread_mutex_t *, const pthread_mutexattr_t *);
+static int (*libc_pthread_cond_init)(pthread_cond_t *, const pthread_condattr_t *);
+static int (*libc_pthread_mutex_lock)(pthread_mutex_t *);
+static int (*libc_pthread_mutex_unlock)(pthread_mutex_t *);
+static int (*libc_pthread_join)(pthread_t, void **);
+static int (*libc_pthread_cond_broadcast)(pthread_cond_t *);
+static int (*libc_pthread_cond_wait)(pthread_cond_t *, pthread_mutex_t *);
 
 static struct sigaction saved_sigsegv;
 static bool saved_sigsegv_valid = false;
@@ -181,7 +188,7 @@ static bool saved_sigbus_valid = false;
 static struct sigaction saved_sigtrap;
 static bool saved_sigtrap_valid = false;
 
-int dw_init_stubs = 0;
+pthread_once_t dw_init_stubs = PTHREAD_ONCE_INIT;
 // size_t (*dw_strlen)(const char *s);
 
 /*
@@ -212,7 +219,6 @@ void dw_init_syscall_stubs()
 	libc_stat = dlsym_check(RTLD_NEXT, "stat");
 	libc_fstat = dlsym_check(RTLD_NEXT, "fstat");
 	libc_lstat = dlsym_check(RTLD_NEXT, "lstat");
-	libc_newfstatat = dlsym_check(RTLD_NEXT, "newfstatat");
 	libc_fstatat = dlsym_check(RTLD_NEXT, "fstatat");
 	libc_stat64 = dlsym_check(RTLD_NEXT, "stat64");
 	libc_fstat64 = dlsym_check(RTLD_NEXT, "fstat64");
@@ -268,7 +274,14 @@ void dw_init_syscall_stubs()
 	libc_execvp = dlsym_check(RTLD_NEXT, "execvp");
 	libc_execvpe = dlsym_check(RTLD_NEXT, "execvpe");
 	libc_readlink = dlsym_check(RTLD_NEXT, "readlink");
-	dw_init_stubs = 1;
+	libc_pthread_create = dlsym_check(RTLD_NEXT, "pthread_create");
+	libc_pthread_cond_init = dlsym_check(RTLD_NEXT, "pthread_cond_init");
+	libc_pthread_mutex_init = dlsym_check(RTLD_NEXT, "pthread_mutex_init");
+	libc_pthread_cond_wait = dlsym_check(RTLD_NEXT, "pthread_cond_wait");
+	libc_pthread_cond_broadcast = dlsym_check(RTLD_NEXT, "pthread_cond_broadcast");
+	libc_pthread_join = dlsym_check(RTLD_NEXT, "pthread_join");
+	libc_pthread_mutex_lock = dlsym_check(RTLD_NEXT, "pthread_mutex_lock");
+	libc_pthread_mutex_unlock = dlsym_check(RTLD_NEXT, "pthread_mutex_unlock");
 }
 
 /*
@@ -276,6 +289,7 @@ void dw_init_syscall_stubs()
  */
 void *dw_memset(void *s, int c, size_t n)
 {
+	pthread_once(&dw_init_stubs, dw_init_syscall_stubs);
 	return libc_memset(s, c, n);
 }
 
@@ -689,7 +703,6 @@ int fstat(int fd, struct stat *statbuf) { sin(); dw_check_access((void *)statbuf
 int fstat64(int fd, struct stat64 *statbuf) { sin(); dw_check_access((void *)statbuf, sizeof(struct stat64)); int ret = libc_fstat64 ? libc_fstat64(fd, (struct stat64 *)dw_unprotect(statbuf)) : libc_fstat(fd, (struct stat *)dw_unprotect(statbuf)); sout(); return ret; }
 int lstat(const char *restrict pathname, struct stat *restrict statbuf) { sin(); char *npathname = dw_unprotect((void *)pathname); dw_check_access((void *)pathname, libc_strlen(npathname) + 1); dw_check_access((void *)statbuf, sizeof(struct stat)); int ret = libc_lstat(npathname, (struct stat *)dw_unprotect((void *)statbuf)); sout(); return ret; }
 int fstatat(int dirfd, const char *restrict pathname, struct stat *restrict statbuf, int flags) { sin(); char *npathname = dw_unprotect((void *)pathname); dw_check_access((void *)pathname, libc_strlen(npathname) + 1); dw_check_access((void *)statbuf, sizeof(struct stat)); int ret = libc_fstatat(dirfd, npathname, (struct stat *)dw_unprotect((void *)statbuf), flags); sout(); return ret; }
-int newfstatat(int dirfd, const char *pathname, struct stat *statbuf, int flags) { sin(); char *npathname = dw_unprotect((void *)pathname); dw_check_access((void *)pathname, libc_strlen(npathname) + 1); dw_check_access((void *)statbuf, sizeof(struct stat)); int ret = libc_newfstatat(dirfd, npathname, (struct stat *)dw_unprotect((void *)statbuf), flags); sout(); return ret; }
 
 size_t fread(void *ptr, size_t size, size_t nmemb, FILE *stream) { sin(); dw_check_access(ptr, size * nmemb); size_t ret = libc_fread(dw_unprotect(ptr), size, nmemb, stream); sout(); return ret; }
 size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream) { sin(); dw_check_access(ptr, size * nmemb); size_t ret = libc_fwrite((const void *)dw_unprotect(ptr), size, nmemb, stream); sout(); return ret; }
@@ -757,3 +770,55 @@ int execve(const char *pathname, char *const argv[], char *const envp[]) { sin()
 int execv(const char *pathname, char *const argv[]) { sin(); char *npathname = dw_unprotect((void *)pathname); dw_check_access((void *)pathname, libc_strlen(npathname) + 1); dw_check_access((void *)argv, arglen(argv)); int ret = libc_execv(npathname, dw_unprotect(argv)); sout(); return ret; }
 int execvp(const char *file, char *const argv[]) { sin(); char *nfile = (char *) dw_unprotect((void *) file); dw_check_access((void *) file, libc_strlen(nfile) + 1); char *const *nargv = (char *const *) dw_unprotect((void *) argv); if (nargv) dw_check_access((void *) argv, arglen(nargv)); int ret = libc_execvp(nfile, (char *const *) nargv); sout(); return ret; }
 int execvpe(const char *file, char *const argv[], char *const envp[]) { sin(); char *nfile = (char *) dw_unprotect((void *) file); dw_check_access((void *) file, libc_strlen(nfile) + 1); char *const *nargv = (char *const *) dw_unprotect((void *) argv); char *const *nenvp = envp ? (char *const *) dw_unprotect((void *) envp) : NULL; if (nargv) dw_check_access((void *) argv, arglen(nargv)); if (nenvp) dw_check_access((void *) envp, arglen(nenvp)); int ret = libc_execvpe(nfile, (char *const *) nargv, (char *const *) nenvp); sout(); return ret; }
+
+
+typedef struct {
+	void *(*fn)(void *);
+	void *arg;
+} thread_start_info;
+
+static void *pthread_start_trampoline(void *p)
+{
+	thread_start_info *s = p;
+	dw_protect_active = true;
+	void *(*fn)(void *) = s->fn;
+	void *arg = s->arg;
+	free(s);
+	return fn(arg);
+}
+
+int pthread_create(pthread_t *t, const pthread_attr_t *attr, void *(*fn)(void *), void *arg)
+{
+	sin();
+
+	pthread_t *nthread = (pthread_t *)dw_unprotect((void *)t);
+	dw_check_access((void *)t, sizeof(pthread_t));
+
+	const pthread_attr_t *nattr = attr ? (const pthread_attr_t *)dw_unprotect((void *)attr) : NULL;
+	if (attr) dw_check_access((void *)attr, sizeof(pthread_attr_t));
+
+	void *narg = arg ? dw_unprotect(arg) : NULL;
+
+	thread_start_info *s = malloc(sizeof(thread_start_info));
+	if (!s) {
+		sout();
+		return ENOMEM;
+	}
+
+	s->fn  = (void *(*)(void *))dw_unprotect((void *)fn);
+	s->arg = narg;
+
+	int rc = libc_pthread_create(nthread, nattr, pthread_start_trampoline, s);
+	if (rc != 0)
+		free(s);
+	sout();
+	return rc;
+}
+
+int pthread_mutex_init(pthread_mutex_t *mutex, const pthread_mutexattr_t *attr) { sin(); pthread_mutex_t *nmutex = (pthread_mutex_t *)dw_unprotect(mutex); const pthread_mutexattr_t *nattr = attr ? (const pthread_mutexattr_t *)dw_unprotect((void *)attr) : NULL; dw_check_access(nmutex, sizeof(pthread_mutex_t)); if (nattr) dw_check_access((void *)nattr, sizeof(pthread_mutexattr_t)); int ret = libc_pthread_mutex_init(nmutex, nattr); sout(); return ret; }
+int pthread_cond_init(pthread_cond_t *cond, const pthread_condattr_t *attr) { sin(); pthread_cond_t *ncond = (pthread_cond_t *)dw_unprotect(cond); const pthread_condattr_t *nattr = attr ? (const pthread_condattr_t *)dw_unprotect((void *)attr) : NULL; dw_check_access(ncond, sizeof(pthread_cond_t)); if (nattr) dw_check_access((void *)nattr, sizeof(pthread_condattr_t)); int ret = libc_pthread_cond_init(ncond, nattr); sout(); return ret; }
+int pthread_mutex_lock(pthread_mutex_t *mutex) { sin(); pthread_mutex_t *nmutex = (pthread_mutex_t *)dw_unprotect(mutex); dw_check_access(nmutex, sizeof(pthread_mutex_t)); int ret = libc_pthread_mutex_lock(nmutex); sout(); return ret; }
+int pthread_mutex_unlock(pthread_mutex_t *mutex) { sin(); pthread_mutex_t *nmutex = (pthread_mutex_t *)dw_unprotect(mutex); dw_check_access(nmutex, sizeof(pthread_mutex_t)); int ret = libc_pthread_mutex_unlock(nmutex); sout(); return ret; }
+int pthread_join(pthread_t thread, void **retval) { sin(); pthread_t nthread = (pthread_t)dw_unprotect((void *)thread); void **nret = retval ? (void **)dw_unprotect(retval) : NULL; if (retval) dw_check_access(retval, sizeof(void *)); int ret = libc_pthread_join(nthread, nret); sout(); return ret; }
+int pthread_cond_broadcast(pthread_cond_t *cond) { sin(); pthread_cond_t *ncond = (pthread_cond_t *)dw_unprotect(cond); dw_check_access(ncond, sizeof(pthread_cond_t)); int ret = libc_pthread_cond_broadcast(ncond); sout(); return ret; }
+int pthread_cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex) { sin(); pthread_cond_t *ncond = (pthread_cond_t *)dw_unprotect(cond); pthread_mutex_t *nmutex = (pthread_mutex_t *)dw_unprotect(mutex); dw_check_access(ncond, sizeof(pthread_cond_t)); dw_check_access(nmutex, sizeof(pthread_mutex_t)); int ret = libc_pthread_cond_wait(ncond, nmutex); sout(); return ret; }

@@ -34,7 +34,7 @@ size_t save_extended_states(unsigned reg, void *fp, const uint8_t *in);
 
 extern unsigned dw_saved_registers[];
 extern const unsigned dw_nb_saved_registers;
-extern uintptr_t dw_save_regs[];
+extern __thread uintptr_t dw_save_regs[];
 
 #define dw_get_register(base, index) \
 	*((uintptr_t *) ((void *) (base) + (index)))
