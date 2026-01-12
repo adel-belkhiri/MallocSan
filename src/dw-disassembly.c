@@ -746,13 +746,16 @@ fill_instruction_operands(struct insn_entry *entry, struct insn_entry_runtime* e
 			if (fill_memory_operand(&entry->arg_m[arg_m], &entry_rt->arg_m[arg_m], op, handle, insn, x86, uctx)) {
 				nb_protected++;
 
+				// We need a VSIB flag per entry to know if we will need XSAVE/XRSTOR when patching the instruction
+				int index = entry->arg_m[arg_m].index;
+				entry->has_vsib |= reg_is_avx(index);
+
 				// For AVX-512 scatter/gather operations, the mask register (k0..k1) is optional
-				if (reg_is_avx512(entry->arg_m[arg_m].index)) {
+				if (reg_is_avx512(index)) {
 					entry->arg_m[arg_m].mask =
 						get_avx512_mask_register(entry->gregs_read, entry->gregs_read_count);
 				}
-				else if (reg_is_sse(entry->arg_m[arg_m].index) ||
-						 reg_is_avx2(entry->arg_m[arg_m].index)) {
+				else if (reg_is_sse(index) || reg_is_avx2(index)) {
 					// For AVX-2 gather operations, the mask register (XMM0..YMM31) is mandatory
 					if (x86->op_count < 3)
 						DW_LOG(ERROR, DISASSEMBLY, "Too few operands for an AVX-2 gather operation\n");
@@ -1062,7 +1065,7 @@ bool dw_instruction_entry_patch(struct insn_entry *entry,
 			.type                    = PATCH_EXEC_MODEL_PROBE,
 			.probe.read_registers    = 0,
 			.probe.write_registers   = 0,
-			.probe.clobber_registers = PATCH_REGS_ALL,
+			.probe.clobber_registers = (1ULL << PATCH_ARCH_GREGS_COUNT) - 1,
 			.probe.user_data         = entry,
 			.probe.procedure         = patch_handler,
 	};
@@ -1070,6 +1073,9 @@ bool dw_instruction_entry_patch(struct insn_entry *entry,
 	patch_t patch;
 	patch_attr attr;
 	patch_status s;
+
+	if (entry->has_vsib)
+		exec_model.probe.clobber_registers = PATCH_REGS_ALL;
 
 	if (entry->post_handler && !entry->deferred_post_handler)
 		exec_model.type = PATCH_EXEC_MODEL_PROBE_AROUND;
