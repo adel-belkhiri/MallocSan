@@ -198,13 +198,36 @@ dw_init()
 	arg = getenv("DW_CHECK_HANDLING");
 	if (arg != NULL && atoi(arg) == 1) { check_handling = true; dw_set_check_handling(check_handling); }
 
-	DW_LOG(INFO, MAIN, "Starting program dw\n");
-	DW_LOG(INFO, MAIN,
-		   "Min protect size %lu, max protect size %lu, max nb protected %lu, first protected %lu\n",
-		   min_protect_size, max_protect_size, max_nb_protected, first_protected);
-	DW_LOG(INFO, MAIN,
-		   "Instruction entries %lu, log level %d, stats file %s, strategy %d, check handling %d\n",
-		   nb_insn_olx_entries, log_level, stats_file, dw_strategy, check_handling);
+	bool show_banner = true;
+	arg = getenv("DW_HIDE_BANNER");
+	if (arg != NULL && atoi(arg) == 1)
+		show_banner = false;
+
+	if (show_banner) {
+		dw_fprintf(2,
+		"============================================================\n"
+		"                  MallocSan Runtime Initialized              \n"
+		"                       (LD_PRELOAD active)                   \n"
+		"============================================================\n"
+		" Object Selection:\n"
+		"   min_size            : %lu bytes\n"
+		"   max_size            : %lu bytes\n"
+		"   first_protected     : %lu (allocation index)\n"
+		"   max_nb_protected    : %lu objects\n"
+		"\n"
+		" Instrumentation:\n"
+		"   insn_entries        : %lu\n"
+		"   strategy            : %d\n"
+		"   check_handling      : %s\n"
+		"\n"
+		" Logging / Statistics:\n"
+		"   log_level           : %d\n"
+		"   stats_file          : %s\n"
+		"============================================================\n",
+		min_protect_size, max_protect_size, first_protected, max_nb_protected,
+		nb_insn_olx_entries, dw_strategy, check_handling ? "enabled" : "disabled",
+		log_level, stats_file);
+	}
 
 	// Initialise the different modules
 	insn_table = dw_init_instruction_table(nb_insn_olx_entries);
