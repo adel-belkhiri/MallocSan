@@ -27,6 +27,8 @@ const uintptr_t untaint_mask =  (uintptr_t)0x0000ffffffffffff;
 struct object_id {
 	_Atomic(void *) base_addr;
 	_Atomic size_t size;
+
+	_Atomic (void*) alloc_ip;
 };
 
 /*
@@ -52,6 +54,7 @@ void dw_protect_init()
 {
 	for (int i = 0; i < oids_size; i++) {
 		oids[i].base_addr = NULL;
+		oids[i].alloc_ip = NULL;
 		oids[i].size = i + 1;
 	}
 	oids_head = 1;
@@ -84,9 +87,45 @@ bool dw_check_access(const void *ptr, size_t size)
 
 	/* Check [real_addr, real_addr + size) ⊆ [base, base + sz). */
 	if (size > sz || real_addr < base || real_addr > base + sz - size) {
-		DW_LOG(ERROR, PROTECT,
-			   "Invalid access (oid %u): 0x%llx size %zu not between 0x%llx and 0x%llx\n",
-			   oid, real_addr, size, base, (base + sz));
+		// Get the symbol of the function where the object was allocated
+		uint64_t offset = 0;
+		char proc_name[256];
+		dw_lookup_symbol((uintptr_t)oids[oid].alloc_ip, proc_name, sizeof(proc_name), &offset);
+
+		uintptr_t alloc_end  = base + sz;
+		uintptr_t access_end = real_addr + size;
+		size_t diff_bytes = 0;
+		const char *viol_kind = (real_addr < base) ? "underflows allocation" : "overflows allocation";
+
+		if (real_addr < base) {
+			diff_bytes = (size_t)(base - real_addr);
+		} else if (access_end > alloc_end) {
+			diff_bytes = (size_t)(access_end - alloc_end);
+		}
+
+		DW_LOG_APP(WARNING, PROTECT,
+			"Out-of-bounds access detected (oid=%u)\n"
+			"  Allocation:\n"
+			"    base   = 0x%llx\n"
+			"    size   = %zu bytes\n"
+			"    range  = [0x%llx..0x%llx)\n"
+			"    site   = (%s+0x%lx)\n"
+			"  Access:\n"
+			"    addr   = 0x%llx\n"
+			"    size   = %zu bytes\n"
+			"    range  = [0x%llx..0x%llx)\n"
+			"  Violation:\n"
+			"    %s by %zu bytes\n"
+			"  Backtrace:\n",
+			oid,
+			(unsigned long long)base, (size_t)sz,
+			(unsigned long long)base, (unsigned long long)alloc_end,
+			proc_name, offset,
+			(unsigned long long)real_addr, (size_t)size,
+			(unsigned long long)real_addr, (unsigned long long)access_end,
+			viol_kind, diff_bytes);
+
+
 		return false;
 	}
 
@@ -124,7 +163,7 @@ void* dw_get_base_addr(void *ptr)
 /*
  * Add the object to the oid table and taint the pointer.
  */
-static void *dw_protect(void *ptr, size_t size)
+static void *dw_protect(void *ptr, size_t size, void* caller)
 {
 	pthread_mutex_lock(&oids_lock);
 	if (oids_head == 0) {
@@ -138,6 +177,7 @@ static void *dw_protect(void *ptr, size_t size)
 
 	oids[oids_head].base_addr = ptr;
 	oids[oids_head].size = size;
+	oids[oids_head].alloc_ip = caller;
 	oids_head = next_head;
 
 	pthread_mutex_unlock(&oids_lock);
@@ -210,11 +250,11 @@ inline bool dw_is_protected(const void *ptr)
 /*
  * Alloc and return the tainted pointer.
  */
-void *dw_malloc_protect(size_t size)
+void *dw_malloc_protect(size_t size, void* caller)
 {
 	void *result = __libc_malloc(size);
 	if (result != NULL)
-		result = dw_protect(result, size);
+		result = dw_protect(result, size, caller);
 	return result;
 }
 
@@ -241,10 +281,10 @@ void dw_free_protect(void *ptr)
 /*
  * Memalign and return the tainted pointer.
  */
-void *dw_memalign_protect(size_t alignment, size_t size)
+void *dw_memalign_protect(size_t alignment, size_t size, void* caller)
 {
 	void *result = __libc_memalign(alignment, size);
 	if (result != NULL)
-		result = dw_protect(result, size);
+		result = dw_protect(result, size, caller);
 	return result;
 }

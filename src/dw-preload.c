@@ -83,6 +83,8 @@ static bool forward_to_saved_handler(int sig, siginfo_t *info, void *uctx)
  */
 void signal_protected(int sig, siginfo_t *info, void *context)
 {
+	bt_signal_seed = context;
+
 	struct insn_entry *entry;
 
 	/*
@@ -114,21 +116,25 @@ void signal_protected(int sig, siginfo_t *info, void *context)
 	if (entry == NULL) {
 		// The faulting instruction does not have any tainted pointers as operands. Therefore, we
 		// forward the signal to the previously saved handler (if there is any).
-		if (!forward_to_saved_handler(sig, info, context)) {
+		DW_LOG(WARNING, MAIN,
+		    "Segfault on instruction (0x%llx) without protected memory arguments, forwarding to saved handler\n",
+		    fault_insn);
+		dw_protect_active = save_active;
+		bt_signal_seed = NULL;
+		bool success = forward_to_saved_handler(sig, info, context);
+		if (!success) {
 			DW_LOG(ERROR, MAIN,
 			    "Segfault on instruction (0x%llx) without protected memory arguments, no saved handler\n",
 			    fault_insn);
 		}
-		dw_protect_active = save_active;
 		return;
 	}
-
 	if (created_out)
-		DW_LOG(INFO, MAIN,
-			    "Thread %u has created a new entry for instruction 0x%llx\n", gettid(), entry->insn);
+		DW_LOG(DEBUG, MAIN, "Thread %u has created a new entry for instruction 0x%llx\n", gettid(), entry->insn);
 
 	// We return and it will trap again, but this time libpatch will call the patch_handler
 	dw_protect_active = save_active;
+	bt_signal_seed = NULL;
 }
 
 /*
@@ -200,11 +206,11 @@ dw_init()
 		   "Instruction entries %lu, log level %d, stats file %s, strategy %d, check handling %d\n",
 		   nb_insn_olx_entries, log_level, stats_file, dw_strategy, check_handling);
 
-    // Initialise the different modules
+	// Initialise the different modules
 	insn_table = dw_init_instruction_table(nb_insn_olx_entries);
 	dw_protect_init();
 	dw_patch_init();
-	DW_LOG(INFO, MAIN, "Patch init\n");
+	DW_LOG(DEBUG, MAIN, "Patch init\n");
 
 	/*
 	 * Insert the SIGSEGV signal handler to catch protected pointers. We use
@@ -307,16 +313,16 @@ static void *malloc2(size_t size, void *caller)
 	if (save_active) {
 		if (check_caller(caller)) {
 			if (check_candidate(size))
-				ret = dw_malloc_protect(size);
+				ret = dw_malloc_protect(size, caller);
 		} else
-			DW_LOG(DEBUG, MAIN, "Not tainting malloc, caller from library\n");
+			DW_LOG(TRACE, MAIN, "Not tainting malloc, caller from library\n");
 	}
 	if (ret == NULL)
 		ret = __libc_malloc(size);
 
 	dw_protect_active = save_active;
-	DW_LOG(DEBUG, MAIN, "Malloc %p, size %lu, nb_candidates %lu\n", ret,
-		   size, nb_protected_candidates);
+	DW_LOG(TRACE, MAIN, "Malloc %p, size %lu, caller %p, nb_candidates %lu\n", ret,
+		   size, caller, nb_protected_candidates);
 
 	return ret;
 }
@@ -336,6 +342,11 @@ void *realloc(void *ptr, size_t size)
 {
 	if (ptr == NULL)
 		return malloc2(size, __builtin_return_address(0));
+
+	if (size == 0) {
+		free(ptr);
+		return NULL;
+	}
 
 	void *ret = malloc2(size, __builtin_return_address(0));
 	if (ret == NULL)
@@ -373,7 +384,7 @@ int posix_memalign(void **memptr, size_t alignment, size_t size)
 
 	if (save_active && check_caller(__builtin_return_address(0))) {
 		if (check_candidate(size))
-			ret = dw_memalign_protect(alignment, size);
+			ret = dw_memalign_protect(alignment, size, __builtin_return_address(0));
 		else
 			ret = NULL;
 	}
@@ -387,7 +398,7 @@ int posix_memalign(void **memptr, size_t alignment, size_t size)
 		return ENOMEM;
 
 	*memptr = ret;
-	DW_LOG(DEBUG, MAIN, "posix_memalign %p, size %lu, nb_candidates %lu\n", ret,
+	DW_LOG(TRACE, MAIN, "posix_memalign %p, size %lu, nb_candidates %lu\n", ret,
 		   size, nb_protected_candidates);
 	return 0;
 }
@@ -403,12 +414,12 @@ void *memalign(size_t alignment, size_t size)
 	dw_protect_active = false;
 
 	if (save_active && check_candidate(size))
-		ret = dw_memalign_protect(alignment, size);
+		ret = dw_memalign_protect(alignment, size, __builtin_return_address(0));
 	else
 		ret = __libc_memalign(alignment, size);
 
 	dw_protect_active = save_active;
-	DW_LOG(DEBUG, MAIN, "Memalign %p, size %lu, nb_candidates %lu\n", ret,
+	DW_LOG(TRACE, MAIN, "Memalign %p, size %lu, nb_candidates %lu\n", ret,
 		   size, nb_protected_candidates);
 
 	return ret;
@@ -443,5 +454,5 @@ void free(void *ptr)
 	else
 		__libc_free(ptr);
 
-	DW_LOG(DEBUG, MAIN, "Free %p\n", ptr);
+	DW_LOG(TRACE, MAIN, "Free %p\n", ptr);
 }

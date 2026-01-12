@@ -49,10 +49,10 @@ void* dw_reprotect(const void *ptr, const void *old_ptr);
 bool dw_is_protected(const void *ptr);
 
 /* Alloc a protected object */
-void* dw_malloc_protect(size_t size);
+void* dw_malloc_protect(size_t size, void* caller);
 
 /* Memalign a protected object */
-void* dw_memalign_protect(size_t alignment, size_t size);
+void* dw_memalign_protect(size_t alignment, size_t size, void* caller);
 
 /* Free a protected object */
 void dw_free_protect(void *ptr);

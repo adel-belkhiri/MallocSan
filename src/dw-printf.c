@@ -1435,6 +1435,16 @@ static int vsnprintf_impl(output_gadget_t* output, const char* format, va_list a
   return (int)output->pos;
 }
 
+int dw_vsnprintf(char *s, size_t n, const char *format, va_list arg)
+{
+  output_gadget_t gadget = buffer_gadget(s, n);
+
+  format_string_loop(&gadget, format, arg);
+  append_termination_with_gadget(&gadget);
+
+  return (int)gadget.pos;
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 
 int vprintf_(const char* format, va_list arg)
