@@ -284,15 +284,6 @@ void dw_init_syscall_stubs()
 	libc_pthread_mutex_unlock = dlsym_check(RTLD_NEXT, "pthread_mutex_unlock");
 }
 
-/*
- * Have our own memset, not called with tainted pointers.
- */
-void *dw_memset(void *s, int c, size_t n)
-{
-	pthread_once(&dw_init_stubs, dw_init_syscall_stubs);
-	return libc_memset(s, c, n);
-}
-
 /* Make it shorter, every function calls those */
 #define sin() dw_sin()
 #define sout() dw_sout()
@@ -430,7 +421,7 @@ sighandler_t signal(int signum, sighandler_t handler)
 	struct sigaction oldact;
 
 	sin();
-	dw_memset(&act, 0, sizeof(act));
+	__builtin_memset(&act, 0, sizeof(act));
 	act.sa_handler = handler;
 	sigemptyset(&act.sa_mask);
 

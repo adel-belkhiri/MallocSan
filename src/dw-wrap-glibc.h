@@ -6,7 +6,6 @@
 #include <stdbool.h>
 
 size_t dw_strlen(const char *s);
-void *dw_memset(void *s, int c, size_t n);
 
 /*
  * Each library function wrapper will check the pointers received as argument,

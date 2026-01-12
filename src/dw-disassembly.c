@@ -133,7 +133,7 @@ static bool dw_acquire_runtime_slot(struct insn_entry *entry, int *idx_out)
 
 		if (!insn_rt_slots[i].used) {
 			*idx_out = i;
-			dw_memset(&insn_rt_slots[i], 0, sizeof(insn_rt_slots[i]));
+			__builtin_memset(&insn_rt_slots[i], 0, sizeof(insn_rt_slots[i]));
 			insn_rt_slots[i].used = true;
 			insn_rt_slots[i].entry = entry;
 			return true;
@@ -886,7 +886,7 @@ static bool dw_populate_instruction_entry(instruction_table *table, struct insn_
 	if (nb_protected == 0) {
 		DW_LOG(WARNING, DISASSEMBLY,
 			   "Instruction 0x%llx generated a fault but no protected memory argument\n", entry->insn);
-		dw_memset((void *)entry, 0, sizeof(struct insn_entry));
+		__builtin_memset((void *)entry, 0, sizeof(struct insn_entry));
 		return false;
 	}
 
@@ -1465,7 +1465,7 @@ void dw_unprotect_context(struct patch_exec_context *ctx)
 
 		rt_slot_p = &insn_rt_slots[rt_idx];
 	} else {
-		dw_memset(&rt_slot, 0, sizeof(struct insn_entry_runtime));
+		__builtin_memset(&rt_slot, 0, sizeof(struct insn_entry_runtime));
 		rt_slot.entry = entry;
 		rt_slot_p = &rt_slot;
 	}
@@ -1521,7 +1521,7 @@ static void check_updated_regs (struct insn_entry *entry, struct insn_entry_runt
 	struct memory_arg *mem;
 	struct memory_arg_runtime *mem_rt;
 	bool should_check[dw_nb_saved_registers];
-	dw_memset(should_check, 0, sizeof(should_check));
+	__builtin_memset(should_check, 0, sizeof(should_check));
 
 	if (!entry->deferred_post_handler) {
 		for (int i = 0; i < dw_nb_saved_registers; i++)
