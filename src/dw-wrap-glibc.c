@@ -181,12 +181,17 @@ static int (*libc_pthread_join)(pthread_t, void **);
 static int (*libc_pthread_cond_broadcast)(pthread_cond_t *);
 static int (*libc_pthread_cond_wait)(pthread_cond_t *, pthread_mutex_t *);
 
-static struct sigaction saved_sigsegv;
-static bool saved_sigsegv_valid = false;
-static struct sigaction saved_sigbus;
-static bool saved_sigbus_valid = false;
-static struct sigaction saved_sigtrap;
-static bool saved_sigtrap_valid = false;
+struct dw_saved_sigaction {
+	pid_t tid;
+	struct sigaction sa;
+	bool valid;
+};
+
+#define DW_MAX_SAVED_SIGACTIONS 64
+
+static struct dw_saved_sigaction saved_sigsegv[DW_MAX_SAVED_SIGACTIONS];
+static struct dw_saved_sigaction saved_sigbus[DW_MAX_SAVED_SIGACTIONS];
+static struct dw_saved_sigaction saved_sigtrap[DW_MAX_SAVED_SIGACTIONS];
 
 pthread_once_t dw_init_stubs = PTHREAD_ONCE_INIT;
 // size_t (*dw_strlen)(const char *s);
@@ -299,45 +304,88 @@ static inline bool monitor_signal(int signum)
 	return signum == SIGSEGV || signum == SIGBUS || signum == SIGTRAP;
 }
 
-static inline void pick_saved(int signum, struct sigaction **saved, bool **valid)
+static inline struct dw_saved_sigaction *get_saved_table(int signum)
 {
 	switch (signum)
 	{
 	case SIGSEGV:
-		*saved = &saved_sigsegv;
-		*valid = &saved_sigsegv_valid;
-		break;
-
+		return saved_sigsegv;
 	case SIGBUS:
-		*saved = &saved_sigbus;
-		*valid = &saved_sigbus_valid;
-		break;
-
+		return saved_sigbus;
 	case SIGTRAP:
-		*saved = &saved_sigtrap;
-		*valid = &saved_sigtrap_valid;
-		break;
-
+		return saved_sigtrap;
 	default:
-		// We should not be here!
-		*saved = NULL;
-		*valid = NULL;
+		return NULL;
 	}
+}
+
+static inline struct dw_saved_sigaction *find_saved_entry(int signum, pid_t tid)
+{
+	struct dw_saved_sigaction *table = get_saved_table(signum);
+	if (table == NULL)
+		return NULL;
+
+	for (int i = 0; i < DW_MAX_SAVED_SIGACTIONS; i++) {
+		if (table[i].valid && table[i].tid == tid)
+			return &table[i];
+	}
+
+	return NULL;
+}
+
+static inline struct dw_saved_sigaction *find_any_saved_entry(int signum)
+{
+	struct dw_saved_sigaction *table = get_saved_table(signum);
+	if (table == NULL)
+		return NULL;
+
+	for (int i = 0; i < DW_MAX_SAVED_SIGACTIONS; i++) {
+		if (table[i].valid)
+			return &table[i];
+	}
+
+	return NULL;
+}
+
+static inline struct dw_saved_sigaction *get_or_alloc_saved_entry(int signum, pid_t tid)
+{
+	struct dw_saved_sigaction *entry = find_saved_entry(signum, tid);
+	if (entry != NULL)
+		return entry;
+
+	struct dw_saved_sigaction *table = get_saved_table(signum);
+	if (table == NULL)
+		return NULL;
+
+	for (int i = 0; i < DW_MAX_SAVED_SIGACTIONS; i++) {
+		if (!table[i].valid) {
+			table[i].tid = tid;
+			table[i].valid = true;
+			return &table[i];
+		}
+	}
+
+	/* Table is full, overwrite the first entry as a fallback. */
+	table[0].tid = tid;
+	table[0].valid = true;
+	return &table[0];
 }
 
 bool dw_sigaction_get_saved(int signum, struct sigaction *sa)
 {
-	struct sigaction *saved;
-	bool *valid;
-
 	if (!monitor_signal(signum))
 		return false;
 
-	pick_saved(signum, &saved, &valid);
-	if (!*valid)
+	pid_t tid = gettid();
+	struct dw_saved_sigaction *entry = find_saved_entry(signum, tid);
+
+	if (entry == NULL)
+		entry = find_any_saved_entry(signum);
+
+	if (entry == NULL)
 		return false;
 
-	*sa = *saved;
+	*sa = entry->sa;
 	return true;
 }
 
@@ -346,20 +394,31 @@ int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
 	sin();
 
 	if (!monitor_signal(signum)) {
+		if (act != NULL) {
+			struct sigaction sanitized = *act;
+			sigdelset(&sanitized.sa_mask, SIGSEGV);
+			sigdelset(&sanitized.sa_mask, SIGBUS);
+			sigdelset(&sanitized.sa_mask, SIGTRAP);
+			int ret = libc_sigaction(signum, &sanitized, oldact);
+			sout();
+			return ret;
+		}
 		int ret = libc_sigaction(signum, act, oldact);
 		sout();
 		return ret;
 	}
 
-	struct sigaction *saved;
-	bool *valid;
-	pick_saved(signum, &saved, &valid);
+	pid_t tid = gettid();
 
 	// If act is NULL, we just return the old action as info
 	if (oldact != NULL) {
-		if (*valid) {
-			*oldact = *saved;
-		} else {
+		struct dw_saved_sigaction *entry = find_saved_entry(signum, tid);
+		if (entry == NULL)
+			entry = find_any_saved_entry(signum);
+
+		if (entry != NULL)
+			*oldact = entry->sa;
+		else {
 			memset(oldact, 0, sizeof(*oldact));
 			oldact->sa_handler = SIG_DFL;
 			sigemptyset(&oldact->sa_mask);
@@ -373,16 +432,24 @@ int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
 
 	// If the signal is SIGTRAP, we allow setting it only once
 	if (signum == SIGTRAP) {
-		if (!*valid || act->sa_sigaction == saved->sa_sigaction ||
-		    (void (*)(int)) act->sa_handler == (void (*)(int)) saved->sa_handler) {
-			*saved = *act;
-			*valid = true;
+		struct dw_saved_sigaction *entry_any = find_any_saved_entry(signum);
+
+		if (entry_any == NULL ||
+		    act->sa_sigaction == entry_any->sa.sa_sigaction ||
+		    (void (*)(int)) act->sa_handler == (void (*)(int)) entry_any->sa.sa_handler) {
+
+			struct dw_saved_sigaction *entry = get_or_alloc_saved_entry(signum, tid);
+			if (entry != NULL)
+				entry->sa = *act;
+
 			int ret = libc_sigaction(signum, act, NULL);
 			sout();
 			return ret;
 		}
 
-		DW_LOG(WARNING, WRAP, "Blocked attempt to overwrite the SIGTRAP handler\n");
+		DW_LOG(WARNING, WRAP, "[%u] Blocked attempt to overwrite the SIGTRAP handler\n", gettid());
+		const struct sigaction *saved =
+			entry_any ? &entry_any->sa : act;
 		int ret = libc_sigaction(signum, saved, NULL);
 		sout();
 		return ret;
@@ -396,16 +463,22 @@ int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
 		return ret;
 	}
 
-	// Otherwise, we save the new handler and replace it with our protected one
-	if (!*valid) {
-		*saved = *act;
-		*valid = true;
-	}
+	// Otherwise, always save the latest handler provided by the tracee
+	struct dw_saved_sigaction *entry = get_or_alloc_saved_entry(signum, tid);
+	if (entry != NULL)
+		entry->sa = *act;
 
-	DW_LOG(WARNING, WRAP,
-		    "Blocked attempt to overwrite MallocSan %s handler\n", signum == SIGSEGV ? "SIGSEGV" : "SIGBUS");
+	void *user_handler = NULL;
+	if ((act->sa_flags & SA_SIGINFO) && act->sa_sigaction)
+		user_handler = (void *)act->sa_sigaction;
+	else
+		user_handler = (void *)act->sa_handler;
+
+	DW_LOG(WARNING, WRAP, "[%u] Updated saved MallocSan %s handler to %p\n",
+			gettid(), signum == SIGSEGV ? "SIGSEGV" : "SIGBUS", user_handler);
 
 	struct sigaction replacement = *act;
+
 	replacement.sa_sigaction = signal_protected;
 	replacement.sa_handler = (void (*)(int)) signal_protected;
 	replacement.sa_flags |= SA_SIGINFO;
