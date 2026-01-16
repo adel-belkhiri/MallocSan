@@ -198,10 +198,10 @@ dw_init()
 	arg = getenv("DW_CHECK_HANDLING");
 	if (arg != NULL && atoi(arg) == 1) { check_handling = true; dw_set_check_handling(check_handling); }
 
-	bool show_banner = true;
-	arg = getenv("DW_HIDE_BANNER");
+	bool show_banner = false;
+	arg = getenv("DW_SHOW_BANNER");
 	if (arg != NULL && atoi(arg) == 1)
-		show_banner = false;
+		show_banner = true;
 
 	if (show_banner) {
 		dw_fprintf(2,

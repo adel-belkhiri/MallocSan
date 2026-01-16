@@ -71,7 +71,7 @@ The following environment variables control pointer tainting and library's opera
 | `DW_STATS_FILE`       | Output file for patching statistics (default: `.taintstats.txt`).                                  |
 | `DW_STRATEGY`         | Patching mode: `0` = TRAP, `1` = JUMP. (Currently focusing on TRAP due to `libpatch` limitations.) |
 | `DW_CHECK_HANDLING`   | Enable extra consistency checks (`1` = on, default = `0`).                                         |
-| `DW_HIDE_BANNER`      | Hide MallocSan banner printed at startup (`1` = hide, default = `0`).                              |
+| `DW_SHOW_BANNER`      | Show MallocSan banner printed at startup (`1` = show, default = `0`).                              |
 
 
 ## Usage
@@ -96,4 +96,3 @@ patchelf --add-needed <absolute path>/libmallocsan.so ./simple
 While live debugging is still cumbersome, post-mortem analysis works well:
 If the program crashes, you can inspect the generated core dump in GDB without
 interference from trap handling.
-
