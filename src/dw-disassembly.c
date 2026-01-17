@@ -125,30 +125,30 @@ struct insn_entry *dw_get_instruction_entry(instruction_table *table, uintptr_t 
 	return NULL;
 }
 
-static bool dw_acquire_runtime_slot(struct insn_entry *entry, int *idx_out)
+static inline bool dw_acquire_runtime_slot(struct insn_entry *entry, int *idx_out)
 {
 	for (int i = 0; i < MAX_SCAN_INST_COUNT; ++i) {
-		if (insn_rt_slots[i].entry == entry && insn_rt_slots[i].used)
-			DW_LOG(ERROR, DISASSEMBLY, "Runtime slot %d for instruction 0x%llx shouldn't be used!\n", i, entry->insn);
-
 		if (!insn_rt_slots[i].used) {
 			*idx_out = i;
-			__builtin_memset(&insn_rt_slots[i], 0, sizeof(insn_rt_slots[i]));
 			insn_rt_slots[i].used = true;
 			insn_rt_slots[i].entry = entry;
 			return true;
 		}
+
+		if (insn_rt_slots[i].entry == entry)
+			DW_LOG(ERROR, DISASSEMBLY,
+				   "Runtime slot %d for instruction 0x%llx shouldn't be used!\n",
+				   i, entry->insn);
 	}
 	// Out of slots
 	DW_LOG(ERROR, DISASSEMBLY, "Runtime slots shouldn't be exhausted!\n");
 	return false;
 }
 
-static bool dw_find_runtime_slot(struct insn_entry *entry, int *idx_out)
+static inline bool dw_find_runtime_slot(struct insn_entry *entry, int *idx_out)
 {
-	for (int i = 0; i < MAX_SCAN_INST_COUNT; ++i) {
-		if (insn_rt_slots[i].used && insn_rt_slots[i].entry == entry)
-		{
+	for (int i = 0; i < MAX_SCAN_INST_COUNT; i++) {
+		if (insn_rt_slots[i].used && insn_rt_slots[i].entry == entry) {
 			if (idx_out)
 				*idx_out = i;
 			return true;
@@ -158,10 +158,13 @@ static bool dw_find_runtime_slot(struct insn_entry *entry, int *idx_out)
 	return false;
 }
 
-static void dw_release_rt_slot(int idx)
+static inline void dw_release_rt_slot(int idx)
 {
-	insn_rt_slots[idx].used = false;
+	if (idx < 0 || idx >= MAX_SCAN_INST_COUNT)
+		return;
+
 	insn_rt_slots[idx].entry = NULL;
+	insn_rt_slots[idx].used = false;
 }
 
 /*
@@ -1288,6 +1291,7 @@ static void check_vsib_access(struct memory_arg *mem, struct memory_arg_runtime 
 			index_size, width, count, idx);
 
 	mem_rt->index_is_tainted = false;
+	mem_rt->mask_bv = ~0ULL;
 
 	/* Decode the indices from the XSAVE area. */
 	bytes_count = decode_extended_states(index, xsave_ptr, index_buffer);
@@ -1297,7 +1301,7 @@ static void check_vsib_access(struct memory_arg *mem, struct memory_arg_runtime 
 			dw_get_reg_entry(index)->name, bytes_count, index_size);
 
 	/* Save the original indices as they might be tainted. */
-	memcpy(mem_rt->indices, index_buffer, bytes_count);
+	__builtin_memcpy(mem_rt->indices, index_buffer, bytes_count);
 
 	/*
 	 * Decode the mask register:
@@ -1376,6 +1380,11 @@ static void check_sib_access(struct memory_arg *mem, struct memory_arg_runtime* 
 	bool index_is_protected, base_is_protected;
 	uintptr_t valuei = 0, valuei_clean = 0, addr;
 	unsigned regi = mem->index;
+
+	mem_rt->index_taint = 0;
+	mem_rt->index_addr = 0;
+	mem_rt->saved_address = 0;
+	mem_rt->saved_value = 0;
 
 	index_is_protected = false;
 	base_is_protected = dw_is_protected((void *) valueb);
@@ -1471,17 +1480,18 @@ void dw_unprotect_context(struct patch_exec_context *ctx)
 
 		rt_slot_p = &insn_rt_slots[rt_idx];
 	} else {
-		__builtin_memset(&rt_slot, 0, sizeof(struct insn_entry_runtime));
 		rt_slot.entry = entry;
 		rt_slot_p = &rt_slot;
 	}
 
 	for (int i = 0; i < entry->nb_arg_m; i++) {
-		mem = &(entry->arg_m[i]);
 		mem_rt = &(rt_slot_p->arg_m[i]);
-		regb = mem->base;
+		mem_rt->base_taint = 0;
+		mem_rt->base_addr = 0;
 
 		// Handle the base register
+		mem = &(entry->arg_m[i]);
+		regb = mem->base;
 		valueb = 0;
 		if (regb != X86_REG_INVALID) {
 			reb = dw_get_reg_entry(regb);
@@ -1516,9 +1526,7 @@ void dw_unprotect_context(struct patch_exec_context *ctx)
 			}
 	}
 
-	if (entry->post_handler)
-		rt_slot_p->pending_post_handler = true;
-	else
+	if (!entry->post_handler)
 		dw_bt_seed_patch_clear();
 }
 
@@ -1601,10 +1609,6 @@ void dw_reprotect_context(struct patch_exec_context *ctx)
 		return;
 
 	struct insn_entry_runtime *runtime_slot = &insn_rt_slots[slot_idx];
-
-	if (runtime_slot->entry != entry || !runtime_slot->pending_post_handler)
-		DW_LOG(ERROR, DISASSEMBLY,
-			"Post-handler runtime slot mismatch for instruction 0x%llx\n", entry->insn);
 
 	if (dw_check_handling) {
 		DW_LOG(DEBUG, DISASSEMBLY, "(+) Before reprotecting instruction 0x%llx: %s\n",

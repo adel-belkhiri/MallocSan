@@ -105,7 +105,7 @@ struct memory_arg_runtime {
 		struct {
 			/* The index register is a vector register, so we can have multiple indices */
 			uint8_t indices[64];
-			/* set to true is the index is tainted */
+			/* set to true if the index is tainted */
 			bool index_is_tainted;
 			/* per-execution mask bits: Stores the decoded mask register value. One bit per lane to indicate whether the
 			 * corresponding memory access must be performed or not */
@@ -117,7 +117,6 @@ struct memory_arg_runtime {
 struct insn_entry_runtime {
 	struct insn_entry *entry;
 	struct memory_arg_runtime arg_m[MAX_MEM_ARG];
-	bool pending_post_handler;
 	bool used;
 };
 
