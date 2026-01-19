@@ -69,9 +69,10 @@ The following environment variables control pointer tainting and library's opera
 | `DW_INSN_ENTRIES`     | Expected number of instructions to patch/trap. The internal table will be \~2× this size.          |
 | `DW_LOG_LEVEL`        | Log verbosity: `0` = silent, `4` = debug (errors, warnings, info, debug).                          |
 | `DW_STATS_FILE`       | Output file for patching statistics (default: `.taintstats.txt`).                                  |
-| `DW_STRATEGY`         | Patching mode: `0` = TRAP, `1` = JUMP. (Currently focusing on TRAP due to `libpatch` limitations.) |
 | `DW_CHECK_HANDLING`   | Enable extra consistency checks (`1` = on, default = `0`).                                         |
 | `DW_SHOW_BANNER`      | Show MallocSan banner printed at startup (`1` = show, default = `0`).                              |
+
+MallocSan uses the `JUMP` patching strategy and falls back to `TRAP` only when no jump-based patch is possible.
 
 
 ## Usage
@@ -80,7 +81,6 @@ A sample invocation of the test application "simple" can look like the following
 ```bash
 time LD_PRELOAD=./libmallocsan.so \
      DW_STATS_FILE=stats.txt \
-     DW_STRATEGY=1 \
      DW_LOG_LEVEL=0 \
      ./simple 10 1000000 2>out.txt
 ```

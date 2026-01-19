@@ -23,7 +23,9 @@ _Atomic int dw_fully_initialized = 0;
 static size_t nb_insn_olx_entries = 30000;
 
 /*
- * In the current version, we will only try PATCH_TRAP which should always work.
+ * In the current version, we will only use PATCH_JUMP and fall back to PATCH_TRAP only when
+ * libpatch cannot generate a jump-based solution for a given patch site.
+ *
  * This should let us debug two aspects. The first is libc wrappers to insure
  * that no tainted pointers leak to system calls. A trace of system calls with
  * arguments and a stack dump can let us check if a tainted pointer is passed as
@@ -33,7 +35,7 @@ static size_t nb_insn_olx_entries = 30000;
  * ymm10
  */
 
-enum dw_strategies dw_strategy = DW_PATCH_TRAP;
+enum dw_strategies dw_strategy = DW_PATCH_JUMP;
 
 static instruction_table *insn_table;
 
@@ -192,9 +194,6 @@ dw_init()
 	arg = getenv("DW_STATS_FILE");
 	if (arg != NULL) stats_file = arg;
 
-	arg = getenv("DW_STRATEGY");
-	if (arg != NULL) dw_strategy = atoi(arg);
-
 	arg = getenv("DW_CHECK_HANDLING");
 	if (arg != NULL && atoi(arg) == 1) { check_handling = true; dw_set_check_handling(check_handling); }
 
@@ -217,7 +216,7 @@ dw_init()
 		"\n"
 		" Instrumentation:\n"
 		"   insn_entries        : %lu\n"
-		"   strategy            : %d\n"
+		"   strategy            : %s (fallback TRAP)\n"
 		"   check_handling      : %s\n"
 		"\n"
 		" Logging / Statistics:\n"
@@ -225,7 +224,7 @@ dw_init()
 		"   stats_file          : %s\n"
 		"============================================================\n",
 		min_protect_size, max_protect_size, first_protected, max_nb_protected,
-		nb_insn_olx_entries, dw_strategy, check_handling ? "enabled" : "disabled",
+		nb_insn_olx_entries, strategy_name(dw_strategy), check_handling ? "enabled" : "disabled",
 		log_level, stats_file);
 	}
 

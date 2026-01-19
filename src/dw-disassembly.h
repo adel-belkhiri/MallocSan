@@ -14,6 +14,9 @@
 #define MAX_REG_ARG 6
 #define MAX_MOD_REG 6
 #define MAX_SCAN_INST_COUNT 32
+#define MAX_SAFE_SITE_COUNT (MAX_SCAN_INST_COUNT/4)
+#define DW_MIN_SAFE_CANDIDATE_SIZE 4
+#define DW_TAIL_CANDIDATE_BUDGET 2
 #define MAX_VSIB_INDEX_WIDTH 8  // 64 bits index
 #define MIN_VSIB_INDEX_WIDTH 4  // 32 bits index
 
@@ -122,6 +125,16 @@ struct insn_entry_runtime {
 
 extern enum dw_strategies dw_strategy;
 
+static inline const char *strategy_name(enum dw_strategies s)
+{
+	switch (s) {
+		case DW_PATCH_TRAP: return "TRAP";
+		case DW_PATCH_JUMP: return "JUMP";
+		case DW_PATCH_MIXED: return "MIXED";
+		default: return "UNKNOWN";
+	}
+}
+
 extern __thread struct insn_entry_runtime insn_rt_slots[MAX_SCAN_INST_COUNT];
 
 struct reg_arg {
@@ -172,15 +185,6 @@ struct insn_entry *dw_create_instruction_entry(instruction_table *table,
 
 /* Initialize libpatch */
 void dw_patch_init();
-
-typedef void (*dw_patch_probe)(struct patch_exec_context *ctx, uint8_t post_or_ret);
-
-/* Patch the instruction described by that entry and have
- * the specified handler called before and after that instruction */
-bool dw_instruction_entry_patch(struct insn_entry *entry,
-								enum dw_strategies strategy,
-								dw_patch_probe patch_handler,
-								bool deferred_post_handler);
 
 /* A potentially tainted pointer is accessed, unprotect it before the access */
 void dw_unprotect_context(struct patch_exec_context *ctx);

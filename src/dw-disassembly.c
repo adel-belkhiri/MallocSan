@@ -74,6 +74,36 @@ static inline struct capstone_context *capstone_get_context(void)
 	return &cs_ctx;
 }
 
+struct post_safe_site {
+	uintptr_t addr;
+	unsigned skipped_same_access;
+};
+
+struct post_safe_site_rb {
+	struct post_safe_site entries[MAX_SAFE_SITE_COUNT];
+	unsigned head;
+	unsigned count;
+};
+
+
+static inline void add_post_safe_site(struct post_safe_site_rb *rb, uintptr_t addr, uint16_t size, unsigned skipped_same_access)
+{
+	if (!rb || size < DW_MIN_SAFE_CANDIDATE_SIZE)
+		return;
+
+	unsigned idx;
+	if (rb->count < MAX_SAFE_SITE_COUNT) {
+		idx = (rb->head + rb->count) % MAX_SAFE_SITE_COUNT;
+		rb->count++;
+	} else {
+		idx = rb->head;
+		rb->head = (rb->head + 1) % MAX_SAFE_SITE_COUNT;
+	}
+
+	rb->entries[idx].addr = addr;
+	rb->entries[idx].skipped_same_access = skipped_same_access;
+}
+
 /*
  * Allocate the instruction hash table and initialize libcapstone.
  */
@@ -350,17 +380,26 @@ static bool get_function_bounds(uintptr_t ip, uintptr_t *start, uintptr_t *end)
 }
 
 /*
- * Check if we can defer the installation of post-handler and if this is the
- * case returns the address where the post-handler should be installed
+ * Defer post-handler installation by scanning forward for safe instruction sites.
+ *
+ * This function scans instructions starting from the next instruction after a fault,
+ * looking for locations where a post-handler can be safely installed.
+ *
+ * The scan stops when:
+ * - A control-flow instruction is encountered (branch, call, return, etc.)
+ * - A tainted register is read or modified
+ * - All tainted registers are overwritten
+ * - Memory access patterns diverge from the original fault
+ * - The maximum instruction count is reached
  */
-static uintptr_t dw_defer_post_handler(instruction_table *table,
-		struct capstone_context * cs,
-		struct insn_entry *entry,
-		struct insn_entry_runtime *entry_rt,
-		uintptr_t start_addr,
-		ucontext_t *uctx,
-		unsigned *scanned_count,
-		unsigned *similar_access_count)
+static uintptr_t dw_defer_post_handler(struct insn_entry *entry,
+				   struct insn_entry_runtime *entry_rt,
+				   uintptr_t start_addr,
+				   ucontext_t *uctx,
+				   struct capstone_context *cs,
+				   unsigned *scanned_count,
+				   unsigned *similar_access_count,
+				   struct post_safe_site_rb *rb)
 {
 	const uint8_t *code            = (const uint8_t *) start_addr;
 	uint64_t instr_addr            = (uint64_t) start_addr;
@@ -374,7 +413,7 @@ static uintptr_t dw_defer_post_handler(instruction_table *table,
 	uint8_t tainted_regs_count = 0;
 	struct memory_arg *mem;
 	struct memory_arg_runtime *mem_rt;
-
+	unsigned tail_budget = 0;
 
 	uintptr_t func_start = 0, func_end = 0;
 	size_t max_bytes = (size_t)MAX_SCAN_INST_COUNT * 15;
@@ -394,15 +433,17 @@ static uintptr_t dw_defer_post_handler(instruction_table *table,
 	for (int i = 0; i < entry->nb_arg_m; i++) {
 		mem = &entry->arg_m[i];
 		mem_rt = &entry_rt->arg_m[i];
+		int taint_reg = X86_REG_INVALID;
 
 		if (mem_rt->base_taint)
-			reg_set_add(tainted_regs, &tainted_regs_count, sizeof(tainted_regs)/sizeof(tainted_regs[0]), mem->base);
+			taint_reg = mem->base;
 
-		if (reg_is_gpr(mem->index) && mem_rt->index_taint)
-			reg_set_add(tainted_regs, &tainted_regs_count, sizeof(tainted_regs)/sizeof(tainted_regs[0]), mem->index);
+		if ((reg_is_gpr(mem->index) && mem_rt->index_taint) ||
+			(reg_is_avx(mem->index) && mem_rt->index_is_tainted))
+			taint_reg = mem->index;
 
-		else if (reg_is_avx(mem->index) && mem_rt->index_is_tainted)
-			reg_set_add(tainted_regs, &tainted_regs_count, sizeof(tainted_regs)/sizeof(tainted_regs[0]), mem->index);
+		if (taint_reg != X86_REG_INVALID)
+			reg_set_add(tainted_regs, &tainted_regs_count, sizeof(tainted_regs)/sizeof(tainted_regs[0]), taint_reg);
 	}
 
 	while (n < MAX_SCAN_INST_COUNT && buff_size > 0) {
@@ -452,8 +493,10 @@ static uintptr_t dw_defer_post_handler(instruction_table *table,
 				 */
 				if ((last_safe_addr <= last_same_access_addr) &&
 					(insn->id != X86_INS_INT3) && (insn->id != X86_INS_JMP)) {
-					last_safe_addr = cs->insn->address;
+					last_safe_addr = insn->address;
 					count_same_access += pending_same_access;
+					pending_same_access = 0;
+					add_post_safe_site(rb, last_safe_addr, insn->size, count_same_access);
 				}
 
 				goto stop_return;
@@ -473,15 +516,25 @@ static uintptr_t dw_defer_post_handler(instruction_table *table,
 		}
 
 		if (!taint_involved) {
-			// We cannot patch memory access instructions as they might fault and require to be repatched
-			if (!is_memory_access_instruction && (last_safe_addr <= last_same_access_addr)) {
-				last_safe_addr = cs->insn->address;
-				count_same_access += pending_same_access;
-				pending_same_access = 0;
+			/*
+			 * When a safe site is found, we record a few "tail" safe sites as fallback
+			 * in case the preferred site is not patchable with a JUMP.
+			 */
+			if (!is_memory_access_instruction) {
+				if (last_safe_addr <= last_same_access_addr) {
+					last_safe_addr = insn->address;
+					count_same_access += pending_same_access;
+					pending_same_access = 0;
+					tail_budget = DW_TAIL_CANDIDATE_BUDGET;
+					add_post_safe_site(rb, last_safe_addr, insn->size, count_same_access);
+				} else if (count_same_access > 0 && tail_budget > 0) {
+					add_post_safe_site(rb, insn->address, insn->size, count_same_access);
+					tail_budget--;
+				}
 			}
 
-			DW_LOG(DEBUG, DISASSEMBLY, "Skipping instruction at 0x%llx -> %s %s\n",
-				   cs->insn->address, cs->insn->mnemonic, cs->insn->op_str);
+			DW_LOG(DEBUG, DISASSEMBLY, "Skipping instruction at 0x%llx -> %s %s, (%u)\n",
+				   insn->address, insn->mnemonic, insn->op_str, insn->size);
 			++n;
 			continue;
 		}
@@ -508,11 +561,12 @@ static uintptr_t dw_defer_post_handler(instruction_table *table,
 
 					if (!similar_memory_access(insn->id, op, mem, mem_rt, uctx, repeat))
 						goto stop_return;
+					}
+					last_same_access_addr = insn->address;
+					pending_same_access++;
+					tail_budget = 0;
 				}
-				last_same_access_addr = cs->insn->address;
-				pending_same_access++;
 			}
-		}
 
 		// 4) We need to stop if one of the memory registers is tainted and updated or read
 		bool every_tainted_reg_written = true;
@@ -532,8 +586,9 @@ static uintptr_t dw_defer_post_handler(instruction_table *table,
 				}
 
 				if (!is_memory_access_instruction && (last_safe_addr <= last_same_access_addr)) {
-					last_safe_addr = cs->insn->address;
+					last_safe_addr = insn->address;
 					count_same_access += pending_same_access;
+					add_post_safe_site(rb, last_safe_addr, insn->size, count_same_access);
 				}
 				goto stop_return;
 			}
@@ -541,8 +596,9 @@ static uintptr_t dw_defer_post_handler(instruction_table *table,
 			// The tainted base or index register is read
 			if (read) {
 				if (!is_memory_access_instruction && (last_safe_addr <= last_same_access_addr)) {
-					last_safe_addr = cs->insn->address;
+					last_safe_addr = insn->address;
 					count_same_access += pending_same_access;
+					add_post_safe_site(rb, last_safe_addr, insn->size, count_same_access);
 				}
 				goto stop_return;
 			}
@@ -554,8 +610,9 @@ static uintptr_t dw_defer_post_handler(instruction_table *table,
 		// All tainted registers are overwritten, so we can skip the post-handler
 		if (every_tainted_reg_written) {
 			if (!is_memory_access_instruction && (last_safe_addr <= last_same_access_addr)) {
-				last_safe_addr = cs->insn->address;
+				last_safe_addr = insn->address;
 				count_same_access += pending_same_access;
+				add_post_safe_site(rb, last_safe_addr, insn->size, count_same_access);
 			}
 
 			DW_LOG(DEBUG, DISASSEMBLY, "Post-handler has been DISABLED because all tainted registers are overwritten!\n");
@@ -564,8 +621,8 @@ static uintptr_t dw_defer_post_handler(instruction_table *table,
 		}
 
 		// Otherwise, we can safely skip the instruction
-		DW_LOG(DEBUG, DISASSEMBLY, "Skipping instruction at 0x%llx -> %s %s\n",
-			    cs->insn->address, cs->insn->mnemonic, cs->insn->op_str);
+		DW_LOG(DEBUG, DISASSEMBLY, "Skipping instruction at 0x%llx -> %s %s, (%u)\n",
+			    insn->address, insn->mnemonic, insn->op_str, insn->size);
 
 		n++;
 		continue;
@@ -793,7 +850,9 @@ fill_instruction_operands(struct insn_entry *entry, struct insn_entry_runtime* e
  * Disassembles a faulted instruction, and populates the entry with register and memory operand
  * information.
  */
-static bool dw_populate_instruction_entry(instruction_table *table, struct insn_entry *entry, uintptr_t fault, ucontext_t *uctx)
+static bool dw_populate_instruction_entry(instruction_table *table, struct insn_entry *entry,
+					   uintptr_t fault, ucontext_t *uctx,
+					   struct post_safe_site_rb *safe_sites)
 {
 	size_t sizeds = 15; /* x86 max insn length */
 	bool success;
@@ -960,36 +1019,25 @@ static bool dw_populate_instruction_entry(instruction_table *table, struct insn_
 	 * safely skipped or installed at a later instruction.
 	 */
 	if (entry->post_handler && !need_immediate_reprotection) {
-		unsigned int insn_scan_count, similar_acess_count;
+		unsigned int insn_scan_count, similar_access_count;
 		uintptr_t last_safe_addr;
 
-		last_safe_addr = dw_defer_post_handler(table, cs, entry, &entry_rt, insn_addr, uctx, &insn_scan_count,
-											    &similar_acess_count);
+		last_safe_addr = dw_defer_post_handler(entry, &entry_rt, insn_addr, uctx, cs,
+							   &insn_scan_count, &similar_access_count, safe_sites);
 
 		DW_LOG(DEBUG, DISASSEMBLY,
 			   "Forward scan has stopped at 0x%llx (%s %s), after (%u) instructions.\n",
 			   cs->insn->address, cs->insn->mnemonic, cs->insn->op_str, insn_scan_count);
 
-		if (entry->post_handler && similar_acess_count > 0) {
+		if (entry->post_handler && similar_access_count > 0) {
 			entry->deferred_post_handler = true;
 			entry->next_insn = last_safe_addr;
-
 			DW_LOG(DEBUG, DISASSEMBLY,
 				   "Post-handler DEFERRED to 0x%llx - skipped (%u) similar memory accesses!\n",
-				   last_safe_addr, similar_acess_count);
+				   last_safe_addr, similar_access_count);
 		}
 	}
 	return true;
-}
-
-static inline const char *strategy_name(enum dw_strategies s)
-{
-	switch (s) {
-		case DW_PATCH_TRAP: return "TRAP";
-		case DW_PATCH_JUMP: return "JUMP";
-		case DW_PATCH_MIXED: return "MIXED";
-		default: return "UNKNOWN";
-	}
 }
 
 /*
@@ -1052,10 +1100,9 @@ void dw_patch_init()
  * Once the algorithm is well tested and debugged, this saving and comparison
  * step will be removed.
  */
-bool dw_instruction_entry_patch(struct insn_entry *entry,
-		enum dw_strategies strategy,
-		dw_patch_probe patch_handler,
-		bool deferred)
+static bool dw_instruction_entry_patch_strategy(struct insn_entry *entry,
+				   enum dw_strategies strategy,
+				   bool deferred)
 {
 	struct patch_location location = {
 			.type      = PATCH_LOCATION_ADDRESS,
@@ -1100,8 +1147,9 @@ bool dw_instruction_entry_patch(struct insn_entry *entry,
 	} else if (strategy == DW_PATCH_JUMP) {
 		s = patch_attr_set_trap_policy(&attr, PATCH_TRAP_POLICY_FORBID);
 		check_patch(s, "set policy FORBID");
-	} else
+	} else {
 		DW_LOG(ERROR, DISASSEMBLY, "Unknown patching strategy\n");
+	}
 
 	s = patch_attr_set_initial_state(&attr, PATCH_ENABLED);
 	check_patch(s, "set enabled");
@@ -1123,38 +1171,89 @@ bool dw_instruction_entry_patch(struct insn_entry *entry,
  * This function patches an instruction and returns the strategy that finally worked,
  * or exit on failure.
  */
-static enum dw_strategies do_patch(struct insn_entry *entry, enum dw_strategies strategy,
-								   dw_patch_probe handler, bool is_deferred)
+static enum dw_strategies do_patch(struct insn_entry *entry, bool deferred)
 {
-	const char *patch_type = is_deferred ? "deferred" : "initial";
-	uintptr_t patch_addr = is_deferred ? entry->next_insn : entry->insn;
-	enum dw_strategies chosen_strategy = DW_PATCH_UNKNOWN;
+	const char *patch_type = deferred ? "deferred" : "initial";
+	uintptr_t patch_addr = deferred ? entry->next_insn : entry->insn;
+	enum dw_strategies strategy = DW_PATCH_UNKNOWN;
 
-	const enum dw_strategies fallback_strategy =
-				(strategy == DW_PATCH_JUMP) ? DW_PATCH_TRAP : DW_PATCH_UNKNOWN;
-
-	if (dw_instruction_entry_patch(entry, strategy, handler, is_deferred)) {
-		chosen_strategy = strategy;
-	} else if (fallback_strategy != DW_PATCH_UNKNOWN) {
-		if (dw_instruction_entry_patch(entry, fallback_strategy, handler, is_deferred))
-			chosen_strategy = fallback_strategy;
-	}
-
-	if (chosen_strategy == DW_PATCH_UNKNOWN)
+	if (dw_instruction_entry_patch_strategy(entry, DW_PATCH_JUMP, deferred))
+		strategy = DW_PATCH_JUMP;
+	else if (dw_instruction_entry_patch_strategy(entry, DW_PATCH_TRAP, deferred))
+		strategy = DW_PATCH_TRAP;
+	else
 		DW_LOG(ERROR, MAIN, "Patching %s location 0x%llx failed (origin 0x%llx).\n",
 			   patch_type, patch_addr, entry->insn);
 
 	DW_LOG(DEBUG, MAIN, "Successfully patched %s site 0x%llx with %s strategy.\n",
-		   patch_type, patch_addr, strategy_name(chosen_strategy));
+		   patch_type, patch_addr, strategy_name(strategy));
 
-	return chosen_strategy;
+	return strategy;
+}
+
+/*
+ * Try to patch one of the deferred safe sites with JUMP strategy.
+ * Return true on success, false otherwise.
+ */
+static bool patch_deferred_site(struct insn_entry *entry, struct post_safe_site_rb *safe_sites)
+{
+	for (int i = (int)safe_sites->count - 1; i >= 0; i--) {
+		unsigned idx = (safe_sites->head + i) % MAX_SAFE_SITE_COUNT;
+
+		entry->next_insn = safe_sites->entries[idx].addr;
+		if (dw_instruction_entry_patch_strategy(entry, DW_PATCH_JUMP, true)) {
+			DW_LOG(DEBUG, MAIN, "Successfully patched deferred site 0x%llx with %s strategy.\n",
+				   entry->next_insn, strategy_name(DW_PATCH_JUMP));
+			return true;
+		}
+
+		DW_LOG(DEBUG, MAIN,
+			   "Deferred JUMP patch failed at 0x%llx (origin 0x%llx), trying next candidate.\n",
+			   entry->next_insn, entry->insn);
+	}
+
+	return false;
+}
+
+/*
+ * Patches the instruction with a tainted register. If the post-handler
+ * is deferred, we also patch the deferred site. We always try JUMP first, and
+ * fall back to TRAP only when there is no jump-based patch solution.
+ */
+static void patch_entry(struct insn_entry *entry, struct post_safe_site_rb *safe_sites)
+{
+
+	if (!entry->post_handler || !entry->deferred_post_handler) {
+		entry->strategy = do_patch(entry, false);
+		return;
+	}
+
+	/*
+	 * Either we can patch one of the deferred sites with JUMP, or we cancel deferring
+	 * and patch the initial site (with JUMP->TRAP fallback).
+	 */
+	if (patch_deferred_site(entry, safe_sites)) {
+		enum dw_strategies initial_strategy = do_patch(entry, false);
+
+		entry->strategy = (initial_strategy != DW_PATCH_JUMP) ? DW_PATCH_MIXED : initial_strategy;
+		return;
+	}
+
+	DW_LOG(DEBUG, MAIN,
+		   "Deferred JUMP patch failed for all candidates (origin 0x%llx), canceling deferring.\n",
+		   (unsigned long long)entry->insn);
+
+	entry->deferred_post_handler = false;
+	entry->strategy = do_patch(entry, false);
 }
 
 /*
  * Create a new entry for this instruction address
  */
-struct insn_entry *
-dw_create_instruction_entry(instruction_table *table, uintptr_t fault, ucontext_t *uctx, bool *created_out)
+struct insn_entry *dw_create_instruction_entry(instruction_table *table,
+					   uintptr_t fault,
+					   ucontext_t *uctx,
+					   bool *created_out)
 {
 	size_t hash   = fault % table->size;
 	size_t cursor = hash;
@@ -1171,28 +1270,23 @@ dw_create_instruction_entry(instruction_table *table, uintptr_t fault, ucontext_
 			if (atomic_compare_exchange_strong_explicit(&e->state, &expected, ENTRY_INITIALIZING,
 				    memory_order_acq_rel, memory_order_relaxed)) {
 
-				bool ok = dw_populate_instruction_entry(table, e, fault, uctx);
+				struct post_safe_site_rb safe_sites;
+				safe_sites.head = 0;
+				safe_sites.count = 0;
+
+				bool ok = dw_populate_instruction_entry(table, e, fault, uctx, &safe_sites);
 				if (!ok) {
 					atomic_store_explicit(&e->state, ENTRY_FAILED, memory_order_release);
 					DW_LOG(WARNING, MAIN, "Problem creating entry for instruction 0x%llx\n", fault);
 					return NULL;
 				}
 
-				/*
-				* Here we patch the instruction that involves tainted registers. If the post-handler
-				* is deferred, we also patch the deferred location. If we cannot install a patch with
-				* a given strategy, we fall back to the trap strategy.
-				*/
-				e->strategy = do_patch(e, dw_strategy, patch_handler, false);
+				patch_entry(e, &safe_sites);
 
-				if (e->post_handler && e->deferred_post_handler) {
-					if (e->strategy != do_patch(e, dw_strategy, patch_handler, true))
-						e->strategy = DW_PATCH_MIXED;
-				}
-
-				DW_LOG(DEBUG, MAIN, "Patch summary for 0x%llx: Post-handler: %s, Deferred: %s, Strategy: %s\n",
-					e->insn, e->post_handler ? "Yes" : "No", e->deferred_post_handler ? "Yes" : "No",
-					strategy_name(e->strategy));
+				DW_LOG(DEBUG, MAIN,
+					   "Patch summary for 0x%llx: Post-handler: %s, Deferred: %s, Strategy: %s\n",
+					   e->insn, e->post_handler ? "Yes" : "No", e->deferred_post_handler ? "Yes" : "No",
+					   strategy_name(e->strategy));
 
 				atomic_store_explicit(&e->state, ENTRY_READY, memory_order_release);
 				*created_out = true;
@@ -1621,11 +1715,6 @@ void dw_reprotect_context(struct patch_exec_context *ctx)
 		mem = &(entry->arg_m[i]);
 		mem_rt = &runtime_slot->arg_m[i];
 
-		// Continue if neither base nor index were tainted
-		if (!mem_rt->base_taint &&
-			((reg_is_gpr(mem->index) && !mem_rt->index_taint) ||
-			 (reg_is_avx(mem->index) && !mem_rt->index_is_tainted)))
-			continue;
 		/*
 		 * The tainted register, base or index, is retainted unless the same register was also
 		 * an overwritten register argument.
