@@ -104,14 +104,27 @@ static inline void add_post_safe_site(struct post_safe_site_rb *rb, uintptr_t ad
 	rb->entries[idx].skipped_same_access = skipped_same_access;
 }
 
+static inline size_t hash_addr(uintptr_t x)
+{
+	x ^= x >> 33;
+	x *= 0xff51afd7ed558ccdULL;
+	x ^= x >> 33;
+	return (size_t)x;
+}
+
+static inline size_t get_pow2(size_t x)
+{
+	return 1ULL << (64 - __builtin_clzl(x - 1));
+}
+
 /*
  * Allocate the instruction hash table and initialize libcapstone.
  */
 instruction_table *dw_init_instruction_table(size_t size)
 {
 	instruction_table *table = malloc(sizeof(instruction_table));
-	// have a hash table about twice as large, and a power of two -1
-	table->size = 2 * size - 1;
+	// have a hash table about twice as large, and a power of two
+	table->size = get_pow2(2 * size);
 	table->entries = calloc(table->size, sizeof(struct insn_entry));
 
 	return table;
@@ -131,25 +144,31 @@ void dw_fini_instruction_table(instruction_table *table)
  */
 struct insn_entry *dw_get_instruction_entry(instruction_table *table, uintptr_t fault)
 {
-	size_t hash = fault % table->size;
-	size_t cursor = hash;
+	size_t mask   = table->size - 1;
+	size_t start  = hash_addr(fault) & mask;
+	size_t cursor = start;
 
-	while ((void *) table->entries[cursor].insn != NULL) {
+	while (1) {
 		struct insn_entry *e = &table->entries[cursor];
 		int state = atomic_load_explicit(&e->state, memory_order_acquire);
 
 		if (state == ENTRY_EMPTY)
 			return NULL;
 
-		if (table->entries[cursor].insn == fault) {
-			if (state == ENTRY_READY)
-				return &(table->entries[cursor]);
-			else
+		if (state == ENTRY_INITIALIZING) {
+			do {
+				state = atomic_load_explicit(&e->state, memory_order_acquire);
+			} while (state == ENTRY_INITIALIZING);
+
+			if (state == ENTRY_EMPTY)
 				return NULL;
 		}
 
-		cursor = (cursor + 1) % table->size;
-		if (cursor == hash)
+		if (e->insn == fault)
+			return (state == ENTRY_READY) ? e : NULL;
+
+		cursor = (cursor + 1) & mask;
+		if (cursor == start)
 			break;
 	}
 	return NULL;
@@ -951,7 +970,6 @@ static bool dw_populate_instruction_entry(instruction_table *table, struct insn_
 	if (nb_protected == 0) {
 		DW_LOG(WARNING, DISASSEMBLY,
 			   "Instruction 0x%llx generated a fault but no protected memory argument\n", entry->insn);
-		__builtin_memset((void *)entry, 0, sizeof(struct insn_entry));
 		return false;
 	}
 
@@ -1255,8 +1273,9 @@ struct insn_entry *dw_create_instruction_entry(instruction_table *table,
 					   ucontext_t *uctx,
 					   bool *created_out)
 {
-	size_t hash   = fault % table->size;
-	size_t cursor = hash;
+	size_t mask   = table->size - 1;
+	size_t start  = hash_addr(fault) & mask;
+	size_t cursor = start;
 
 	*created_out = false;
 
@@ -1302,7 +1321,7 @@ struct insn_entry *dw_create_instruction_entry(instruction_table *table,
 				entry_state = atomic_load_explicit(&e->state, memory_order_acquire);
 			} while (entry_state == ENTRY_INITIALIZING);
 
-			if ((e->insn == fault) && (entry_state == ENTRY_READY || entry_state == ENTRY_FAILED))
+			if (e->insn == fault)
 				return (entry_state == ENTRY_READY) ? e : NULL;
 		}
 		else if (entry_state == ENTRY_READY)
@@ -1310,9 +1329,13 @@ struct insn_entry *dw_create_instruction_entry(instruction_table *table,
 			if (e->insn == fault)
 				return e;
 		}
+		else if (entry_state == ENTRY_FAILED) {
+			if (e->insn == fault)
+				return NULL;
+		}
 
-		cursor = (cursor + 1) % table->size;
-		if (cursor == hash) {
+		cursor = (cursor + 1) & mask;
+		if (cursor == start) {
 			DW_LOG(ERROR, DISASSEMBLY, "Instruction hash table full\n");
 			break;
 		}
@@ -1805,7 +1828,7 @@ void dw_print_instruction_entries(instruction_table *table, int fd)
 
 	for (int i = 0; i < table->size; i++) {
 		entry = &(table->entries[i]);
-		if ((void *) entry->insn != NULL) {
+		if (atomic_load_explicit(&entry->state, memory_order_acquire) == ENTRY_READY) {
 			dw_fprintf(fd, "%4d 0x%lx: %9u: %2u: %1u %s;\n",
 					   count, entry->insn, atomic_load(&entry->hit_count), entry->insn_length,
 					   entry->strategy, entry->disasm_insn);
