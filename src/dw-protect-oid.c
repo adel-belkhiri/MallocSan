@@ -1,5 +1,4 @@
 #include <malloc.h>
-#include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
 
@@ -28,7 +27,7 @@ struct object_id {
 	_Atomic(void *) base_addr;
 	_Atomic size_t size;
 
-	_Atomic (void*) alloc_ip;
+	void *alloc_ip;
 };
 
 /*
@@ -43,9 +42,67 @@ struct object_id {
  * 0x0001–0x7FFF, i.e., up to 2^15 - 1 = 32767 distinct tainted IDs.
  */
 static const unsigned oids_size = 32767;
-static unsigned oids_head = 0;
+/* Packed free-list head: lower 16 bits = head index, upper bits = ABA counter. */
+static _Atomic uint64_t oids_head = 0;
 static struct object_id oids[32767];
-static pthread_mutex_t oids_lock = PTHREAD_MUTEX_INITIALIZER;
+
+#define OIDS_HEAD_IDX_MASK UINT64_C(0xFFFF)
+
+static inline unsigned oids_head_get_idx(uint64_t head)
+{
+	return (unsigned)(head & OIDS_HEAD_IDX_MASK);
+}
+
+static inline uint64_t oids_head_get_counter(uint64_t head)
+{
+	return head >> 16;
+}
+
+static inline uint64_t oids_head_pack(unsigned idx, uint64_t counter)
+{
+	return (counter << 16) | ((uint64_t)idx & OIDS_HEAD_IDX_MASK);
+}
+
+static inline unsigned dw_oid_alloc(void)
+{
+	uint64_t head = atomic_load_explicit(&oids_head, memory_order_acquire);
+
+	while (1) {
+		unsigned idx = oids_head_get_idx(head);
+		if (idx == 0)
+			return 0;
+		if (idx >= oids_size) {
+			DW_LOG(ERROR, PROTECT, "OID free list corrupted (head=%u)\n", idx);
+			return 0;
+		}
+
+		unsigned next = (unsigned)atomic_load_explicit(&oids[idx].size, memory_order_relaxed);
+		if (next >= oids_size) {
+			DW_LOG(ERROR, PROTECT, "OID free list corrupted (next=%u)\n", next);
+			return 0;
+		}
+
+		uint64_t desired = oids_head_pack(next, oids_head_get_counter(head) + 1);
+		if (atomic_compare_exchange_weak_explicit(&oids_head,
+				&head, desired,
+				memory_order_acq_rel, memory_order_acquire))
+			return idx;
+	}
+}
+
+static inline void dw_oid_free(unsigned oid)
+{
+	uint64_t head = atomic_load_explicit(&oids_head, memory_order_acquire);
+
+	while (1) {
+		atomic_store_explicit(&oids[oid].size, (size_t)oids_head_get_idx(head), memory_order_relaxed);
+		uint64_t desired = oids_head_pack(oid, oids_head_get_counter(head) + 1);
+		if (atomic_compare_exchange_weak_explicit(&oids_head,
+				&head, desired,
+				memory_order_release, memory_order_acquire))
+			return;
+	}
+}
 
 /* Start without protecting objects, wait until libdw is fully initialized. */
 __thread bool dw_protect_active = false;
@@ -53,12 +110,12 @@ __thread bool dw_protect_active = false;
 void dw_protect_init()
 {
 	for (int i = 0; i < oids_size; i++) {
-		oids[i].base_addr = NULL;
+		atomic_store_explicit(&oids[i].base_addr, NULL, memory_order_relaxed);
+		atomic_store_explicit(&oids[i].size, (size_t)i + 1, memory_order_relaxed);
 		oids[i].alloc_ip = NULL;
-		oids[i].size = i + 1;
 	}
-	oids_head = 1;
-	oids[oids_size - 1].size = 0;
+	atomic_store_explicit(&oids[oids_size - 1].size, 0, memory_order_relaxed);
+	atomic_store_explicit(&oids_head, oids_head_pack(1, 0), memory_order_release);
 }
 
 bool dw_check_access(const void *ptr, size_t size)
@@ -76,21 +133,27 @@ bool dw_check_access(const void *ptr, size_t size)
 	if (oid == 0)
 		return true;
 
-	if (oid >= oids_size || oids[oid].base_addr == NULL) {
+	if (oid >= oids_size)
+		goto invalid;
+
+	void *base_addr = atomic_load_explicit(&oids[oid].base_addr, memory_order_acquire);
+	if (base_addr == NULL) {
+invalid:
 		DW_LOG(WARNING, PROTECT,
 			   "Invalid taint value %u for %p\n", oid, ptr);
 		return false;
 	}
 
-	uintptr_t base = (uintptr_t)oids[oid].base_addr;
-	size_t sz = oids[oid].size;
+	uintptr_t base = (uintptr_t)base_addr;
+	size_t sz = atomic_load_explicit(&oids[oid].size, memory_order_relaxed);
 
 	/* Check [real_addr, real_addr + size) ⊆ [base, base + sz). */
 	if (size > sz || real_addr < base || real_addr > base + sz - size) {
 		// Get the symbol of the function where the object was allocated
 		uint64_t offset = 0;
 		char proc_name[256];
-		dw_lookup_symbol((uintptr_t)oids[oid].alloc_ip, proc_name, sizeof(proc_name), &offset);
+		void *alloc_ip = oids[oid].alloc_ip;
+		dw_lookup_symbol((uintptr_t)alloc_ip, proc_name, sizeof(proc_name), &offset);
 
 		uintptr_t alloc_end  = base + sz;
 		uintptr_t access_end = real_addr + size;
@@ -139,11 +202,15 @@ size_t dw_get_size(void *ptr)
 	if (oid == 0)
 		return malloc_usable_size(ptr);
 
-	if (oid > oids_size - 1 || oids[oid].base_addr == 0) {
+	if (oid > oids_size - 1)
+		goto invalid;
+
+	if (atomic_load_explicit(&oids[oid].base_addr, memory_order_acquire) == NULL) {
+invalid:
 		DW_LOG(WARNING, PROTECT, "Invalid taint value %u for %p\n", oid, ptr);
 		return 0;
 	}
-	return oids[oid].size;
+	return atomic_load_explicit(&oids[oid].size, memory_order_relaxed);
 }
 
 void* dw_get_base_addr(void *ptr)
@@ -153,11 +220,16 @@ void* dw_get_base_addr(void *ptr)
 	if (oid == 0)
 		return 0;
 
-	if (oid > oids_size - 1 || oids[oid].base_addr == 0) {
+	if (oid > oids_size - 1)
+		goto invalid;
+
+	void *base_addr = atomic_load_explicit(&oids[oid].base_addr, memory_order_acquire);
+	if (base_addr == NULL) {
+invalid:
 		DW_LOG(WARNING, PROTECT, "Invalid taint value %u for %p\n", oid, ptr);
 		return 0;
 	}
-	return oids[oid].base_addr;
+	return base_addr;
 }
 
 /*
@@ -165,22 +237,15 @@ void* dw_get_base_addr(void *ptr)
  */
 static void *dw_protect(void *ptr, size_t size, void* caller)
 {
-	pthread_mutex_lock(&oids_lock);
-	if (oids_head == 0) {
-		DW_LOG(ERROR, PROTECT, "OID table full, cannot taint pointer %p\n", ptr);
-		pthread_mutex_unlock(&oids_lock);
+	unsigned oid = dw_oid_alloc();
+	if (oid == 0) {
+		DW_LOG(WARNING, PROTECT, "OID table exhausted, cannot taint pointer %p\n", ptr);
 		return ptr;
 	}
 
-	unsigned oid       = oids_head;
-	unsigned next_head = oids[oids_head].size;
-
-	oids[oids_head].base_addr = ptr;
-	oids[oids_head].size = size;
-	oids[oids_head].alloc_ip = caller;
-	oids_head = next_head;
-
-	pthread_mutex_unlock(&oids_lock);
+	oids[oid].alloc_ip = caller;
+	atomic_store_explicit(&oids[oid].size, size, memory_order_relaxed);
+	atomic_store_explicit(&oids[oid].base_addr, ptr, memory_order_release);
 
 	uintptr_t p   = (uintptr_t)ptr & ~taint_mask;       // clear tag field
 	uintptr_t tag = (uintptr_t)oid << 48;
@@ -208,7 +273,7 @@ inline void *dw_reprotect(const void *ptr, const void *old_ptr)
 	// Decode tag
 	uintptr_t oid = taint_bits >> 48;
 
-	if (oid >= oids_size || oids[oid].base_addr == 0) {
+	if (oid >= oids_size || atomic_load_explicit(&oids[oid].base_addr, memory_order_acquire) == NULL) {
 		DW_LOG(ERROR, PROTECT, "Invalid taint bits %p from old pointer %p\n", (void *)taint_bits, old_ptr);
 		return (void *)ptr;
 	}
@@ -265,15 +330,12 @@ void dw_free_protect(void *ptr)
 {
 	unsigned oid = (uintptr_t) ptr >> 48;
 	if (oid != 0) {
-		pthread_mutex_lock(&oids_lock);
-		if (oid > oids_size - 1 || oids[oid].base_addr == 0)
+		if ((oid > oids_size - 1) ||
+			(atomic_exchange_explicit(&oids[oid].base_addr, NULL, memory_order_acq_rel) == NULL)) {
 			DW_LOG(WARNING, PROTECT, "Invalid taint value %u for %p\n", oid, ptr);
-		else {
-			oids[oid].size = oids_head;
-			oids[oid].base_addr = NULL;
-			oids_head = oid;
+		} else {
+			dw_oid_free(oid);
 		}
-		pthread_mutex_unlock(&oids_lock);
 	}
 	__libc_free(dw_unprotect(ptr));
 }
