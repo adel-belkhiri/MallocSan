@@ -57,6 +57,8 @@ struct memory_arg {
 	int64_t displacement;
 	unsigned access;
 	int base, index;
+	const struct reg_entry *base_re;
+	const struct reg_entry *index_re;
 
 	/* If the same register as the base or index is also a register argument, base_access or
 	 * index_access will be non zero and set to CS_AC_READ / CS_AC_WRITE. In that case, some care

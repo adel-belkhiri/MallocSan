@@ -223,14 +223,15 @@ static inline void dw_release_rt_slot(int idx)
  */
 static bool dw_reg_written(struct insn_entry *entry, unsigned reg)
 {
-	struct reg_entry *re = dw_get_reg_entry(reg);
+	const struct reg_entry *re = dw_get_reg_entry(reg);
 	if (!re)
 		return false;
 
 	int canon_index = re->canonical_index;
-	for (int i = 0; i < entry->gregs_write_count; i++)
+	for (int i = 0; i < entry->gregs_write_count; i++) {
 		if (dw_get_reg_entry(entry->gregs_written[i])->canonical_index == canon_index)
 			return true;
+	}
 
 	return false;
 }
@@ -259,7 +260,7 @@ static inline bool is_reg_zeroing(const cs_insn *insn)
 
 static inline bool reg_check_access(uint32_t reg, const uint16_t *regs, uint8_t count)
 {
-	struct reg_entry *re = dw_get_reg_entry(reg);
+	const struct reg_entry *re = dw_get_reg_entry(reg);
 	if (!re)
 		return false;
 
@@ -274,7 +275,7 @@ static inline bool reg_check_access(uint32_t reg, const uint16_t *regs, uint8_t 
 
 static inline void reg_set_add(uint16_t *list, uint8_t *count, size_t cap, uint16_t reg)
 {
-	struct reg_entry *re = dw_get_reg_entry(reg);
+	const struct reg_entry *re = dw_get_reg_entry(reg);
 	if (!re || *count >= cap)
 		return;
 
@@ -666,7 +667,7 @@ static bool
 fill_memory_operand(struct memory_arg* m, struct memory_arg_runtime* m_rt, const cs_x86_op *op, const csh handle,
 				    const cs_insn *insn, const cs_x86 *x86, const ucontext_t *uctx)
 {
-	struct reg_entry *re;
+	const struct reg_entry *re;
 	unsigned base, index;
 	uintptr_t addr, index_addr, base_addr = 0;
 	int scale;
@@ -680,10 +681,12 @@ fill_memory_operand(struct memory_arg* m, struct memory_arg_runtime* m_rt, const
 
 	m->base = base = op->mem.base;
 	m->index = index = op->mem.index;
+	m->base_re = (base != X86_REG_INVALID) ? dw_get_reg_entry(base) : NULL;
+	m->index_re = (index != X86_REG_INVALID) ? dw_get_reg_entry(index) : NULL;
 
 	// Handle the base register
-	re = dw_get_reg_entry(base);
-	if (re && base != X86_REG_INVALID) {
+	re = m->base_re;
+	if (re) {
 		if (!reg_is_gpr(base))
 			DW_LOG(ERROR, DISASSEMBLY, "Base register %s not a General-Purpose Register\n", re->name);
 
@@ -704,9 +707,9 @@ fill_memory_operand(struct memory_arg* m, struct memory_arg_runtime* m_rt, const
 	}
 
 	// Handle the index register according to SIB/VSIB access modes
-	re = dw_get_reg_entry(index);
+	re = m->index_re;
 	if (reg_is_gpr(index)) {
-		m_rt->index_addr = index_addr = dw_get_register(uctx, re->ucontext_index);
+		m_rt->index_addr = index_addr = re ? dw_get_register(uctx, re->ucontext_index) : 0;
 		if (dw_is_protected((void *) index_addr)) {
 			m_rt->index_taint = index_addr;
 			register_is_protected = true;
@@ -728,9 +731,9 @@ fill_memory_operand(struct memory_arg* m, struct memory_arg_runtime* m_rt, const
 		uint8_t index_width = m->index_width = vsib_index_width(insn->id);
 		if (index_width != MIN_VSIB_INDEX_WIDTH && index_width != MAX_VSIB_INDEX_WIDTH)
 			DW_LOG(ERROR, DISASSEMBLY, "Invalid width (%d) for the indices within the %s register\n",
-				   m->index_width, dw_get_reg_entry(index)->name);
+				   m->index_width, re->name);
 
-		m->indices_count = re->size / index_width;
+		m->indices_count = (re && index_width) ? (re->size / index_width) : 0;
 
 		// This is just a heuristic: we consider the index tainted if its width is equal to 8 bytes
 		if (index_width == MAX_VSIB_INDEX_WIDTH) {
@@ -751,11 +754,11 @@ static void assign_base_index_access(struct insn_entry *entry)
 {
 	for (unsigned i = 0; i < entry->nb_arg_m; i++) {
 		struct memory_arg *arg_m = &entry->arg_m[i];
-		struct reg_entry *base_re  = dw_get_reg_entry(arg_m->base);
-		struct reg_entry *index_re = dw_get_reg_entry(arg_m->index);
+		const struct reg_entry *base_re  = arg_m->base_re;
+		const struct reg_entry *index_re = arg_m->index_re;
 
 		for (unsigned j = 0; j < entry->nb_arg_r; j++) {
-			struct reg_entry *re_arg_r = dw_get_reg_entry(entry->arg_r[j].reg);
+			const struct reg_entry *re_arg_r = dw_get_reg_entry(entry->arg_r[j].reg);
 
 			if (base_re && re_arg_r && (base_re->canonical_index == re_arg_r->canonical_index)) {
 				arg_m->base_access = entry->arg_r[j].access;
@@ -793,7 +796,7 @@ static unsigned
 fill_instruction_operands(struct insn_entry *entry, struct insn_entry_runtime* entry_rt, const csh handle, const cs_insn *insn,
 						  const cs_x86 *x86, const ucontext_t *uctx)
 {
-	struct reg_entry *re;
+	const struct reg_entry *re;
 	unsigned arg_m = 0, arg_r = 0, nb_protected = 0;
 
 	// Loop over all the instruction arguments
@@ -1012,12 +1015,12 @@ static bool dw_populate_instruction_entry(instruction_table *table, struct insn_
 		if (dw_reg_written(entry, entry->arg_m[i].base) && !(entry->arg_m[i].base_access & CS_AC_WRITE) &&
 			!dw_reg_si_di(entry, entry->arg_m[i].base))
 			DW_LOG(WARNING, DISASSEMBLY, "Instruction 0x%llx, base register %s implicitly modified\n",
-				   entry->insn, dw_get_reg_entry(entry->arg_m[i].base)->name);
+				   entry->insn, (entry->arg_m[i].base_re)->name);
 
 		if (dw_reg_written(entry, entry->arg_m[i].index) && !(entry->arg_m[i].index_access & CS_AC_WRITE) &&
 			!dw_reg_si_di(entry, entry->arg_m[i].index))
 			DW_LOG(WARNING, DISASSEMBLY, "Instruction 0x%llx, index register %s implicitly modified\n",
-				   entry->insn, dw_get_reg_entry(entry->arg_m[i].index)->name);
+				   entry->insn, (entry->arg_m[i].index_re)->name);
 	}
 
  	// If all tainted registers are overwritten by the instruction, there is no point in installing a post handler
@@ -1384,9 +1387,11 @@ static void check_vsib_access(struct memory_arg *mem, struct memory_arg_runtime 
 {
 	uint8_t width, count;
 	uint8_t index_buffer[64] = {0}; /* ZMM registers are 64 bytes */
-	size_t bytes_count, index_size, mask_size = 0;
+	size_t bytes_count, index_size;
 	unsigned index = mem->index;
 	const int mask_reg = mem->mask;
+	const struct reg_entry *index_re = mem->index_re;
+	const struct reg_entry *mask_re = dw_get_reg_entry(mask_reg);
 
 	width = mem->index_width;
 	count = mem->indices_count;
@@ -1401,7 +1406,7 @@ static void check_vsib_access(struct memory_arg *mem, struct memory_arg_runtime 
 		return;
 	}
 
-	index_size = dw_get_reg_entry(index)->size;
+	index_size = index_re ? index_re->size : 0;
 
 	if (index_size > sizeof(index_buffer) || index_size != count * width)
 		DW_LOG(WARNING, DISASSEMBLY, "Unexpected index register size %zu (width %u, lanes %u) for mem arg %u\n",
@@ -1414,8 +1419,8 @@ static void check_vsib_access(struct memory_arg *mem, struct memory_arg_runtime 
 	bytes_count = decode_extended_states(index, xsave_ptr, index_buffer);
 	if (bytes_count != index_size)
 		DW_LOG(ERROR, DISASSEMBLY,
-			"Failed to decode index register %s (decoded %zu / expected %zu)\n",
-			dw_get_reg_entry(index)->name, bytes_count, index_size);
+			   "Failed to decode index register %s (decoded %zu / expected %zu)\n",
+			   index_re->name, bytes_count, index_size);
 
 	/* Save the original indices as they might be tainted. */
 	__builtin_memcpy(mem_rt->indices, index_buffer, bytes_count);
@@ -1429,27 +1434,25 @@ static void check_vsib_access(struct memory_arg *mem, struct memory_arg_runtime 
 	if (mask_reg == X86_REG_INVALID || mask_reg == X86_REG_K0) {
 		mem_rt->mask_bv = ~0ULL; /* all lanes enabled */
 	} else if (reg_is_avx512_opmask(mask_reg)) {
-		mask_size = dw_get_reg_entry(mask_reg)->size;
 		bytes_count = decode_extended_states(mask_reg, xsave_ptr,
 						     (uint8_t *)&mem_rt->mask_bv);
 
-		if (bytes_count != mask_size)
+		if (bytes_count != mask_re->size)
 			DW_LOG(ERROR, DISASSEMBLY, "Failed to decode mask register %s (decoded %zu / expected %zu)\n",
-				dw_get_reg_entry(mask_reg)->name, bytes_count, mask_size);
+				mask_re->name, bytes_count, mask_re->size);
 	} else if (reg_is_sse(mask_reg) || reg_is_avx2(mask_reg)) {
 		uint8_t mask_buffer[32] = {0};
 
-		mask_size = dw_get_reg_entry(mask_reg)->size;
 		bytes_count = decode_extended_states(mask_reg, xsave_ptr, mask_buffer);
-		if (bytes_count != mask_size)
+		if (bytes_count != mask_re->size)
 			DW_LOG(ERROR, DISASSEMBLY,
 				"Failed to decode mask register %s (decoded %zu / expected %zu)\n",
-				dw_get_reg_entry(mask_reg)->name, bytes_count, mask_size);
+				mask_re->name, bytes_count, mask_re->size);
 
 		decode_avx_mask(mask_buffer, count, width * 8, &mem_rt->mask_bv);
 	} else {
 		DW_LOG(ERROR, DISASSEMBLY, "Invalid mask register %s for mem arg %u\n",
-			dw_get_reg_entry(mask_reg)->name, idx);
+			mask_re ? mask_re->name : "<unknown>", idx);
 	}
 
 	for (int i = 0; i < count; i++) {
@@ -1483,8 +1486,8 @@ static void check_vsib_access(struct memory_arg *mem, struct memory_arg_runtime 
 		bytes_count = save_extended_states(index, xsave_ptr, index_buffer);
 		if (bytes_count != index_size)
 			DW_LOG(ERROR, DISASSEMBLY,
-				    "Failed to save indices to register %s (encoded %zu / expected %zu)\n",
-				    dw_get_reg_entry(index)->name, bytes_count, index_size);
+				   "Failed to save indices to register %s (encoded %zu / expected %zu)\n",
+				   index_re->name, bytes_count, index_size);
 	}
 }
 
@@ -1493,7 +1496,6 @@ static void check_sib_access(struct memory_arg *mem, struct memory_arg_runtime* 
 					uintptr_t valueb, unsigned idx, bool repeat,
 					struct patch_exec_context *ctx)
 {
-	struct reg_entry *re;
 	bool index_is_protected, base_is_protected;
 	uintptr_t valuei = 0, valuei_clean = 0, addr;
 	unsigned regi = mem->index;
@@ -1506,7 +1508,7 @@ static void check_sib_access(struct memory_arg *mem, struct memory_arg_runtime* 
 	index_is_protected = false;
 	base_is_protected = dw_is_protected((void *) valueb);
 
-	re = dw_get_reg_entry(regi);
+	const struct reg_entry *re = mem->index_re;
 	if (re != NULL && regi != X86_REG_INVALID) {
 		valuei = dw_get_register(ctx, re->libpatch_index);
 		mem_rt->index_addr = valuei_clean = valuei;
@@ -1575,7 +1577,6 @@ static void check_sib_access(struct memory_arg *mem, struct memory_arg_runtime* 
 void dw_unprotect_context(struct patch_exec_context *ctx)
 {
 	struct insn_entry *entry = ctx->user_data;
-	struct reg_entry *reb;
 	struct memory_arg *mem;
 	struct memory_arg_runtime *mem_rt;
 	unsigned regb;
@@ -1611,7 +1612,7 @@ void dw_unprotect_context(struct patch_exec_context *ctx)
 		regb = mem->base;
 		valueb = 0;
 		if (regb != X86_REG_INVALID) {
-			reb = dw_get_reg_entry(regb);
+			const struct reg_entry *reb = mem->base_re;
 			valueb = dw_get_register(ctx, reb->libpatch_index);
 			mem_rt->base_addr = valueb;
 
@@ -1648,7 +1649,6 @@ void dw_unprotect_context(struct patch_exec_context *ctx)
 }
 
 static void check_updated_regs (struct insn_entry *entry, struct insn_entry_runtime *entry_rt, struct patch_exec_context *ctx) {
-	struct reg_entry *re;
 	struct memory_arg *mem;
 	struct memory_arg_runtime *mem_rt;
 	bool should_check[dw_nb_saved_registers];
@@ -1663,11 +1663,11 @@ static void check_updated_regs (struct insn_entry *entry, struct insn_entry_runt
 			mem_rt = &(entry_rt->arg_m[i]);
 
 			if (mem_rt->base_taint) {
-				re = dw_get_reg_entry(mem->base);
-				if (re) {
+				const struct reg_entry *reb = mem->base_re;
+				if (reb) {
 					for (size_t j = 0; j < dw_nb_saved_registers; j++) {
-						struct reg_entry *saved_re = dw_get_reg_entry(dw_saved_registers[j]);
-						if (saved_re->canonical_index == re->canonical_index) {
+						const struct reg_entry *saved_re = dw_get_reg_entry(dw_saved_registers[j]);
+						if (saved_re->canonical_index == reb->canonical_index) {
 							should_check[j] = true;
 							break;
 						}
@@ -1675,11 +1675,11 @@ static void check_updated_regs (struct insn_entry *entry, struct insn_entry_runt
 				}
 			}
 
-			re = dw_get_reg_entry(mem->index);
-			if (re && re->canonical_index != X86_REG_INVALID && mem_rt->index_taint) {
+			const struct reg_entry *rei = mem->index_re;
+			if (rei && rei->canonical_index != X86_REG_INVALID && mem_rt->index_taint) {
 				for (size_t j = 0; j < dw_nb_saved_registers; j++) {
-					struct reg_entry *saved_re = dw_get_reg_entry(dw_saved_registers[j]);
-					if (saved_re->canonical_index == re->canonical_index) {
+					const struct reg_entry *saved_re = dw_get_reg_entry(dw_saved_registers[j]);
+					if (saved_re->canonical_index == rei->canonical_index) {
 						should_check[j] = true;
 						break;
 					}
@@ -1693,7 +1693,7 @@ static void check_updated_regs (struct insn_entry *entry, struct insn_entry_runt
 			continue;
 
 		unsigned reg = dw_saved_registers[i];
-		re = dw_get_reg_entry(reg);
+		const struct reg_entry *re = dw_get_reg_entry(reg);
 		if (!re || re->libpatch_index < 0)
 			continue;
 
@@ -1716,7 +1716,7 @@ void dw_reprotect_context(struct patch_exec_context *ctx)
 	struct insn_entry *entry = ctx->user_data;
 	struct memory_arg *mem;
 	struct memory_arg_runtime *mem_rt;
-	struct reg_entry *re;
+	const struct reg_entry *re;
 	unsigned reg;
 	int slot_idx;
 
@@ -1744,20 +1744,21 @@ void dw_reprotect_context(struct patch_exec_context *ctx)
 		 */
 		if (mem_rt->base_taint && ((mem->base_access & CS_AC_WRITE) == 0)) {
 			reg = mem->base;
-			re = dw_get_reg_entry(reg);
+			re = mem->base_re;
 			const void* valueb_new = (const void*) dw_get_register(ctx, re->libpatch_index);
 			dw_set_register(ctx, re->libpatch_index, (uint64_t) dw_reprotect(valueb_new, (void *) mem_rt->base_taint));
 		}
 
 		// Handle the VSIB case
 		if (mem->index != X86_REG_INVALID && reg_is_avx(mem->index)) {
+			re = mem->index_re;
 			if (mem_rt->index_is_tainted) {
 				reg = mem->index;
 				size_t saved_bytes = save_extended_states(reg, ctx->extended_states, mem_rt->indices);
 				if (saved_bytes != (mem->indices_count * mem->index_width))
 					DW_LOG(ERROR, DISASSEMBLY,
-						"Failed to save the indices from register %s into the XSAVE area!\n",
-						dw_get_reg_entry(reg)->name);
+						   "Failed to save the indices from register %s into the XSAVE area!\n",
+						   re->name);
 				// Reset this flag as it will be set again in the pre-handler
 				mem_rt->index_is_tainted = false;
 			}
@@ -1767,7 +1768,8 @@ void dw_reprotect_context(struct patch_exec_context *ctx)
 		// Handle the SIB case
 		if (mem_rt->index_taint && ((mem->index_access & CS_AC_WRITE) == 0)) {
 			reg = mem->index;
-			re = dw_get_reg_entry(reg);
+			re = mem->index_re;
+
 			const void* valuei_new = (const void*) dw_get_register(ctx, re->libpatch_index);
 			dw_set_register(ctx, re->libpatch_index,
 					(uint64_t) dw_reprotect((void *) valuei_new, (void *) mem_rt->index_taint));
