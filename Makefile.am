@@ -28,32 +28,29 @@ CLEANFILES = \
   $(OLX_PC)
 
 .PHONY: install-third-party uninstall-third-party
+.PHONY: submodules
 
 all-local: libpatch.stamp
 
 # --- submodules fetchers (makeable prerequisites) ---
 
-$(LIBOLX_CONFIGURE):
+submodules:
 	@set -e; \
-	if test -d "$(LIBOLX_SRC_DIR)" && { test -d "$(LIBOLX_SRC_DIR)/.git" || test -f "$(LIBOLX_SRC_DIR)/.git"; }; then \
-	  echo "Submodule present: external/libolx"; \
+	if test -f "$(LIBOLX_CONFIGURE)" && test -f "$(LIBPATCH_CONFIGURE)"; then \
+	  echo "Submodules present: external/libolx external/libpatch"; \
 	else \
-	  echo "Initializing submodule for external/libolx"; \
+	  echo "Initializing submodules: external/libolx and external/libpatch"; \
 	  test -n "$(GIT)" || { echo "git not available"; exit 1; }; \
-	  $(GIT) -C "$(abs_top_srcdir)" submodule update --init --recursive external/libolx; \
+	  $(GIT) -C "$(abs_top_srcdir)" submodule update --init --recursive external/libolx external/libpatch; \
 	fi; \
-	test -f "$@" || { echo "libolx: missing configure after fetch"; exit 1; }
+	test -f "$(LIBOLX_CONFIGURE)" || { echo "libolx: missing configure after fetch"; exit 1; }; \
+	test -f "$(LIBPATCH_CONFIGURE)" || { echo "libpatch: missing configure after fetch"; exit 1; }
 
-$(LIBPATCH_CONFIGURE):
-	@set -e; \
-	if test -d "$(LIBPATCH_SRC_DIR)" && { test -d "$(LIBPATCH_SRC_DIR)/.git" || test -f "$(LIBPATCH_SRC_DIR)/.git"; }; then \
-	  echo "Submodule present: external/libpatch"; \
-	else \
-	  echo "Initializing submodule for external/libpatch"; \
-	  test -n "$(GIT)" || { echo "git not available"; exit 1; }; \
-	  $(GIT) -C "$(abs_top_srcdir)" submodule update --init --recursive external/libpatch; \
-	fi; \
-	test -f "$@" || { echo "libpatch: missing configure after fetch"; exit 1; }
+$(LIBOLX_CONFIGURE): submodules
+	@:
+
+$(LIBPATCH_CONFIGURE): submodules
+	@:
 
 # --- libolx build ---
 
