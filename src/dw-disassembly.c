@@ -1268,6 +1268,39 @@ static void patch_entry(struct insn_entry *entry, struct post_safe_site_rb *safe
 	entry->strategy = do_patch(entry, false);
 }
 
+static inline void dw_unprotect_entry_regs_ucontext(const struct insn_entry *e, ucontext_t *uctx)
+{
+	for (unsigned i = 0; i < e->nb_arg_m; i++) {
+		uintptr_t valueb = 0, valuei = 0;
+		bool tainted = false;
+		const struct memory_arg *mem = &(e->arg_m[i]);
+		const struct reg_entry *re_base = mem->base_re;
+		if (re_base && re_base->ucontext_index >= 0) {
+			valueb = dw_get_register(uctx, re_base->ucontext_index);
+			if (dw_is_protected((void *)valueb)) {
+				tainted = true;
+				dw_set_register(uctx, re_base->ucontext_index,
+						(uintptr_t)dw_unprotect((void *)valueb));
+			}
+		}
+
+		const struct reg_entry *re_index = mem->index_re;
+		if (re_index && re_index->ucontext_index >= 0) {
+			valuei = dw_get_register(uctx, re_index->ucontext_index);
+			if (dw_is_protected((void *)valuei)) {
+				tainted = true;
+				dw_set_register(uctx, re_index->ucontext_index,
+						(uintptr_t)dw_unprotect((void *)valuei));
+			}
+		}
+
+		if (tainted) {
+			uintptr_t addr = valueb + valuei * mem->scale + mem->displacement;
+			dw_check_access((void *) addr, mem->length);
+		}
+	}
+}
+
 /*
  * Create a new entry for this instruction address
  */
@@ -1281,6 +1314,9 @@ struct insn_entry *dw_create_instruction_entry(instruction_table *table,
 	size_t cursor = start;
 
 	*created_out = false;
+
+	static const uintptr_t library_start = 0x700000000000ULL;
+	const bool patch_disabled = (fault >= library_start);
 
 	while (1) {
 		struct insn_entry *e = &table->entries[cursor];
@@ -1303,12 +1339,23 @@ struct insn_entry *dw_create_instruction_entry(instruction_table *table,
 					return NULL;
 				}
 
-				patch_entry(e, &safe_sites);
+				//TODO: Temporary workaround until libpatch supports overlapping patches
+				e->patch_disabled = patch_disabled;
+				e->strategy = DW_PATCH_UNKNOWN;
 
-				DW_LOG(DEBUG, MAIN,
-					   "Patch summary for 0x%llx: Post-handler: %s, Deferred: %s, Strategy: %s\n",
-					   e->insn, e->post_handler ? "Yes" : "No", e->deferred_post_handler ? "Yes" : "No",
-					   strategy_name(e->strategy));
+				if (e->patch_disabled) {
+					dw_unprotect_entry_regs_ucontext(e, uctx);
+					DW_LOG(WARNING, DISASSEMBLY,
+						   "Instruction 0x%llx is within a library/OLX area, patching is disabled\n",
+						   (unsigned long long)fault);
+				} else {
+					patch_entry(e, &safe_sites);
+
+					DW_LOG(DEBUG, MAIN,
+						   "Patch summary for 0x%llx: Post-handler: %s, Deferred: %s, Strategy: %s\n",
+						   e->insn, e->post_handler ? "Yes" : "No", e->deferred_post_handler ? "Yes" : "No",
+						   strategy_name(e->strategy));
+				}
 
 				atomic_store_explicit(&e->state, ENTRY_READY, memory_order_release);
 				*created_out = true;
@@ -1324,13 +1371,19 @@ struct insn_entry *dw_create_instruction_entry(instruction_table *table,
 				entry_state = atomic_load_explicit(&e->state, memory_order_acquire);
 			} while (entry_state == ENTRY_INITIALIZING);
 
-			if (e->insn == fault)
+			if (e->insn == fault) {
+				if (entry_state == ENTRY_READY && e->patch_disabled)
+					dw_unprotect_entry_regs_ucontext(e, uctx);
 				return (entry_state == ENTRY_READY) ? e : NULL;
+			}
 		}
 		else if (entry_state == ENTRY_READY)
 		{
-			if (e->insn == fault)
+			if (e->insn == fault) {
+				if (e->patch_disabled)
+					dw_unprotect_entry_regs_ucontext(e, uctx);
 				return e;
+			}
 		}
 		else if (entry_state == ENTRY_FAILED) {
 			if (e->insn == fault)

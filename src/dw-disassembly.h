@@ -154,6 +154,7 @@ struct insn_entry {
 	bool repeat;
 	bool post_handler;
 	bool deferred_post_handler;
+	bool patch_disabled;
 	bool has_vsib;
 	uintptr_t insn;
 	uintptr_t next_insn;
