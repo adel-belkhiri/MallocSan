@@ -101,7 +101,8 @@ void __dw_log_internal(enum dw_log_level level, enum dw_log_category_name topic,
 	dw_log_v(level, topic, fmt, args);
 	va_end(args);
 
-	dw_backtrace(2, bt_kind);
+	if (level <= dw_log_categories[topic].backtrace_level)
+		dw_backtrace(2, bt_kind);
 
 	// If the log level is "ERROR", this is fatal and the program exits
 	if (level == ERROR)
