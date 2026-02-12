@@ -163,10 +163,10 @@ struct insn_entry {
 	char disasm_insn[64];
 	unsigned strategy;
 	unsigned insn_length;
-	unsigned gregs_read_count;
-	unsigned gregs_write_count;
-	unsigned gregs_read[MAX_MOD_REG]; // test
-	unsigned gregs_written[MAX_MOD_REG]; // test
+	uint8_t gregs_read_count;
+	uint8_t gregs_write_count;
+	uint16_t gregs_read[MAX_MOD_REG]; // test
+	uint16_t gregs_written[MAX_MOD_REG]; // test
 };
 
 /* For now the instruction table cannot be expanded after initialization */

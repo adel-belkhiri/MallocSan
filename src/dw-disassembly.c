@@ -293,6 +293,62 @@ static inline void reg_set_add(uint16_t *list, uint8_t *count, size_t cap, uint1
 	(*count)++;
 }
 
+static inline bool reg_is_overwritten(uint32_t reg, uint8_t op_access, const uint16_t *regs_written,
+								   uint8_t write_count)
+{
+	if (reg == X86_REG_INVALID)
+		return false;
+
+	bool written = (op_access & CS_AC_WRITE) || reg_check_access(reg, regs_written, write_count);
+	if (!written)
+		return false;
+
+	bool data_read = (op_access & CS_AC_READ) != 0;
+	return !data_read;
+}
+
+static inline bool base_index_overwritten(const cs_insn *insn,
+										  const struct insn_entry *entry,
+										  const struct insn_entry_runtime *entry_rt,
+										  unsigned idx)
+{
+	const struct memory_arg *m = &entry->arg_m[idx];
+	const struct memory_arg_runtime *m_rt = &entry_rt->arg_m[idx];
+	bool is_vsib = reg_is_avx(m->index);
+
+	bool base_overwritten = true;
+	bool index_overwritten = true;
+
+	bool is_xadd_xchg = insn && (insn->id == X86_INS_XCHG || insn->id == X86_INS_XADD);
+
+	// Base
+	if (m_rt->base_taint && m->base != X86_REG_INVALID) {
+		base_overwritten = false;
+		if (is_xadd_xchg && (m->base_access & CS_AC_WRITE))
+			base_overwritten = true; // override (xadd/xchg overwrite reg operand)
+		else
+			base_overwritten = reg_is_overwritten(m->base, m->base_access, entry->gregs_written,
+											   entry->gregs_write_count);
+	}
+
+	// Index
+	if (m->index != X86_REG_INVALID) {
+		bool idx_tainted = (!is_vsib && m_rt->index_taint) ||
+						   (is_vsib && m_rt->index_is_tainted);
+
+		if (idx_tainted) {
+			index_overwritten = false;
+			if (is_xadd_xchg && (m->index_access & CS_AC_WRITE))
+				index_overwritten = true;
+			else
+				index_overwritten = reg_is_overwritten(m->index, m->index_access, entry->gregs_written,
+												   entry->gregs_write_count);
+		}
+	}
+
+	return base_overwritten && index_overwritten;
+}
+
 static inline uint8_t vsib_index_width(x86_insn id)
 {
 	switch (id)
@@ -783,8 +839,8 @@ static void assign_base_index_access(struct insn_entry *entry)
 	}
 }
 
-static inline unsigned int get_avx512_mask_register(unsigned int gregs_reads[],
-													    unsigned int gregs_read_count) {
+static inline unsigned int get_avx512_mask_register(uint16_t gregs_reads[],
+												   uint8_t gregs_read_count) {
 	for (int i = 0; i < gregs_read_count; i++) {
 			if (gregs_reads[i] >= X86_REG_K0 && gregs_reads[i] <= X86_REG_K7)
 				return (gregs_reads[i]);
@@ -954,15 +1010,15 @@ static bool dw_populate_instruction_entry(instruction_table *table, struct insn_
 		DW_LOG(ERROR, DISASSEMBLY, "More registers written %d than expected %d\n",
 			   write_count, MAX_MOD_REG);
 
-	entry->gregs_read_count = read_count;
-	entry->gregs_write_count = write_count;
+	entry->gregs_read_count = min(read_count, MAX_MOD_REG);
+	entry->gregs_write_count = min(write_count, MAX_MOD_REG);
 
-	for (int i = 0; i < min(read_count, MAX_MOD_REG); i++) {
+	for (int i = 0; i < entry->gregs_read_count; i++) {
 		reg = entry->gregs_read[i] = regs_read[i];
 		DW_LOG(DEBUG, DISASSEMBLY, "read: %s; (%d)\n", cs_reg_name(cs->handle, reg), reg);
 	}
 
-	for (int i = 0; i < min(write_count, MAX_MOD_REG); i++) {
+	for (int i = 0; i < entry->gregs_write_count; i++) {
 		reg = entry->gregs_written[i] = regs_write[i];
 		DW_LOG(DEBUG, DISASSEMBLY, "write: %s; (%d)\n", cs_reg_name(cs->handle, reg), reg);
 	}
@@ -983,27 +1039,16 @@ static bool dw_populate_instruction_entry(instruction_table *table, struct insn_
 	bool need_immediate_reprotection = false;
 	bool all_tainted_overwritten = true;
 	for (int i = 0; i < entry->nb_arg_m; i++) {
-		bool is_vsib = reg_is_avx(entry->arg_m[i].index);
-		bool base_overwritten = (entry->arg_m[i].base_access & CS_AC_WRITE) ||
-				dw_reg_written(entry, entry->arg_m[i].base);
-		bool index_overwritten = (entry->arg_m[i].index_access & CS_AC_WRITE) ||
-				dw_reg_written(entry, entry->arg_m[i].index);
+		if (!base_index_overwritten(cs->insn, entry, &entry_rt, i)) {
+			// If the base or index register is not fully overwritten and corresponds to
+			// a register argument, it must be immediately re-tainted.
+			bool is_vsib = reg_is_avx(entry->arg_m[i].index);
+			if ((entry->arg_m[i].base_access && entry_rt.arg_m[i].base_taint) ||
+				(!is_vsib && entry->arg_m[i].index_access && entry_rt.arg_m[i].index_taint) ||
+				(is_vsib && entry->arg_m[i].index_access && entry_rt.arg_m[i].index_is_tainted)) {
+				need_immediate_reprotection = true;
+			}
 
-		// If the base or index registers is also a register argument, we need
-		// to retaint it immediatly, unless it is overwritten by the instruction.
-		if ((entry->arg_m[i].base_access && entry_rt.arg_m[i].base_taint) ||
-			(!is_vsib && entry->arg_m[i].index_access && entry_rt.arg_m[i].index_taint) ||
-			(is_vsib && entry->arg_m[i].index_access && entry_rt.arg_m[i].index_is_tainted)) {
-			need_immediate_reprotection = true;
-		}
-
-		// Is there a tainted register that is not overwritten?
-		if ((entry_rt.arg_m[i].base_taint && !base_overwritten &&
-				(!(entry->arg_m[i].base_access) || (entry->arg_m[i].base_access & CS_AC_READ))) ||
-			(!is_vsib && entry_rt.arg_m[i].index_taint && !index_overwritten &&
-				(!(entry->arg_m[i].index_access) || (entry->arg_m[i].index_access & CS_AC_READ))) ||
-			(is_vsib && entry_rt.arg_m[i].index_is_tainted && !index_overwritten &&
-				(!(entry->arg_m[i].index_access) || (entry->arg_m[i].index_access & CS_AC_READ)))) {
 			all_tainted_overwritten = false;
 		}
 
@@ -1023,12 +1068,13 @@ static bool dw_populate_instruction_entry(instruction_table *table, struct insn_
 				   entry->insn, (entry->arg_m[i].index_re)->name);
 	}
 
- 	// If all tainted registers are overwritten by the instruction, there is no point in installing a post handler
+	// If all tainted registers are overwritten by the instruction, there is no point in installing a post handler
 	if (all_tainted_overwritten) {
+		entry->post_handler = false;
+
 		DW_LOG(DEBUG, DISASSEMBLY,
 			   "Disabling post-handler at 0x%llx (%s %s) because all tainted registers were overwritten.\n",
 			   entry->insn, cs->insn->mnemonic, cs->insn->op_str);
-		entry->post_handler = false;
 	}
 
 	// Instructions with repeat prefix need immediate reprotection
