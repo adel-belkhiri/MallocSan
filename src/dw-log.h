@@ -8,7 +8,7 @@
 
 enum dw_log_level {ERROR=0, WARNING, INFO, DEBUG, TRACE};
 
-enum dw_log_category_name {PROTECT=0, DISASSEMBLY, MAIN, WRAP};
+enum dw_log_category_name {PROTECT=0, DISASSEMBLY, MAIN, PATCH, WRAP};
 
 struct app_backtrace_seed {
 	int valid;

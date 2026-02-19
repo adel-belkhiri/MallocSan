@@ -12,6 +12,7 @@
 #include <capstone/capstone.h>
 
 #include "dw-disassembly.h"
+#include "dw-patch.h"
 #include "dw-log.h"
 #include "dw-protect.h"
 #include "dw-registers.h"
@@ -73,18 +74,6 @@ static inline struct capstone_context *capstone_get_context(void)
 	}
 	return &cs_ctx;
 }
-
-struct post_safe_site {
-	uintptr_t addr;
-	unsigned skipped_same_access;
-};
-
-struct post_safe_site_rb {
-	struct post_safe_site entries[MAX_SAFE_SITE_COUNT];
-	unsigned head;
-	unsigned count;
-};
-
 
 static inline void add_post_safe_site(struct post_safe_site_rb *rb, uintptr_t addr, uint16_t size, unsigned skipped_same_access)
 {
@@ -1107,213 +1096,6 @@ static bool dw_populate_instruction_entry(instruction_table *table, struct insn_
 	return true;
 }
 
-/*
- * Handler executed before and after instructions that possibly access tainted
- * pointers when an instruction is "patched" to insert pre and post probes.
- */
-static void patch_handler(struct patch_exec_context *ctx, uint8_t post)
-{
-	struct insn_entry *entry = ctx->user_data;
-	if (post || ctx->program_counter != entry->insn) {
-		//DW_LOG(WARNING, MAIN, "REprotect @ 0x%lx\n", ctx->program_counter);
-		dw_reprotect_context(ctx);
-	} else {
-		// DW_LOG(WARNING, MAIN, "UNprotect @ 0x%lx\n", ctx->program_counter);
-		dw_unprotect_context(ctx);
-	}
-}
-
-static void check_patch(patch_status s, char *msg)
-{
-	if (s == PATCH_OK)
-		return;
-
-	struct patch_error e;
-	patch_last_error(&e);
-	DW_LOG(DEBUG, DISASSEMBLY,
-		   "Patch lib return value not OK, %d, for %s, origin %s, irritant %s, message %s\n",
-		   s, msg, e.origin, e.irritant, e.message);
-}
-
-void dw_patch_init()
-{
-	const struct patch_option options[] = {
-			{
-				.type       = PATCH_OPT_ENABLE_WXE,
-				.enable_wxe = 0
-			}
-	};
-
-	(void) patch_init(options, sizeof(options) / sizeof(struct patch_option));
-}
-
-/*
- * Patch the instruction accessing a protected object and attach a pre and post
- * handler to unprotect and reprotect the tainted registers.
- *
- * With PATCH_EXEC_MODEL_AROUND_STEP_TRAP or PATCH_EXEC_MODEL_AROUND_STEP, the
- * SIGSEGV handler will not get called, the patch handler (pre and post) will be
- * called instead. It will be called either through the target instruction
- * patched by a trap (int3), intercepted by libpatch with their own handler, or
- * through the target instruction patched by a jump.
- *
- * Eventually, to avoid the cost of saving a lot of registers and making a call,
- * we may use PATCH_EXEC_MODEL_DIVERT to jump to an OLX buffer that untaints,
- * executes the relocated instruction, and retaints in assembly directly.
- *
- * We save all the relevant registers in a static structure to check if some
- * registers are unexpectedly modified by the stepped instruction. This
- * structure should be Thread Local Storage for multi-threaded programs.
- * Once the algorithm is well tested and debugged, this saving and comparison
- * step will be removed.
- */
-static bool dw_instruction_entry_patch_strategy(struct insn_entry *entry,
-				   enum dw_strategies strategy,
-				   bool deferred)
-{
-	struct patch_location location = {
-			.type      = PATCH_LOCATION_ADDRESS,
-			.direction = PATCH_LOCATION_FORWARD,
-			.algorithm = PATCH_LOCATION_FIRST,
-			.address   = entry->insn,
-	};
-
-	struct patch_exec_model exec_model = {
-			.type                    = PATCH_EXEC_MODEL_PROBE,
-			.probe.read_registers    = 0,
-			.probe.write_registers   = 0,
-			.probe.clobber_registers = (1ULL << PATCH_ARCH_GREGS_COUNT) - 1,
-			.probe.user_data         = entry,
-			.probe.procedure         = patch_handler,
-	};
-
-	patch_t patch;
-	patch_attr attr;
-	patch_status s;
-
-	if (entry->has_vsib)
-		exec_model.probe.clobber_registers = PATCH_REGS_ALL;
-
-	if (entry->post_handler && !entry->deferred_post_handler)
-		exec_model.type = PATCH_EXEC_MODEL_PROBE_AROUND;
-
-	if (deferred) {
-		location.address = entry->next_insn;
-		if (!entry->deferred_post_handler)
-			DW_LOG(ERROR, DISASSEMBLY,
-				   "Instruction 0x%llx must be associated with a deferred post handler at this point!\n",
-				   entry->insn);
-	}
-
-	s = patch_attr_init(&attr, sizeof(attr));
-	check_patch(s, "attr init");
-
-	if (strategy == DW_PATCH_TRAP) {
-		s = patch_attr_set_trap_policy(&attr, PATCH_TRAP_POLICY_FORCE);
-		check_patch(s, "set policy FORCE");
-	} else if (strategy == DW_PATCH_JUMP) {
-		s = patch_attr_set_trap_policy(&attr, PATCH_TRAP_POLICY_FORBID);
-		check_patch(s, "set policy FORBID");
-	} else {
-		DW_LOG(ERROR, DISASSEMBLY, "Unknown patching strategy\n");
-	}
-
-	s = patch_attr_set_initial_state(&attr, PATCH_ENABLED);
-	check_patch(s, "set enabled");
-
-	s = patch_make(&location, &exec_model, &attr, &patch, NULL);
-	check_patch(s, "make");
-	if (s != PATCH_OK)
-		return false;
-
-	s = patch_commit();
-	check_patch(s, "commit");
-	if (s != PATCH_OK)
-		return false;
-
-	return true;
-}
-
-/*
- * This function patches an instruction and returns the strategy that finally worked,
- * or exit on failure.
- */
-static enum dw_strategies do_patch(struct insn_entry *entry, bool deferred)
-{
-	const char *patch_type = deferred ? "deferred" : "initial";
-	uintptr_t patch_addr = deferred ? entry->next_insn : entry->insn;
-	enum dw_strategies strategy = DW_PATCH_UNKNOWN;
-
-	if (dw_instruction_entry_patch_strategy(entry, DW_PATCH_JUMP, deferred))
-		strategy = DW_PATCH_JUMP;
-	else if (dw_instruction_entry_patch_strategy(entry, DW_PATCH_TRAP, deferred))
-		strategy = DW_PATCH_TRAP;
-	else
-		DW_LOG(ERROR, MAIN, "Patching %s location 0x%llx failed (origin 0x%llx).\n",
-			   patch_type, patch_addr, entry->insn);
-
-	DW_LOG(DEBUG, MAIN, "Successfully patched %s site 0x%llx with %s strategy.\n",
-		   patch_type, patch_addr, strategy_name(strategy));
-
-	return strategy;
-}
-
-/*
- * Try to patch one of the deferred safe sites with JUMP strategy.
- * Return true on success, false otherwise.
- */
-static bool patch_deferred_site(struct insn_entry *entry, struct post_safe_site_rb *safe_sites)
-{
-	for (int i = (int)safe_sites->count - 1; i >= 0; i--) {
-		unsigned idx = (safe_sites->head + i) % MAX_SAFE_SITE_COUNT;
-
-		entry->next_insn = safe_sites->entries[idx].addr;
-		if (dw_instruction_entry_patch_strategy(entry, DW_PATCH_JUMP, true)) {
-			DW_LOG(DEBUG, MAIN, "Successfully patched deferred site 0x%llx with %s strategy.\n",
-				   entry->next_insn, strategy_name(DW_PATCH_JUMP));
-			return true;
-		}
-
-		DW_LOG(DEBUG, MAIN,
-			   "Deferred JUMP patch failed at 0x%llx (origin 0x%llx), trying next candidate.\n",
-			   entry->next_insn, entry->insn);
-	}
-
-	return false;
-}
-
-/*
- * Patches the instruction with a tainted register. If the post-handler
- * is deferred, we also patch the deferred site. We always try JUMP first, and
- * fall back to TRAP only when there is no jump-based patch solution.
- */
-static void patch_entry(struct insn_entry *entry, struct post_safe_site_rb *safe_sites)
-{
-
-	if (!entry->post_handler || !entry->deferred_post_handler) {
-		entry->strategy = do_patch(entry, false);
-		return;
-	}
-
-	/*
-	 * Either we can patch one of the deferred sites with JUMP, or we cancel deferring
-	 * and patch the initial site (with JUMP->TRAP fallback).
-	 */
-	if (patch_deferred_site(entry, safe_sites)) {
-		enum dw_strategies initial_strategy = do_patch(entry, false);
-
-		entry->strategy = (initial_strategy != DW_PATCH_JUMP) ? DW_PATCH_MIXED : initial_strategy;
-		return;
-	}
-
-	DW_LOG(DEBUG, MAIN,
-		   "Deferred JUMP patch failed for all candidates (origin 0x%llx), canceling deferring.\n",
-		   (unsigned long long)entry->insn);
-
-	entry->deferred_post_handler = false;
-	entry->strategy = do_patch(entry, false);
-}
-
 static inline void dw_unprotect_entry_regs_ucontext(const struct insn_entry *e, ucontext_t *uctx)
 {
 	for (unsigned i = 0; i < e->nb_arg_m; i++) {
@@ -1350,16 +1132,19 @@ static inline void dw_unprotect_entry_regs_ucontext(const struct insn_entry *e, 
 /*
  * Create a new entry for this instruction address
  */
-struct insn_entry *dw_create_instruction_entry(instruction_table *table,
-					   uintptr_t fault,
-					   ucontext_t *uctx,
-					   bool *created_out)
+struct insn_entry *dw_create_instruction_entry(instruction_table *table, uintptr_t fault,
+											   ucontext_t *uctx, bool *created_out,
+											   struct post_safe_site_rb *safe_sites_out)
 {
 	size_t mask   = table->size - 1;
 	size_t start  = hash_addr(fault) & mask;
 	size_t cursor = start;
 
 	*created_out = false;
+	if (safe_sites_out) {
+		safe_sites_out->head = 0;
+		safe_sites_out->count = 0;
+	}
 
 	static const uintptr_t library_start = 0x700000000000ULL;
 	const bool patch_disabled = (fault >= library_start);
@@ -1394,16 +1179,18 @@ struct insn_entry *dw_create_instruction_entry(instruction_table *table,
 					DW_LOG(WARNING, DISASSEMBLY,
 						   "Instruction 0x%llx is within a library/OLX area, patching is disabled\n",
 						   (unsigned long long)fault);
+					atomic_store_explicit(&e->state, ENTRY_READY, memory_order_release);
+				} else if (safe_sites_out) {
+					*safe_sites_out = safe_sites;
 				} else {
-					patch_entry(e, &safe_sites);
-
-					DW_LOG(DEBUG, MAIN,
-						   "Patch summary for 0x%llx: Post-handler: %s, Deferred: %s, Strategy: %s\n",
-						   e->insn, e->post_handler ? "Yes" : "No", e->deferred_post_handler ? "Yes" : "No",
-						   strategy_name(e->strategy));
+					atomic_store_explicit(&e->state, ENTRY_FAILED, memory_order_release);
+					DW_LOG(WARNING, MAIN,
+						   "Cannot create patch request for instruction 0x%llx: safe_sites_out is "
+						   "NULL\n",
+						   (unsigned long long)fault);
+					return NULL;
 				}
 
-				atomic_store_explicit(&e->state, ENTRY_READY, memory_order_release);
 				*created_out = true;
 				return e;
 			}

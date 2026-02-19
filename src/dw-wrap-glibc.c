@@ -29,6 +29,7 @@
 #include <time.h>
 
 #include "dw-log.h"
+#include "dw-patch.h"
 #include "dw-printf.h"
 #include "dw-protect.h"
 #include "dw-wrap-glibc.h"
@@ -875,6 +876,8 @@ int pthread_create(pthread_t *t, const pthread_attr_t *attr, void *(*fn)(void *)
 	int rc = libc_pthread_create(nthread, nattr, pthread_start_trampoline, s);
 	if (rc != 0)
 		free(s);
+	else
+		dw_patch_worker_start();
 	sout();
 	return rc;
 }

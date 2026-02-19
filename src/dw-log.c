@@ -18,12 +18,11 @@ struct dw_log_category {
 	int backtrace_level;
 };
 
-struct dw_log_category dw_log_categories[] = {
-	{"protect", 1, ERROR, 1},
-	{"disassembly", 1, ERROR, 1},
-	{"main", 1, ERROR, 1},
-	{"wrap", 1, ERROR, 1}
-};
+struct dw_log_category dw_log_categories[] = {{"protect", 1, ERROR, 1},
+											  {"disassembly", 1, ERROR, 1},
+											  {"main", 1, ERROR, 1},
+											  {"wrap", 1, ERROR, 1},
+											  {"patch", 1, ERROR, 1}};
 
 inline unsigned string_copy(char *dest, char *src, size_t n)
 {
