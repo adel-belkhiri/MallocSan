@@ -12,8 +12,10 @@
 #include <sys/user.h>
 #include <ucontext.h>
 
+#include "dw-cpuid.h"
 #include "dw-disassembly.h"
 #include "dw-log.h"
+#include "dw-patch.h"
 #include "dw-protect.h"
 #include "dw-wrap-glibc.h"
 
@@ -38,6 +40,177 @@ static size_t nb_insn_olx_entries = 30000;
 enum dw_strategies dw_strategy = DW_PATCH_JUMP;
 
 static instruction_table *insn_table;
+
+struct patch_trampoline_context {
+	struct insn_entry *entry;
+	struct post_safe_site_rb safe_sites;
+	uintptr_t fault_rip;
+};
+
+static __thread struct patch_trampoline_context patch_tramp_ctx;
+
+/* XSAVE support for preserving AVX/AVX-512 state across trampoline calls. */
+static int dw_xsave_enabled = 0;
+static uint64_t dw_xsave_size = 0;
+static uint64_t dw_xsave_mask = 0;
+
+static inline uint64_t dw_xgetbv(uint32_t index)
+{
+	uint32_t eax, edx;
+	__asm__ volatile(".byte 0x0f, 0x01, 0xd0" : "=a"(eax), "=d"(edx) : "c"(index));
+	return ((uint64_t)edx << 32) | eax;
+}
+
+static void dw_init_xsave_state(void)
+{
+	unsigned int eax, ebx, ecx, edx;
+
+	dw_xsave_enabled = 0;
+	dw_xsave_size = 0;
+	dw_xsave_mask = 0;
+
+	if (!dw_cpuid_has_leaf(1))
+		return;
+	dw_cpuid(1, 0, &eax, &ebx, &ecx, &edx);
+
+	if ((ecx & ((1u << 26) | (1u << 27))) != ((1u << 26) | (1u << 27)))
+		return;
+
+	if (!dw_cpuid_has_leaf(0xD))
+		return;
+	dw_cpuid(0xD, 0, &eax, &ebx, &ecx, &edx);
+
+	uint64_t supported = ((uint64_t)edx << 32) | eax;
+	uint64_t xcr0 = dw_xgetbv(0);
+	uint64_t mask = xcr0 & supported;
+
+	if (mask == 0 || ebx < 512 + 64)
+		return;
+
+	dw_xsave_mask = mask;
+	dw_xsave_size = ebx;
+	dw_xsave_enabled = 1;
+}
+
+static __attribute__((noinline, used)) uintptr_t dw_patch_trampoline_call(void)
+{
+	struct insn_entry *entry = patch_tramp_ctx.entry;
+	uintptr_t fault_rip = patch_tramp_ctx.fault_rip;
+	bool save_active = dw_protect_active;
+
+	dw_protect_active = false;
+
+	if (entry) {
+		int patch_rc = dw_patch_entry(entry, &patch_tramp_ctx.safe_sites);
+		if (patch_rc == 0) {
+			atomic_store_explicit(&entry->state, ENTRY_READY, memory_order_release);
+			DW_LOG(DEBUG, MAIN,
+				   "Patch summary for 0x%llx: Post-handler: %s, Deferred: %s, Strategy: %s\n",
+				   entry->insn, entry->post_handler ? "Yes" : "No",
+				   entry->deferred_post_handler ? "Yes" : "No", strategy_name(entry->strategy));
+		} else {
+			atomic_store_explicit(&entry->state, ENTRY_FAILED, memory_order_release);
+			DW_LOG(WARNING, MAIN, "Failed to patch instruction 0x%llx (rc=%d)\n", entry->insn,
+				   patch_rc);
+		}
+	}
+
+	patch_tramp_ctx.entry = NULL;
+	dw_protect_active = save_active;
+	return fault_rip;
+}
+
+/*
+ * Signal trampoline:
+ * 1) Preserve faulting thread registers and flags.
+ * 2) Call the regular patching path (queue/worker or synchronous fallback).
+ * 3) Jump back to the original faulting RIP.
+ */
+__attribute__((naked, used)) static void dw_patch_trampoline(void)
+{
+	__asm__ volatile(
+		/* Avoid clobbering the SysV red zone of the faulting frame */
+		"subq $128, %%rsp\n\t"
+		"subq $8, %%rsp\n\t"
+		/* Save flags/GPRs */
+		"pushfq\n\t"
+		"pushq %%rax\n\t"
+		"pushq %%rbx\n\t"
+		"pushq %%rcx\n\t"
+		"pushq %%rdx\n\t"
+		"pushq %%rsi\n\t"
+		"pushq %%rdi\n\t"
+		"pushq %%rbp\n\t"
+		"pushq %%r8\n\t"
+		"pushq %%r9\n\t"
+		"pushq %%r10\n\t"
+		"pushq %%r11\n\t"
+		"pushq %%r12\n\t"
+		"pushq %%r13\n\t"
+		"pushq %%r14\n\t"
+		"pushq %%r15\n\t"
+		/* Keep a pointer to the saved frame. */
+		"movq %%rsp, %%r12\n\t"
+		/* Choose XSAVE when enabled, otherwise use FXSAVE. */
+		"cmpl $0, %0\n\t"
+		"je fxsave_path\n\t"
+		/* Save/restore full XSAVE state (AVX/AVX-512). */
+		"subq %1, %%rsp\n\t"
+		"andq $-64, %%rsp\n\t"
+		"lea 512(%%rsp), %%rdi\n\t"
+		"cld\n\t"
+		"xorl %%eax, %%eax\n\t"
+		"movl $8, %%ecx\n\t"
+		"rep stosq\n\t"
+		"movq %2, %%rax\n\t"
+		"movq %%rax, %%rdx\n\t"
+		"shr $32, %%rdx\n\t"
+		"xsave64 (%%rsp)\n\t"
+		/* Call our trampoline */
+		"callq dw_patch_trampoline_call\n\t"
+		"movq %%rax, %%r11\n\t"
+		"movq %2, %%rax\n\t"
+		"movq %%rax, %%rdx\n\t"
+		"shr $32, %%rdx\n\t"
+		"xrstor64 (%%rsp)\n\t"
+		"jmp restore_path\n\t"
+		"fxsave_path:\n\t"
+		/* Save/restore x87+SSE state to keep the injected call transparent. */
+		"subq $528, %%rsp\n\t"
+		"andq $-16, %%rsp\n\t"
+		"fxsave64 (%%rsp)\n\t"
+		/* Call our trampoline */
+		"callq dw_patch_trampoline_call\n\t"
+		"movq %%rax, %%r11\n\t"
+		"fxrstor64 (%%rsp)\n\t"
+		"restore_path:\n\t"
+		/* Restore GPRs/flags and resume at the saved RIP.*/
+		"movq %%r12, %%rsp\n\t"
+		"movq %%r11, 128(%%rsp)\n\t"
+		"popq %%r15\n\t"
+		"popq %%r14\n\t"
+		"popq %%r13\n\t"
+		"popq %%r12\n\t"
+		"popq %%r11\n\t"
+		"popq %%r10\n\t"
+		"popq %%r9\n\t"
+		"popq %%r8\n\t"
+		"popq %%rbp\n\t"
+		"popq %%rdi\n\t"
+		"popq %%rsi\n\t"
+		"popq %%rdx\n\t"
+		"popq %%rcx\n\t"
+		"popq %%rbx\n\t"
+		"popq %%rax\n\t"
+		"popfq\n\t"
+		"addq $8, %%rsp\n\t"
+		"addq $128, %%rsp\n\t"
+		/* Jump back to faulting RIP */
+		"jmp *-136(%%rsp)\n\t"
+		:
+		: "m"(dw_xsave_enabled), "m"(dw_xsave_size), "m"(dw_xsave_mask)
+		: "memory");
+}
 
 /*
  * Forward a signal to any previously installed handler.
@@ -88,6 +261,7 @@ void signal_protected(int sig, siginfo_t *info, void *context)
 	bt_signal_seed = context;
 
 	struct insn_entry *entry;
+	struct post_safe_site_rb safe_sites = {.head = 0, .count = 0};
 
 	/*
 	 * We should not have any tainted pointer access while in the handler.
@@ -108,13 +282,12 @@ void signal_protected(int sig, siginfo_t *info, void *context)
 	uintptr_t fault_insn = uctx->uc_mcontext.gregs[REG_RIP];
 
 	/*
-	 * On the first fault at this address, we patch the instruction and create an entry for it in
-	 * the instruction table and. After the entry is created, this SIGSEGV handler should no longer be
-	 * invoked for that instruction. However, if multiple threads hit the same instruction concurrently
-	 * before the entry reaches ENTRY_READY, they can all be in this handler.
+	 * On the first fault at this address, we create the instruction entry in
+	 * this handler, then redirect execution to a trampoline that performs
+	 * patching in regular thread context.
 	 */
 	bool created_out;
-	entry = dw_create_instruction_entry(insn_table, fault_insn, uctx, &created_out);
+	entry = dw_create_instruction_entry(insn_table, fault_insn, uctx, &created_out, &safe_sites);
 	if (entry == NULL) {
 		// The faulting instruction does not have any tainted pointers as operands. Therefore, we
 		// forward the signal to the previously saved handler (if there is any).
@@ -132,9 +305,16 @@ void signal_protected(int sig, siginfo_t *info, void *context)
 		return;
 	}
 	if (created_out)
-		DW_LOG(DEBUG, MAIN, "Thread %u has created a new entry for instruction 0x%llx\n", gettid(), entry->insn);
+		DW_LOG(DEBUG, MAIN, "Thread %u has created a new entry for instruction 0x%llx\n", gettid(),
+			   entry->insn);
 
-	// We return and it will trap again, but this time libpatch will call the patch_handler
+	if (created_out && !entry->patch_disabled) {
+		patch_tramp_ctx.entry = entry;
+		patch_tramp_ctx.safe_sites = safe_sites;
+		patch_tramp_ctx.fault_rip = fault_insn;
+		uctx->uc_mcontext.gregs[REG_RIP] = (greg_t)(uintptr_t)dw_patch_trampoline;
+	}
+
 	dw_protect_active = save_active;
 	bt_signal_seed = NULL;
 }
@@ -231,15 +411,15 @@ dw_init()
 	// Initialise the different modules
 	insn_table = dw_init_instruction_table(nb_insn_olx_entries);
 	dw_protect_init();
-	dw_patch_init();
-	DW_LOG(DEBUG, MAIN, "Patch init\n");
+	dw_init_xsave_state();
+	dw_patch_runtime_init();
+	DW_LOG(DEBUG, PATCH, "Patch init\n");
 
 	/*
 	 * Insert the SIGSEGV signal handler to catch protected pointers. We use
 	 * an alternate stack to allow the handler to save tainted registers on
 	 * the application stack.
 	 */
-
 	stack_t ss;
 	size_t ss_size = 16 * PAGE_SIZE;
 	int ret;
@@ -288,6 +468,8 @@ extern void __attribute__((destructor)) dw_fini()
 	// If there could be remaining tainted pointers, do not free the table
 	// dw_fini_instruction_table(insn_table);
 	// dw_patch_fini();
+
+	dw_patch_worker_stop();
 }
 
 /*

@@ -33,6 +33,7 @@ enum entry_state {ENTRY_EMPTY = 0, ENTRY_INITIALIZING /* one thread is creating 
  * the future, especially when multiple architectures will be supported.
  */
 struct insn_table;
+struct post_safe_site_rb;
 
 typedef struct insn_table instruction_table;
 
@@ -184,10 +185,8 @@ struct insn_entry *dw_get_instruction_entry(
 struct insn_entry *dw_create_instruction_entry(instruction_table *table,
 		uintptr_t fault,
 		ucontext_t *uctx,
-		bool *created_out);
-
-/* Initialize libpatch */
-void dw_patch_init();
+		bool *created_out,
+		struct post_safe_site_rb *safe_sites_out);
 
 /* A potentially tainted pointer is accessed, unprotect it before the access */
 void dw_unprotect_context(struct patch_exec_context *ctx);
