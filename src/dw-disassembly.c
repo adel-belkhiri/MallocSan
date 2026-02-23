@@ -487,11 +487,16 @@ static uintptr_t dw_defer_post_handler(struct insn_entry *entry,
 		size_t func_bytes_left = (size_t)(func_end - start_addr);
 		buff_size = func_bytes_left < max_bytes ? func_bytes_left : max_bytes;
 	} else {
-		// Fallback if libunwind can't provide bounds
-		buff_size = max_bytes;
-		DW_LOG(WARNING, DISASSEMBLY,
-		   "Cannot get function bounds for address 0x%llx, using max scan size %lu\n",
-		   start_addr, buff_size);
+		// Return if libunwind can't provide bounds
+		DW_LOG(
+			WARNING, DISASSEMBLY,
+			"Cannot get function bounds for address 0x%llx, so we cancel post-handler deferring\n",
+			start_addr);
+		if (scanned_count)
+			scanned_count = 0;
+		if (similar_access_count)
+			similar_access_count = 0;
+		return 0;
 	}
 
 	/* Identify which registers from the original instructions are tainted */
@@ -1074,7 +1079,7 @@ static bool dw_populate_instruction_entry(instruction_table *table, struct insn_
 	 * Scan forward from the faulting instruction to determine whether the post-handler can be
 	 * safely skipped or installed at a later instruction.
 	 */
-	if (entry->post_handler && !need_immediate_reprotection) {
+	if (entry->post_handler && !need_immediate_reprotection && !entry->patch_disabled) {
 		unsigned int insn_scan_count, similar_access_count;
 		uintptr_t last_safe_addr;
 
