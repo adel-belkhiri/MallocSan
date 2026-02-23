@@ -1101,39 +1101,6 @@ static bool dw_populate_instruction_entry(instruction_table *table, struct insn_
 	return true;
 }
 
-static inline void dw_unprotect_entry_regs_ucontext(const struct insn_entry *e, ucontext_t *uctx)
-{
-	for (unsigned i = 0; i < e->nb_arg_m; i++) {
-		uintptr_t valueb = 0, valuei = 0;
-		bool tainted = false;
-		const struct memory_arg *mem = &(e->arg_m[i]);
-		const struct reg_entry *re_base = mem->base_re;
-		if (re_base && re_base->ucontext_index >= 0) {
-			valueb = dw_get_register(uctx, re_base->ucontext_index);
-			if (dw_is_protected((void *)valueb)) {
-				tainted = true;
-				dw_set_register(uctx, re_base->ucontext_index,
-						(uintptr_t)dw_unprotect((void *)valueb));
-			}
-		}
-
-		const struct reg_entry *re_index = mem->index_re;
-		if (re_index && re_index->ucontext_index >= 0) {
-			valuei = dw_get_register(uctx, re_index->ucontext_index);
-			if (dw_is_protected((void *)valuei)) {
-				tainted = true;
-				dw_set_register(uctx, re_index->ucontext_index,
-						(uintptr_t)dw_unprotect((void *)valuei));
-			}
-		}
-
-		if (tainted) {
-			uintptr_t addr = valueb + valuei * mem->scale + mem->displacement;
-			dw_check_access((void *) addr, mem->length);
-		}
-	}
-}
-
 /*
  * Create a new entry for this instruction address
  */
@@ -1141,8 +1108,19 @@ struct insn_entry *dw_create_instruction_entry(instruction_table *table, uintptr
 											   ucontext_t *uctx, bool *created_out,
 											   struct post_safe_site_rb *safe_sites_out)
 {
-	size_t mask   = table->size - 1;
-	size_t start  = hash_addr(fault) & mask;
+	// TODO: Temporary workaround until libpatch supports overlapping patches
+	static const uintptr_t library_start = 0x700000000000ULL;
+	const bool patch_disabled = (fault >= library_start);
+
+	if (!patch_disabled && safe_sites_out == NULL) {
+		DW_LOG(WARNING, MAIN,
+			   "Cannot create patch request for instruction 0x%llx: safe_sites_out is NULL\n",
+			   (unsigned long long)fault);
+		return NULL;
+	}
+
+	size_t mask = table->size - 1;
+	size_t start = hash_addr(fault) & mask;
 	size_t cursor = start;
 
 	*created_out = false;
@@ -1150,9 +1128,6 @@ struct insn_entry *dw_create_instruction_entry(instruction_table *table, uintptr
 		safe_sites_out->head = 0;
 		safe_sites_out->count = 0;
 	}
-
-	static const uintptr_t library_start = 0x700000000000ULL;
-	const bool patch_disabled = (fault >= library_start);
 
 	while (1) {
 		struct insn_entry *e = &table->entries[cursor];
@@ -1162,11 +1137,12 @@ struct insn_entry *dw_create_instruction_entry(instruction_table *table, uintptr
 			int expected = ENTRY_EMPTY;
 			/* Try to become the creator for this entry slot */
 			if (atomic_compare_exchange_strong_explicit(&e->state, &expected, ENTRY_INITIALIZING,
-				    memory_order_acq_rel, memory_order_relaxed)) {
+														memory_order_acq_rel,
+														memory_order_relaxed)) {
+				struct post_safe_site_rb safe_sites = {.head = 0, .count = 0};
 
-				struct post_safe_site_rb safe_sites;
-				safe_sites.head = 0;
-				safe_sites.count = 0;
+				e->patch_disabled = patch_disabled;
+				e->strategy = DW_PATCH_UNKNOWN;
 
 				bool ok = dw_populate_instruction_entry(table, e, fault, uctx, &safe_sites);
 				if (!ok) {
@@ -1175,25 +1151,13 @@ struct insn_entry *dw_create_instruction_entry(instruction_table *table, uintptr
 					return NULL;
 				}
 
-				//TODO: Temporary workaround until libpatch supports overlapping patches
-				e->patch_disabled = patch_disabled;
-				e->strategy = DW_PATCH_UNKNOWN;
-
 				if (e->patch_disabled) {
-					dw_unprotect_entry_regs_ucontext(e, uctx);
 					DW_LOG(WARNING, DISASSEMBLY,
 						   "Instruction 0x%llx is within a library/OLX area, patching is disabled\n",
 						   (unsigned long long)fault);
 					atomic_store_explicit(&e->state, ENTRY_READY, memory_order_release);
-				} else if (safe_sites_out) {
-					*safe_sites_out = safe_sites;
 				} else {
-					atomic_store_explicit(&e->state, ENTRY_FAILED, memory_order_release);
-					DW_LOG(WARNING, MAIN,
-						   "Cannot create patch request for instruction 0x%llx: safe_sites_out is "
-						   "NULL\n",
-						   (unsigned long long)fault);
-					return NULL;
+					*safe_sites_out = safe_sites;
 				}
 
 				*created_out = true;
@@ -1209,21 +1173,12 @@ struct insn_entry *dw_create_instruction_entry(instruction_table *table, uintptr
 				entry_state = atomic_load_explicit(&e->state, memory_order_acquire);
 			} while (entry_state == ENTRY_INITIALIZING);
 
-			if (e->insn == fault) {
-				if (entry_state == ENTRY_READY && e->patch_disabled)
-					dw_unprotect_entry_regs_ucontext(e, uctx);
+			if (e->insn == fault)
 				return (entry_state == ENTRY_READY) ? e : NULL;
-			}
-		}
-		else if (entry_state == ENTRY_READY)
-		{
-			if (e->insn == fault) {
-				if (e->patch_disabled)
-					dw_unprotect_entry_regs_ucontext(e, uctx);
+		} else if (entry_state == ENTRY_READY) {
+			if (e->insn == fault)
 				return e;
-			}
-		}
-		else if (entry_state == ENTRY_FAILED) {
+		} else if (entry_state == ENTRY_FAILED) {
 			if (e->insn == fault)
 				return NULL;
 		}

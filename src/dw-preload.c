@@ -12,11 +12,15 @@
 #include <sys/user.h>
 #include <ucontext.h>
 
+#include <capstone/capstone.h> /* CS_AC_* */
+#include <libpatch/tools.h>
+
 #include "dw-cpuid.h"
 #include "dw-disassembly.h"
 #include "dw-log.h"
 #include "dw-patch.h"
 #include "dw-protect.h"
+#include "dw-registers.h"
 #include "dw-wrap-glibc.h"
 
 _Atomic int dw_fully_initialized = 0;
@@ -41,15 +45,195 @@ enum dw_strategies dw_strategy = DW_PATCH_JUMP;
 
 static instruction_table *insn_table;
 
-struct patch_trampoline_context {
-	struct insn_entry *entry;
-	struct post_safe_site_rb safe_sites;
-	uintptr_t fault_rip;
+struct trampoline_gpr_frame {
+	uint64_t r15;
+	uint64_t r14;
+	uint64_t r13;
+	uint64_t r12;
+	uint64_t r11;
+	uint64_t r10;
+	uint64_t r9;
+	uint64_t r8;
+	uint64_t rbp;
+	uint64_t rdi;
+	uint64_t rsi;
+	uint64_t rdx;
+	uint64_t rcx;
+	uint64_t rbx;
+	uint64_t rax;
+	uint64_t rflags;
 };
 
-static __thread struct patch_trampoline_context patch_tramp_ctx;
+struct trampoline_context {
+	uintptr_t fault_rip;
+	void *fault_context;
+	greg_t fault_gregs[NGREG];
+	int sig;
+	bool has_siginfo;
+	siginfo_t siginfo;
+};
 
-/* XSAVE support for preserving AVX/AVX-512 state across trampoline calls. */
+static __thread struct trampoline_context tramp_ctx;
+
+static bool forward_to_saved_handler(int sig, siginfo_t *info, void *uctx);
+
+#define DW_EFLAGS_TF (1ULL << 8)
+#define DW_STEP_MAX_REGS 8
+
+struct step_reg {
+	int ucontext_index;
+	uintptr_t taint;
+	bool should_reprotect;
+};
+
+struct step_state {
+	bool active;
+	uintptr_t fault_rip;
+	bool repeat_insn;
+	size_t nb_regs;
+	struct step_reg regs[DW_STEP_MAX_REGS];
+};
+
+static __thread struct step_state step_state;
+
+static inline void step_state_clear(void)
+{
+	step_state.active = false;
+	step_state.fault_rip = 0;
+	step_state.repeat_insn = false;
+	step_state.nb_regs = 0;
+}
+
+static void step_state_add_reg(int ucontext_index, uintptr_t taint, bool should_reprotect)
+{
+	for (size_t i = 0; i < step_state.nb_regs; i++) {
+		if (step_state.regs[i].ucontext_index != ucontext_index)
+			continue;
+
+		/* If any alias indicates the register is overwritten, skip reprotect. */
+		step_state.regs[i].should_reprotect &= should_reprotect;
+		return;
+	}
+
+	if (step_state.nb_regs >= DW_STEP_MAX_REGS)
+		return;
+
+	step_state.regs[step_state.nb_regs++] = (struct step_reg){
+		.ucontext_index = ucontext_index, .taint = taint, .should_reprotect = should_reprotect};
+}
+
+/*
+ * Prepare single-step processing for a patch-disabled faulting instruction.
+ * We unprotect tainted registers in the signal ucontext, remember their
+ * original tainted values for later reprotection in signal_trap(), and arm TF.
+ */
+static bool prepare_patch_disabled_step(const struct insn_entry *entry, ucontext_t *uctx)
+{
+	step_state_clear();
+	if (!entry || !uctx)
+		return false;
+
+	step_state.fault_rip = entry->insn;
+	step_state.repeat_insn = entry->repeat;
+	size_t repeat_count = 1;
+
+	if (entry->repeat) {
+		const struct reg_entry *rcx_re = dw_get_reg_entry(X86_REG_RCX);
+		if (rcx_re && rcx_re->ucontext_index >= 0)
+			repeat_count = dw_get_register(uctx, rcx_re->ucontext_index);
+	}
+
+	for (unsigned i = 0; i < entry->nb_arg_m; i++) {
+		const struct memory_arg *mem = &entry->arg_m[i];
+		const struct reg_entry *re_base = mem->base_re;
+		const struct reg_entry *re_index = mem->index_re;
+
+		uintptr_t valueb = 0, valuei = 0;
+		bool base_protected = false, index_protected = false;
+
+		if (re_base && re_base->ucontext_index >= 0) {
+			valueb = dw_get_register(uctx, re_base->ucontext_index);
+			base_protected = dw_is_protected((void *)valueb);
+		}
+		if (re_index && re_index->ucontext_index >= 0) {
+			valuei = dw_get_register(uctx, re_index->ucontext_index);
+			index_protected = dw_is_protected((void *)valuei);
+		}
+
+		if (base_protected) {
+			bool reprotect = ((mem->base_access & CS_AC_WRITE) == 0);
+			step_state_add_reg(re_base->ucontext_index, valueb, reprotect);
+			dw_set_register(uctx, re_base->ucontext_index, (uintptr_t)dw_unprotect((void *)valueb));
+		}
+
+		if (index_protected) {
+			bool reprotect = ((mem->index_access & CS_AC_WRITE) == 0);
+			step_state_add_reg(re_index->ucontext_index, valuei, reprotect);
+			dw_set_register(uctx, re_index->ucontext_index,
+							(uintptr_t)dw_unprotect((void *)valuei));
+		}
+
+		if (base_protected || index_protected) {
+			uintptr_t addr = valueb + valuei * mem->scale + mem->displacement;
+			size_t access_size = mem->length;
+
+			if (entry->repeat) {
+				/* RCX==0 means REP does not perform any memory access. */
+				if (repeat_count == 0)
+					continue;
+
+				if (mem->length > ((size_t)-1) / repeat_count)
+					access_size = (size_t)-1;
+				else
+					access_size = mem->length * repeat_count;
+			}
+
+			dw_check_access((void *)addr, access_size);
+		}
+	}
+
+	if (step_state.nb_regs == 0)
+		return false;
+
+	step_state.active = true;
+	uctx->uc_mcontext.gregs[REG_EFL] |= (greg_t)DW_EFLAGS_TF;
+	return true;
+}
+
+static inline void dw_copy_fault_gregs(greg_t dst[NGREG], const greg_t src[NGREG])
+{
+	for (size_t i = 0; i < NGREG; i++)
+		dst[i] = src[i];
+}
+
+static inline void dw_fault_gregs_to_uctx(ucontext_t *uctx, const greg_t gregs[NGREG])
+{
+	for (size_t i = 0; i < NGREG; i++)
+		uctx->uc_mcontext.gregs[i] = gregs[i];
+}
+
+static inline void dw_uctx_to_trampoline_frame(const ucontext_t *uctx,
+											   struct trampoline_gpr_frame *frame)
+{
+	frame->rax = uctx->uc_mcontext.gregs[REG_RAX];
+	frame->rbx = uctx->uc_mcontext.gregs[REG_RBX];
+	frame->rcx = uctx->uc_mcontext.gregs[REG_RCX];
+	frame->rdx = uctx->uc_mcontext.gregs[REG_RDX];
+	frame->rsi = uctx->uc_mcontext.gregs[REG_RSI];
+	frame->rdi = uctx->uc_mcontext.gregs[REG_RDI];
+	frame->rbp = uctx->uc_mcontext.gregs[REG_RBP];
+	frame->r8 = uctx->uc_mcontext.gregs[REG_R8];
+	frame->r9 = uctx->uc_mcontext.gregs[REG_R9];
+	frame->r10 = uctx->uc_mcontext.gregs[REG_R10];
+	frame->r11 = uctx->uc_mcontext.gregs[REG_R11];
+	frame->r12 = uctx->uc_mcontext.gregs[REG_R12];
+	frame->r13 = uctx->uc_mcontext.gregs[REG_R13];
+	frame->r14 = uctx->uc_mcontext.gregs[REG_R14];
+	frame->r15 = uctx->uc_mcontext.gregs[REG_R15];
+	frame->rflags = uctx->uc_mcontext.gregs[REG_EFL];
+}
+
+/* Preserving AVX/AVX-512 state across trampoline calls. */
 static int dw_xsave_enabled = 0;
 static uint64_t dw_xsave_size = 0;
 static uint64_t dw_xsave_mask = 0;
@@ -92,41 +276,86 @@ static void dw_init_xsave_state(void)
 	dw_xsave_enabled = 1;
 }
 
-static __attribute__((noinline, used)) uintptr_t dw_patch_trampoline_call(void)
+__attribute__((noinline, used))
+static uintptr_t handle_seg_fault(struct trampoline_gpr_frame *frame)
 {
-	struct insn_entry *entry = patch_tramp_ctx.entry;
-	uintptr_t fault_rip = patch_tramp_ctx.fault_rip;
+	uintptr_t fault_rip = tramp_ctx.fault_rip;
+	uintptr_t resume_rip = fault_rip;
 	bool save_active = dw_protect_active;
+	bool created_out = false;
+	ucontext_t fault_uctx = {0};
+	struct post_safe_site_rb safe_sites = {.head = 0, .count = 0};
 
 	dw_protect_active = false;
 
+	dw_fault_gregs_to_uctx(&fault_uctx, tramp_ctx.fault_gregs);
+
+	struct insn_entry *entry =
+		dw_create_instruction_entry(insn_table, fault_rip, &fault_uctx, &created_out, &safe_sites);
+
+	if (entry == NULL) {
+		ucontext_t *forward_uctx = (ucontext_t *)tramp_ctx.fault_context;
+		if (!forward_uctx)
+			forward_uctx = &fault_uctx;
+
+		void *saved_bt_seed = bt_signal_seed;
+		bt_signal_seed = forward_uctx;
+		DW_LOG(WARNING, MAIN,
+			   "Segfault on instruction (0x%llx) without protected memory arguments, forwarding to "
+			   "saved handler\n",
+			   fault_rip);
+
+		bool success = forward_to_saved_handler(
+			tramp_ctx.sig, tramp_ctx.has_siginfo ? &tramp_ctx.siginfo : NULL, forward_uctx);
+		if (!success) {
+			DW_LOG(ERROR, MAIN,
+				   "Segfault on instruction (0x%llx) without protected memory arguments, "
+				   "no saved handler\n",
+				   fault_rip);
+		}
+		bt_signal_seed = saved_bt_seed;
+		resume_rip = (uintptr_t)forward_uctx->uc_mcontext.gregs[REG_RIP];
+		dw_uctx_to_trampoline_frame(forward_uctx, frame);
+		goto out;
+	}
+
+	if (created_out)
+		DW_LOG(DEBUG, MAIN, "Thread %u has created a new entry for instruction 0x%llx\n", gettid(),
+			   entry->insn);
+
 	if (entry) {
-		int patch_rc = dw_patch_entry(entry, &patch_tramp_ctx.safe_sites);
-		if (patch_rc == 0) {
-			atomic_store_explicit(&entry->state, ENTRY_READY, memory_order_release);
-			DW_LOG(DEBUG, MAIN,
-				   "Patch summary for 0x%llx: Post-handler: %s, Deferred: %s, Strategy: %s\n",
-				   entry->insn, entry->post_handler ? "Yes" : "No",
-				   entry->deferred_post_handler ? "Yes" : "No", strategy_name(entry->strategy));
-		} else {
-			atomic_store_explicit(&entry->state, ENTRY_FAILED, memory_order_release);
-			DW_LOG(WARNING, MAIN, "Failed to patch instruction 0x%llx (rc=%d)\n", entry->insn,
-				   patch_rc);
+		if (created_out && !entry->patch_disabled) {
+			int patch_rc = dw_patch_entry(entry, &safe_sites);
+			if (patch_rc == 0) {
+				atomic_store_explicit(&entry->state, ENTRY_READY, memory_order_release);
+				DW_LOG(DEBUG, MAIN,
+					   "Patch summary for 0x%llx: Post-handler: %s, Deferred: %s, Strategy: %s\n",
+					   entry->insn, entry->post_handler ? "Yes" : "No",
+					   entry->deferred_post_handler ? "Yes" : "No", strategy_name(entry->strategy));
+			} else {
+				atomic_store_explicit(&entry->state, ENTRY_FAILED, memory_order_release);
+				DW_LOG(WARNING, MAIN, "Failed to patch instruction 0x%llx (rc=%d)\n", entry->insn,
+					   patch_rc);
+			}
 		}
 	}
 
-	patch_tramp_ctx.entry = NULL;
+out:
+	tramp_ctx.fault_context = NULL;
+	tramp_ctx.has_siginfo = false;
 	dw_protect_active = save_active;
-	return fault_rip;
+	return resume_rip;
 }
 
 /*
- * Signal trampoline:
- * 1) Preserve faulting thread registers and flags.
- * 2) Call the regular patching path (queue/worker or synchronous fallback).
- * 3) Jump back to the original faulting RIP.
+ * Trampoline to transfer control to handle_seg_fault function to avoid disassembling and patching
+ * instructions in the signal handler. The trampoline performs the following steps:
+ *    1. Preserve faulting thread registers and flags
+ *    2. Call the function responsible for disassembly and patching instructions
+ *    3. Jump back to the original faulting RIP
  */
-__attribute__((naked, used)) static void dw_patch_trampoline(void)
+__attribute__((naked, used))
+static void handle_seg_fault_trampoline(void)
 {
 	__asm__ volatile(
 		/* Avoid clobbering the SysV red zone of the faulting frame */
@@ -167,7 +396,8 @@ __attribute__((naked, used)) static void dw_patch_trampoline(void)
 		"shr $32, %%rdx\n\t"
 		"xsave64 (%%rsp)\n\t"
 		/* Call our trampoline */
-		"callq dw_patch_trampoline_call\n\t"
+		"movq %%r12, %%rdi\n\t"
+		"callq handle_seg_fault\n\t"
 		"movq %%rax, %%r11\n\t"
 		"movq %2, %%rax\n\t"
 		"movq %%rax, %%rdx\n\t"
@@ -180,7 +410,8 @@ __attribute__((naked, used)) static void dw_patch_trampoline(void)
 		"andq $-16, %%rsp\n\t"
 		"fxsave64 (%%rsp)\n\t"
 		/* Call our trampoline */
-		"callq dw_patch_trampoline_call\n\t"
+		"movq %%r12, %%rdi\n\t"
+		"callq handle_seg_fault\n\t"
 		"movq %%rax, %%r11\n\t"
 		"fxrstor64 (%%rsp)\n\t"
 		"restore_path:\n\t"
@@ -215,7 +446,7 @@ __attribute__((naked, used)) static void dw_patch_trampoline(void)
 /*
  * Forward a signal to any previously installed handler.
  *
- * Some runtimes (e.g., Fortran) may have installed their own handlers. Therefore, the role
+ * Some runtimes (e.g., Fortran) may install their own handlers. Therefore, the role
  * of this function is to forward the signal to one of them.
  */
 static bool forward_to_saved_handler(int sig, siginfo_t *info, void *uctx)
@@ -254,14 +485,66 @@ static bool forward_to_saved_handler(int sig, siginfo_t *info, void *uctx)
 }
 
 /*
+ * Single-step trap is used to retaint pointers after executing patch-disabled instructions.
+ * We delegate breakpoint traps to libpatch.
+ */
+static void signal_trap(int sig, siginfo_t *info, void *context)
+{
+	ucontext_t *uctx = (ucontext_t *)context;
+
+	/* Single-step trap triggered by TF. */
+	if (info && info->si_code == TRAP_TRACE) {
+		if (step_state.active && uctx) {
+			uintptr_t trap_rip = (uintptr_t)uctx->uc_mcontext.gregs[REG_RIP];
+			bool same_rip = (trap_rip == step_state.fault_rip);
+
+			/*
+			 * REP instructions can trigger TRAP_TRACE while RIP still points at
+			 * the same instruction (single-step per iteration). If we re-taint
+			 * immediately, the next iteration can fault again on the same RIP.
+			 */
+			if (step_state.repeat_insn && same_rip) {
+				uctx->uc_mcontext.gregs[REG_EFL] |= (greg_t)DW_EFLAGS_TF;
+				return;
+			}
+
+			/* Stop single-stepping first. */
+			uctx->uc_mcontext.gregs[REG_EFL] &= ~(greg_t)DW_EFLAGS_TF;
+
+			for (size_t i = 0; i < step_state.nb_regs; i++) {
+				const struct step_reg *r = &step_state.regs[i];
+				if (!r->should_reprotect)
+					continue;
+
+				uintptr_t value_new = dw_get_register(uctx, r->ucontext_index);
+				dw_set_register(uctx, r->ucontext_index,
+								(uintptr_t)dw_reprotect((void *)value_new, (void *)r->taint));
+			}
+
+			step_state_clear();
+			return;
+		}
+
+		/*
+		 * This trap was not generated by us and libpatch does not use this kind of traps.
+		 */
+		DW_LOG(WARNING, MAIN, "Received a trap signal (TF) with no active single-step state.\n");
+		if (!forward_to_saved_handler(sig, info, context))
+			DW_LOG(ERROR, MAIN,
+				   "Failed to forward the trap signal (TF) to a registered handler.\n");
+		return;
+	}
+
+	/* Breakpoint / other SIGTRAP (int3): let libpatch handle it. */
+	libpatch_on_trap(sig, info, context);
+}
+
+/*
  * A protected object was presumably accessed, raising a signal (SIGSEGV or SIGBUS)
  */
 void signal_protected(int sig, siginfo_t *info, void *context)
 {
 	bt_signal_seed = context;
-
-	struct insn_entry *entry;
-	struct post_safe_site_rb safe_sites = {.head = 0, .count = 0};
 
 	/*
 	 * We should not have any tainted pointer access while in the handler.
@@ -280,40 +563,49 @@ void signal_protected(int sig, siginfo_t *info, void *context)
 	// Get the instruction address
 	ucontext_t *uctx = ((ucontext_t *) context);
 	uintptr_t fault_insn = uctx->uc_mcontext.gregs[REG_RIP];
+	struct insn_entry *entry = dw_get_instruction_entry(insn_table, fault_insn);
 
 	/*
-	 * On the first fault at this address, we create the instruction entry in
-	 * this handler, then redirect execution to a trampoline that performs
-	 * patching in regular thread context.
+	 * Fast-path for known patch-disabled (library/OLX) instructions.
+	 * We untaint and arm TF directly in the actual signal ucontext instead of
+	 * going through the trampoline, avoiding early TRAP_TRACE in trampoline code.
 	 */
-	bool created_out;
-	entry = dw_create_instruction_entry(insn_table, fault_insn, uctx, &created_out, &safe_sites);
-	if (entry == NULL) {
-		// The faulting instruction does not have any tainted pointers as operands. Therefore, we
-		// forward the signal to the previously saved handler (if there is any).
+	if (entry && entry->patch_disabled) {
+		atomic_fetch_add_explicit(&entry->hit_count, 1, memory_order_relaxed);
+
+		if (prepare_patch_disabled_step(entry, uctx)) {
+			dw_protect_active = save_active;
+			bt_signal_seed = NULL;
+			return;
+		}
+
 		DW_LOG(WARNING, MAIN,
-		    "Segfault on instruction (0x%llx) without protected memory arguments, forwarding to saved handler\n",
-		    fault_insn);
+			   "Patch-disabled instruction 0x%llx could not arm single-step "
+			   "(no supported tainted GPR operands), forwarding to saved handler\n",
+			   (unsigned long long)entry->insn);
+
 		dw_protect_active = save_active;
 		bt_signal_seed = NULL;
 		bool success = forward_to_saved_handler(sig, info, context);
 		if (!success) {
 			DW_LOG(ERROR, MAIN,
-			    "Segfault on instruction (0x%llx) without protected memory arguments, no saved handler\n",
-			    fault_insn);
+				   "Patch-disabled instruction 0x%llx could not arm single-step and no saved "
+				   "handler is installed\n",
+				   (unsigned long long)entry->insn);
 		}
 		return;
 	}
-	if (created_out)
-		DW_LOG(DEBUG, MAIN, "Thread %u has created a new entry for instruction 0x%llx\n", gettid(),
-			   entry->insn);
 
-	if (created_out && !entry->patch_disabled) {
-		patch_tramp_ctx.entry = entry;
-		patch_tramp_ctx.safe_sites = safe_sites;
-		patch_tramp_ctx.fault_rip = fault_insn;
-		uctx->uc_mcontext.gregs[REG_RIP] = (greg_t)(uintptr_t)dw_patch_trampoline;
-	}
+	/* Fallback path: create/patch entry through the trampoline context. */
+	tramp_ctx.sig = sig;
+	tramp_ctx.has_siginfo = (info != NULL);
+	if (info)
+		tramp_ctx.siginfo = *info;
+
+	tramp_ctx.fault_rip = fault_insn;
+	tramp_ctx.fault_context = context;
+	dw_copy_fault_gregs(tramp_ctx.fault_gregs, uctx->uc_mcontext.gregs);
+	uctx->uc_mcontext.gregs[REG_RIP] = (greg_t)(uintptr_t)handle_seg_fault_trampoline;
 
 	dw_protect_active = save_active;
 	bt_signal_seed = NULL;
@@ -412,13 +704,10 @@ dw_init()
 	insn_table = dw_init_instruction_table(nb_insn_olx_entries);
 	dw_protect_init();
 	dw_init_xsave_state();
-	dw_patch_runtime_init();
-	DW_LOG(DEBUG, PATCH, "Patch init\n");
 
 	/*
-	 * Insert the SIGSEGV signal handler to catch protected pointers. We use
-	 * an alternate stack to allow the handler to save tainted registers on
-	 * the application stack.
+	 * We use an alternate stack to allow handlers to run safely even when the
+	 * application stack is near exhaustion.
 	 */
 	stack_t ss;
 	size_t ss_size = 16 * PAGE_SIZE;
@@ -432,8 +721,23 @@ dw_init()
 	if (ret < 0)
 		DW_LOG(ERROR, MAIN, "Sigaltstack failed\n");
 
+	/*
+	 * Install our SIGTRAP handler before initializing libpatch so we can
+	 * single-step patch-disabled faults and still delegate breakpoint traps to
+	 * libpatch.
+	 */
 	sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
 	sigfillset(&sa.sa_mask);
+	sa.sa_sigaction = signal_trap;
+
+	ret = sigaction(SIGTRAP, &sa, NULL);
+	if (ret < 0)
+		DW_LOG(ERROR, MAIN, "Sigaction SIGTRAP failed\n");
+
+	dw_patch_runtime_init();
+	DW_LOG(DEBUG, PATCH, "Patch init\n");
+
+	/* Insert the SIGSEGV/SIGBUS handlers to catch protected pointers. */
 	sa.sa_sigaction = signal_protected;
 
 	ret = sigaction(SIGSEGV, &sa, NULL);
