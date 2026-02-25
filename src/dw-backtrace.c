@@ -15,6 +15,13 @@
 
 extern void* libc_memset(void *s, int c, size_t n);
 
+#define FUNC_CACHE_SIZE 128
+
+static __thread struct func_cache_entry func_cache[FUNC_CACHE_SIZE];
+static __thread int func_cache_entries_used = 0;
+static __thread int func_cache_last_idx = -1;
+static __thread int func_cache_rr_hand = 0; // round-robin pointer
+
 struct bt_patch_seed {
 	int valid;
 	patch_reg pc;
@@ -24,7 +31,6 @@ struct bt_patch_seed {
 
 __thread void *bt_signal_seed = NULL;
 static __thread struct bt_patch_seed bt_patch_seed;
-
 
 
 void dw_bt_seed_patch_set(const struct patch_exec_context *ctx)
@@ -223,24 +229,99 @@ void dw_backtrace(int fd, enum dw_backtrace_kind kind)
 	dw_unwind_print_filtered(fd, &cur, kind);
 }
 
-void dw_lookup_symbol(uintptr_t ip, char *proc_name, size_t name_len, uint64_t *offset_out)
+void dw_lookup_symbol(uintptr_t ip, char *proc_name, size_t name_len, uintptr_t *start_out,
+					  uintptr_t *end_out)
 {
+	unw_proc_info_t pi;
 	unw_cursor_t cur;
-	unw_context_t context;
+	unw_context_t ctx;
+	unw_word_t off;
+	uintptr_t start = 0;
+	uintptr_t end = 0;
 
-	if (offset_out)
-		*offset_out = 0;
+	// Look up proc info by IP
+	int ret = unw_get_proc_info_by_ip(unw_local_addr_space, (unw_word_t)ip, &pi, NULL);
+	if (ret == 0) {
+		start = (uintptr_t)pi.start_ip;
+		end = (uintptr_t)pi.end_ip;
+	}
 
-	unw_getcontext(&context);
-	unw_init_local(&cur, &context);
+	// Name lookup
+	unw_getcontext(&ctx);
+	unw_init_local(&cur, &ctx);
 	unw_set_reg(&cur, UNW_REG_IP, (unw_word_t)ip);
-
-	unw_word_t off = 0;
 	if (unw_get_proc_name(&cur, proc_name, name_len, &off) != 0) {
 		string_copy(proc_name, "-- no symbol --", name_len);
-		proc_name[name_len - 1] = '\0';
-		off = 0;
+		start = 0;
+		end = 0;
 	}
-	if (offset_out)
-		*offset_out = (uint64_t)off;
+
+	if (start_out)
+		*start_out = start;
+	if (end_out)
+		*end_out = end;
+}
+
+/*
+ * Look up a function entry in the thread-local cache by instruction pointer (IP).
+ */
+struct func_cache_entry *func_cache_lookup(uintptr_t ip)
+{
+	if (func_cache_last_idx >= 0) {
+		struct func_cache_entry *e = &func_cache[func_cache_last_idx];
+		if (ip >= e->start_ip && ip < e->end_ip)
+			return e;
+	}
+
+	int used = func_cache_entries_used;
+	if (used <= 0)
+		return NULL;
+
+	int limit = (used < FUNC_CACHE_SIZE) ? used : FUNC_CACHE_SIZE;
+	int idx = (used < FUNC_CACHE_SIZE)
+			? (limit - 1)
+			: ((func_cache_rr_hand + FUNC_CACHE_SIZE - 1) % FUNC_CACHE_SIZE);
+
+	for (int n = 0; n < limit; n++) {
+		struct func_cache_entry *e = &func_cache[idx];
+		if (ip >= e->start_ip && ip < e->end_ip) {
+			func_cache_last_idx = idx;
+			return e;
+		}
+
+		if (--idx < 0)
+			idx = limit - 1;
+	}
+
+	return NULL;
+}
+
+/*
+ * Insert a function entry (bounds + name) into the thread-local cache.
+ */
+struct func_cache_entry *func_cache_insert(uintptr_t start_ip, uintptr_t end_ip,
+														  const char *func_name)
+{
+	if (start_ip == 0 || end_ip <= start_ip || func_name == NULL)
+		return NULL;
+
+	struct func_cache_entry *e;
+
+	if (func_cache_entries_used < FUNC_CACHE_SIZE) {
+		// Still space: append
+		e = &func_cache[func_cache_entries_used++];
+		func_cache_last_idx = func_cache_entries_used - 1;
+	} else {
+		// Overwrite using round-robin
+		e = &func_cache[func_cache_rr_hand];
+		func_cache_last_idx = func_cache_rr_hand;
+		func_cache_rr_hand = (func_cache_rr_hand + 1) % FUNC_CACHE_SIZE;
+	}
+
+	e->start_ip = start_ip;
+	e->end_ip = end_ip;
+
+	string_copy(e->func_name, (char *)func_name, sizeof(e->func_name));
+
+	return e;
 }
