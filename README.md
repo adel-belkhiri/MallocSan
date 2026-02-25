@@ -68,6 +68,7 @@ The following environment variables control pointer tainting and library's opera
 | `DW_FIRST_PROTECTED`  | Skip tainting for the first N allocations.                                                         |
 | `DW_INSN_ENTRIES`     | Expected number of instructions to patch/trap. The internal table will be \~2× this size.          |
 | `DW_LOG_LEVEL`        | Log verbosity: `0` = silent, `4` = debug (errors, warnings, info, debug).                          |
+| `DW_DUMP_MEMORY_MAP`  | Dump `/proc/self/maps` once at warning and error logging levels (`1` = on, default = `0`).   |
 | `DW_STATS_FILE`       | Output file for patching statistics (default: `.taintstats.txt`).                                  |
 | `DW_CHECK_HANDLING`   | Enable extra consistency checks (`1` = on, default = `0`).                                         |
 | `DW_SHOW_BANNER`      | Show MallocSan banner printed at startup (`1` = show, default = `0`).                              |
