@@ -150,10 +150,22 @@ invalid:
 	/* Check [real_addr, real_addr + size) ⊆ [base, base + sz). */
 	if (size > sz || real_addr < base || real_addr > base + sz - size) {
 		// Get the symbol of the function where the object was allocated
-		uint64_t offset = 0;
 		char proc_name[256];
+		char* proc_name_p = proc_name;
+		uint64_t offset = 0;
 		void *alloc_ip = oids[oid].alloc_ip;
-		dw_lookup_symbol((uintptr_t)alloc_ip, proc_name, sizeof(proc_name), &offset);
+		struct func_cache_entry *e = func_cache_lookup((uintptr_t)alloc_ip);
+		if (!e) {
+			uintptr_t start, end;
+			dw_lookup_symbol((uintptr_t)alloc_ip, proc_name, sizeof(proc_name), &start, &end);
+			if (start != 0 && end > start)
+				e = func_cache_insert(start, end, proc_name);
+		}
+
+		if (e) {
+			proc_name_p = e->func_name;
+			offset = (uintptr_t)alloc_ip - e->start_ip;
+		}
 
 		uintptr_t alloc_end  = base + sz;
 		uintptr_t access_end = real_addr + size;
@@ -167,27 +179,23 @@ invalid:
 		}
 
 		DW_LOG_APP(WARNING, PROTECT,
-			"Out-of-bounds access detected (oid=%u)\n"
-			"  Allocation:\n"
-			"    base   = 0x%llx\n"
-			"    size   = %zu bytes\n"
-			"    range  = [0x%llx..0x%llx)\n"
-			"    site   = (%s+0x%lx)\n"
-			"  Access:\n"
-			"    addr   = 0x%llx\n"
-			"    size   = %zu bytes\n"
-			"    range  = [0x%llx..0x%llx)\n"
-			"  Violation:\n"
-			"    %s by %zu bytes\n"
-			"  Backtrace:\n",
-			oid,
-			(unsigned long long)base, (size_t)sz,
-			(unsigned long long)base, (unsigned long long)alloc_end,
-			proc_name, offset,
-			(unsigned long long)real_addr, (size_t)size,
-			(unsigned long long)real_addr, (unsigned long long)access_end,
-			viol_kind, diff_bytes);
-
+				"Out-of-bounds access detected (oid=%u)\n"
+				"  Allocation:\n"
+				"    base   = 0x%llx\n"
+				"    size   = %zu bytes\n"
+				"    range  = [0x%llx..0x%llx)\n"
+				"    site   = (%s+0x%lx)\n"
+				"  Access:\n"
+				"    addr   = 0x%llx\n"
+				"    size   = %zu bytes\n"
+				"    range  = [0x%llx..0x%llx)\n"
+				"  Violation:\n"
+				"    %s by %zu bytes\n"
+				"  Backtrace:\n",
+				oid, (unsigned long long)base, (size_t)sz, (unsigned long long)base,
+				(unsigned long long)alloc_end, proc_name_p, offset,
+				(unsigned long long)real_addr, (size_t)size, (unsigned long long)real_addr,
+				(unsigned long long)access_end, viol_kind, diff_bytes);
 
 		return false;
 	}

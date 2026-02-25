@@ -947,7 +947,7 @@ static bool dw_populate_instruction_entry(instruction_table *table, struct insn_
 	entry->deferred_post_handler = false;
 	snprintf(entry->disasm_insn, sizeof(entry->disasm_insn), "%.11s %.51s", cs->insn->mnemonic, cs->insn->op_str);
 
-	if (dw_log_enabled(WARNING, DISASSEMBLY)) {
+	if (dw_log_enabled(INFO, DISASSEMBLY)) {
 		code = (uint8_t *) fault;
 		char insn_code[256], *c = insn_code;
 		int ret, length = 256;
@@ -959,14 +959,27 @@ static bool dw_populate_instruction_entry(instruction_table *table, struct insn_
 		}
 
 		// Get the symbol of the containing function, to help in debugging
-		unw_word_t offset = 0;
 		char proc_name[256];
-		dw_lookup_symbol(fault, proc_name, sizeof(proc_name), &offset);
+		char* proc_name_p = proc_name;
+		uint64_t offset = 0;
+
+		struct func_cache_entry *e = func_cache_lookup(fault);
+		if (!e) {
+			uintptr_t start = 0, end = 0;
+			dw_lookup_symbol(fault, proc_name, sizeof(proc_name), &start, &end);
+			if (start != 0 && end > start)
+				e = func_cache_insert(start, end, proc_name);
+		}
+
+		if (e) {
+			proc_name_p = e->func_name;
+			offset = (uint64_t) fault - e->start_ip;
+		}
 
 		// This is info, not a warning, but we need it for debug purposes for now
 		DW_LOG(INFO, DISASSEMBLY,
 			"[%u] ==> Instruction 0x%llx (%s+0x%lx), entry %lu, disasm -> %s %s, (%hu), %s\n",
-			gettid(), fault, proc_name, offset, (entry - table->entries), cs->insn->mnemonic,
+			gettid(), fault, proc_name_p, offset, (entry - table->entries), cs->insn->mnemonic,
 			cs->insn->op_str, cs->insn->size, insn_code);
 	}
 
