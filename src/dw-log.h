@@ -28,6 +28,7 @@ void dw_fprintf(int fd, const char *fmt, ...);
 
 /* Set the log level for all categories */
 void dw_set_log_level(enum dw_log_level level);
+void dw_set_dump_memory_map(bool enabled);
 
 /* Check if logging is enabled for that level and topic */
 bool dw_log_enabled(enum dw_log_level level, enum dw_log_category_name topic);

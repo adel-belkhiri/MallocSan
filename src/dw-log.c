@@ -23,6 +23,7 @@ struct dw_log_category dw_log_categories[] = {{"protect", 1, ERROR, 1},
 											  {"main", 1, ERROR, 1},
 											  {"wrap", 1, ERROR, 1},
 											  {"patch", 1, ERROR, 1}};
+static bool dump_memory_map_enabled = false;
 
 inline unsigned string_copy(char *dest, char *src, size_t n)
 {
@@ -91,11 +92,18 @@ static inline void dump_memory_map(enum dw_log_level level, enum dw_log_category
 	}
 }
 
+void dw_set_dump_memory_map(bool enabled)
+{
+	dump_memory_map_enabled = enabled;
+}
+
 void __dw_log_internal(enum dw_log_level level, enum dw_log_category_name topic, enum dw_backtrace_kind bt_kind, const char *fmt, ...)
 {
 	va_list args;
 
-	dump_memory_map(level, topic);
+	if (dump_memory_map_enabled)
+		dump_memory_map(level, topic);
+
 	va_start(args, fmt);
 	dw_log_v(level, topic, fmt, args);
 	va_end(args);

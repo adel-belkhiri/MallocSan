@@ -628,6 +628,7 @@ static long unsigned first_protected = 0, max_nb_protected = ULONG_MAX;
 
 /* Use extended checking of coherency */
 static bool check_handling = false;
+static bool dump_memory_map = false;
 
 /* Verbosity of messages */
 static enum dw_log_level log_level = 0;
@@ -669,6 +670,11 @@ dw_init()
 	arg = getenv("DW_CHECK_HANDLING");
 	if (arg != NULL && atoi(arg) == 1) { check_handling = true; dw_set_check_handling(check_handling); }
 
+	arg = getenv("DW_DUMP_MEMORY_MAP");
+	if (arg != NULL && atoi(arg) == 1)
+		dump_memory_map = true;
+	dw_set_dump_memory_map(dump_memory_map);
+
 	bool show_banner = false;
 	arg = getenv("DW_SHOW_BANNER");
 	if (arg != NULL && atoi(arg) == 1)
@@ -693,11 +699,12 @@ dw_init()
 		"\n"
 		" Logging / Statistics:\n"
 		"   log_level           : %d\n"
+		"   dump_memory_map     : %s\n"
 		"   stats_file          : %s\n"
 		"============================================================\n",
 		min_protect_size, max_protect_size, first_protected, max_nb_protected,
 		nb_insn_olx_entries, strategy_name(dw_strategy), check_handling ? "enabled" : "disabled",
-		log_level, stats_file);
+		log_level, dump_memory_map ? "enabled" : "disabled", stats_file);
 	}
 
 	// Initialise the different modules
@@ -940,6 +947,7 @@ void *calloc(size_t nmemb, size_t size)
 	void *ret = malloc2(nmemb * size, __builtin_return_address(0));
 	if (ret != NULL)
 		__builtin_memset(dw_unprotect(ret), 0, nmemb * size);
+
 	return ret;
 }
 
