@@ -453,7 +453,7 @@ static bool forward_to_saved_handler(int sig, siginfo_t *info, void *uctx)
 {
 	struct sigaction saved;
 
-	if (!dw_sigaction_get_saved(sig, &saved))
+	if (!get_saved_sigaction(sig, &saved))
 		return false;
 
 	/* If the handler expects the 3-argument form */
@@ -721,30 +721,32 @@ dw_init()
 	if (ret < 0)
 		DW_LOG(ERROR, MAIN, "Sigaltstack failed\n");
 
+	dw_patch_runtime_init();
+	DW_LOG(DEBUG, PATCH, "Patch init\n");
+
 	/*
-	 * Install our SIGTRAP handler before initializing libpatch so we can
-	 * single-step patch-disabled faults and still delegate breakpoint traps to
-	 * libpatch.
+	 * Install our SIGTRAP handler after initializing libpatch.
+	 *
+	 * libpatch may install its own SIGTRAP handler during patch_init(). We need
+	 * our handler to stay active to support single-stepping patch-disabled
+	 * faults while still delegating non-trace traps to libpatch.
 	 */
 	sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
 	sigfillset(&sa.sa_mask);
 	sa.sa_sigaction = signal_trap;
 
-	ret = sigaction(SIGTRAP, &sa, NULL);
+	ret = dw_libc_sigaction(SIGTRAP, &sa);
 	if (ret < 0)
 		DW_LOG(ERROR, MAIN, "Sigaction SIGTRAP failed\n");
-
-	dw_patch_runtime_init();
-	DW_LOG(DEBUG, PATCH, "Patch init\n");
 
 	/* Insert the SIGSEGV/SIGBUS handlers to catch protected pointers. */
 	sa.sa_sigaction = signal_protected;
 
-	ret = sigaction(SIGSEGV, &sa, NULL);
+	ret = dw_libc_sigaction(SIGSEGV, &sa);
 	if (ret < 0)
 		DW_LOG(ERROR, MAIN, "Sigaction SIGSEGV failed\n");
 
-	ret = sigaction(SIGBUS, &sa, NULL);
+	ret = dw_libc_sigaction(SIGBUS, &sa);
 	if(ret < 0)
 		DW_LOG(ERROR, MAIN, "Sigaction SIGBUS failed\n");
 

@@ -28,7 +28,7 @@ extern pthread_once_t dw_init_stubs;
 
 void dw_init_syscall_stubs();
 int dw_libc_sigaction(int signum, const struct sigaction *act);
-bool dw_sigaction_get_saved(int signum, struct sigaction *sa);
+bool get_saved_sigaction(int signum, struct sigaction *sa);
 
 #define dw_sin()                       \
 	bool sin_save = dw_protect_active; \
