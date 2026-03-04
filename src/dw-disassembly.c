@@ -985,14 +985,18 @@ static bool dw_populate_instruction_entry(instruction_table *table, struct insn_
 
 	cs_detail *detail = cs->insn->detail;
 	cs_x86 *x86 = &(detail->x86);
+	bool need_immediate_reprotection = false;
 
-	// TODO: To be removed once libpatch supports immediate execution of post-handlers
-	// for call instructions.
-	if (cs_insn_group(cs->handle, cs->insn, X86_GRP_CALL)) {
-		DW_LOG(WARNING, DISASSEMBLY,
-		    "Call instruction %llx (%s %s) has protected memory operands, post handler cannot be used\n",
-		    fault, cs->insn->mnemonic, cs->insn->op_str);
-		entry->post_handler = false;
+	/*
+	 * For control flow instructions, we need to reapply the taint immediatly.
+	 */
+	for (int i = 0; i < detail->groups_count; i++) {
+		if (detail->groups[i] < X86_GRP_VM) {
+			need_immediate_reprotection = true;
+			DW_LOG(DEBUG, DISASSEMBLY, "Jump or Call instruction %llx (%s %s) has protected memory operands",
+				    fault, cs->insn->mnemonic, cs->insn->op_str);
+			break;
+		}
 	}
 
 	entry->repeat =
@@ -1043,7 +1047,6 @@ static bool dw_populate_instruction_entry(instruction_table *table, struct insn_
 		DW_LOG(WARNING, DISASSEMBLY, "Instruction 0x%llx accesses more than one protected object\n",
 			   entry->insn);
 
-	bool need_immediate_reprotection = false;
 	bool all_tainted_overwritten = true;
 	for (int i = 0; i < entry->nb_arg_m; i++) {
 		if (!base_index_overwritten(cs->insn, entry, &entry_rt, i)) {

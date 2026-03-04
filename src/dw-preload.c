@@ -359,8 +359,8 @@ static void handle_seg_fault_trampoline(void)
 {
 	__asm__ volatile(
 		/* Avoid clobbering the SysV red zone of the faulting frame */
-		"subq $128, %%rsp\n\t"
-		"subq $8, %%rsp\n\t"
+		"leaq -128(%%rsp), %%rsp\n\t"
+		"leaq -8(%%rsp), %%rsp\n\t"
 		/* Save flags/GPRs */
 		"pushfq\n\t"
 		"pushq %%rax\n\t"
@@ -434,8 +434,8 @@ static void handle_seg_fault_trampoline(void)
 		"popq %%rbx\n\t"
 		"popq %%rax\n\t"
 		"popfq\n\t"
-		"addq $8, %%rsp\n\t"
-		"addq $128, %%rsp\n\t"
+		"leaq 8(%%rsp), %%rsp\n\t"
+		"leaq 128(%%rsp), %%rsp\n\t"
 		/* Jump back to faulting RIP */
 		"jmp *-136(%%rsp)\n\t"
 		:
