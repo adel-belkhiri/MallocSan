@@ -345,7 +345,7 @@ bool get_saved_sigaction(int signum, struct sigaction *sa)
 {
 	struct dw_saved_sigaction *handler = get_saved_sig_handler(signum);
 
-	if (handler == NULL)
+	if (handler == NULL || !handler->valid)
 		return false;
 
 	*sa = handler->sa;
@@ -375,7 +375,7 @@ int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
 	if (oldact != NULL) {
 		struct dw_saved_sigaction *entry = get_saved_sig_handler(signum);
 
-		if (entry != NULL)
+		if (entry != NULL && entry->valid)
 			*oldact = entry->sa;
 		else {
 			memset(oldact, 0, sizeof(*oldact));
@@ -401,27 +401,23 @@ int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
 		}
 
 		struct dw_saved_sigaction *entry_any = get_saved_sig_handler(signum);
-		if (entry_any == NULL ||
-		    act->sa_sigaction == entry_any->sa.sa_sigaction ||
-		    (void (*)(int)) act->sa_handler == (void (*)(int)) entry_any->sa.sa_handler) {
+		if (entry_any != NULL && entry_any->valid &&
+			(act->sa_sigaction == entry_any->sa.sa_sigaction ||
+			(void (*)(int))act->sa_handler == (void (*)(int))entry_any->sa.sa_handler)) {
 			(void)save_latest_handler(signum, act);
-
-			int ret = libc_sigaction(signum, act, NULL);
 			sout();
-			return ret;
+			return 0;
 		}
 
+		(void)save_latest_handler(signum, act);
 		DW_LOG(WARNING, WRAP, "[%u] Blocked attempt to overwrite the SIGTRAP handler\n", gettid());
-		const struct sigaction *saved =
-			entry_any ? &entry_any->sa : act;
-		int ret = libc_sigaction(signum, saved, NULL);
 		sout();
-		return ret;
+		return 0;
 	}
 
 	// If the action carries out our SIGSEGV and SIGBUS handlers, we let it pass through
 	if (act->sa_sigaction == signal_protected ||
-	    (void (*)(int)) act->sa_handler == (void (*)(int)) signal_protected) {
+		(void (*)(int))act->sa_handler == (void (*)(int))signal_protected) {
 		int ret = libc_sigaction(signum, act, NULL);
 		sout();
 		return ret;
@@ -442,7 +438,7 @@ int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
 	struct sigaction replacement = *act;
 
 	replacement.sa_sigaction = signal_protected;
-	replacement.sa_handler = (void (*)(int)) signal_protected;
+	replacement.sa_handler = (void (*)(int))signal_protected;
 	replacement.sa_flags |= SA_SIGINFO;
 
 	int ret = libc_sigaction(signum, &replacement, NULL);
