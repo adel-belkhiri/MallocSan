@@ -11,6 +11,7 @@
 
 #include <capstone/capstone.h>
 
+#include "dw-backtrace.h"
 #include "dw-disassembly.h"
 #include "dw-patch.h"
 #include "dw-log.h"
@@ -1681,22 +1682,74 @@ void dw_reprotect_context(struct patch_exec_context *ctx)
 }
 
 /*
- * Dump the content of the instruction table, for knowing the
- * number of instructions accessing protected objects, and the number of hits
- * for each instruction. Print statistics about each instruction patched
+ * Print the content of the instruction table. Dump one row per instruction entry,
+ * including symbol information, hit count, and other patching metadata.
  */
 void dw_print_instruction_entries(instruction_table *table, int fd)
 {
 	struct insn_entry *entry;
+	char proc_name[MAX_FUNC_NAME_LEN];
+	char *proc_name_p;
+	const int func_col_width = 40;
 	unsigned count = 0;
+	uintptr_t start, end, fault, offset;
+	bool has_index;
+
+	/* Header */
+	dw_fprintf(fd, "%-5s %-18s %-*s %-10s %-10s %-8s %-9s %-6s %-6s %-10s %-6s %s\n",
+				   "#", "ip", func_col_width, "func", "off", "hits", "len", "m_args",
+				   "index", "post", "defer", "strat", "disasm");
 
 	for (int i = 0; i < table->size; i++) {
+
 		entry = &(table->entries[i]);
-		if (atomic_load_explicit(&entry->state, memory_order_acquire) == ENTRY_READY) {
-			dw_fprintf(fd, "%4d 0x%lx: %9u: %2u: %1u %s;\n",
-					   count, entry->insn, atomic_load(&entry->hit_count), entry->insn_length,
-					   entry->strategy, entry->disasm_insn);
-			count++;
+		if (atomic_load_explicit(&entry->state, memory_order_acquire) != ENTRY_READY)
+			continue;
+
+		fault = entry->insn;
+		start = 0;
+		end = 0;
+		proc_name_p = proc_name;
+
+		struct func_cache_entry *e = func_cache_lookup(fault);
+		if (!e) {
+			dw_lookup_symbol(fault, proc_name, sizeof(proc_name), &start, &end);
+			if (start != 0 && end > start)
+				e = func_cache_insert(start, end, proc_name);
 		}
+
+		if (e) {
+			proc_name_p = e->func_name;
+			start = e->start_ip;
+		}
+
+		offset = 0;
+		has_index = false;
+		if (start)
+			offset = fault - start;
+
+		for (unsigned j = 0; j < entry->nb_arg_m; j++) {
+			if (entry->arg_m[j].index != X86_REG_INVALID) {
+				has_index = true;
+				break;
+			}
+		}
+
+		dw_fprintf(fd, "%-5u 0x%-16lx %-*s 0x%-8lx %-10lu %-8u %-9u %-6u %-6u %-10u %-6u %s\n",
+				   count,
+				   (unsigned long)fault,
+				   func_col_width,
+				   proc_name_p,
+				   (unsigned long)offset,
+				   atomic_load(&entry->hit_count),
+				   entry->insn_length,
+				   entry->nb_arg_m,
+				   (unsigned)has_index,
+				   (unsigned)entry->post_handler,
+				   (unsigned)entry->deferred_post_handler,
+				   entry->strategy,
+				   entry->disasm_insn);
+
+		count++;
 	}
 }
