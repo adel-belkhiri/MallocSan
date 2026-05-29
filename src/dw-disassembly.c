@@ -13,6 +13,7 @@
 
 #include "dw-backtrace.h"
 #include "dw-disassembly.h"
+#include "dw-exec-policy.h"
 #include "dw-patch.h"
 #include "dw-log.h"
 #include "dw-protect.h"
@@ -1127,9 +1128,7 @@ struct insn_entry *dw_create_instruction_entry(instruction_table *table, uintptr
 											   ucontext_t *uctx, bool *created_out,
 											   struct post_safe_site_rb *safe_sites_out)
 {
-	// TODO: Temporary workaround until libpatch supports overlapping patches
-	static const uintptr_t library_start = 0x700000000000ULL;
-	const bool patch_disabled = (fault >= library_start);
+	const bool patch_disabled = dw_patch_disabled_for_addr(fault);
 
 	if (!patch_disabled && safe_sites_out == NULL) {
 		DW_LOG(WARNING, MAIN,
@@ -1172,7 +1171,8 @@ struct insn_entry *dw_create_instruction_entry(instruction_table *table, uintptr
 
 				if (e->patch_disabled) {
 					DW_LOG(WARNING, DISASSEMBLY,
-						   "Instruction 0x%llx is within a library/OLX area, patching is disabled\n",
+						   "Instruction 0x%llx is within a libpatch-generated or unsupported "
+						   "executable mapping, patching is disabled\n",
 						   (unsigned long long)fault);
 					atomic_store_explicit(&e->state, ENTRY_READY, memory_order_release);
 				} else {

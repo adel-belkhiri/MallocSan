@@ -4,6 +4,7 @@ AM_CPPFLAGS = $(AM_CFLAGS)
 lib_LTLIBRARIES = libmallocsan.la
 libmallocsan_la_SOURCES = \
     dw-backtrace.c \
+    dw-exec-policy.c \
     dw-log.c \
     dw-protect-oid.c \
     dw-registers.c \

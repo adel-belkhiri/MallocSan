@@ -17,6 +17,7 @@
 
 #include "dw-cpuid.h"
 #include "dw-disassembly.h"
+#include "dw-exec-policy.h"
 #include "dw-log.h"
 #include "dw-patch.h"
 #include "dw-protect.h"
@@ -757,6 +758,7 @@ dw_init()
 	if(ret < 0)
 		DW_LOG(ERROR, MAIN, "Sigaction SIGBUS failed\n");
 
+	dw_exec_policy_init();
 	// start intercepting allocation functions
 	atomic_store_explicit(&dw_fully_initialized, 1, memory_order_release);
 	dw_protect_active = true;

@@ -1,0 +1,259 @@
+#define _GNU_SOURCE
+
+#include <stdbool.h>
+#include <link.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "dw-exec-policy.h"
+#include "dw-log.h"
+
+#define MAIN_OBJ_MAX_EXEC_SEGS 32
+#define DW_EXEC_MAPPING_MAX_REGIONS 512
+#define DW_EXEC_MAPPING_LINE_MAX 4096
+#define DW_EXEC_MAPPING_PATH_MAX 2048
+
+struct dw_exec_region {
+	uintptr_t start;
+	uintptr_t end;
+};
+
+enum dw_exec_mapping_kind {
+	DW_EXEC_MAP_FILE_BACKED = 0,
+	DW_EXEC_MAP_LIBPATCH_GENERATED,
+	DW_EXEC_MAP_OTHER,
+};
+
+struct dw_exec_mapping {
+	uintptr_t start;
+	uintptr_t end;
+	enum dw_exec_mapping_kind kind;
+};
+
+static struct dw_exec_region main_obj_exec_segs[MAIN_OBJ_MAX_EXEC_SEGS];
+static size_t main_obj_exec_seg_count = 0;
+static bool main_obj_range_ready = false;
+static struct dw_exec_mapping exec_mappings[DW_EXEC_MAPPING_MAX_REGIONS];
+static size_t exec_mapping_count = 0;
+static __thread int exec_mapping_last_idx = -1;
+
+static void add_main_object_exec_seg(uintptr_t start, uintptr_t end)
+{
+	if (start == 0 || end <= start)
+		return;
+
+	for (size_t i = 0; i < main_obj_exec_seg_count; i++) {
+		struct dw_exec_region *region = &main_obj_exec_segs[i];
+		if (end <= region->start || start >= region->end)
+			continue;
+
+		if (start < region->start)
+			region->start = start;
+		if (end > region->end)
+			region->end = end;
+		return;
+	}
+
+	if (main_obj_exec_seg_count >= MAIN_OBJ_MAX_EXEC_SEGS)
+		return;
+
+	main_obj_exec_segs[main_obj_exec_seg_count++] =
+		(struct dw_exec_region){.start = start, .end = end};
+}
+
+static bool load_main_object_exec_segments(const struct dl_phdr_info *info)
+{
+	for (ElfW(Half) i = 0; i < info->dlpi_phnum; i++) {
+		const ElfW(Phdr) *phdr = &info->dlpi_phdr[i];
+
+		if (phdr->p_type != PT_LOAD)
+			continue;
+		if ((phdr->p_flags & PF_X) == 0)
+			continue;
+		if (phdr->p_memsz == 0)
+			continue;
+
+		add_main_object_exec_seg((uintptr_t)info->dlpi_addr + (uintptr_t)phdr->p_vaddr,
+						 (uintptr_t)info->dlpi_addr + (uintptr_t)phdr->p_vaddr +
+							 (uintptr_t)phdr->p_memsz);
+	}
+
+	return main_obj_exec_seg_count > 0;
+}
+
+static int find_main_object_range_cb(struct dl_phdr_info *info, size_t size, void *data)
+{
+	(void)size;
+	(void)data;
+
+	/* For the main executable, glibc typically provides an empty dlpi_name. */
+	if (info->dlpi_name && info->dlpi_name[0] != '\0')
+		return 0;
+
+	if (load_main_object_exec_segments(info))
+		main_obj_range_ready = true;
+
+	/* Stop after finding the main program. */
+	return 1;
+}
+
+void init_main_object_range(void)
+{
+	if (main_obj_range_ready)
+		return;
+
+	main_obj_exec_seg_count = 0;
+	dl_iterate_phdr(find_main_object_range_cb, NULL);
+}
+
+bool dw_main_object_range_available(void)
+{
+	if (!main_obj_range_ready)
+		init_main_object_range();
+
+	return main_obj_range_ready;
+}
+
+bool dw_addr_in_main_object(uintptr_t addr)
+{
+	if (!dw_main_object_range_available())
+		return false;
+
+	for (size_t i = 0; i < main_obj_exec_seg_count; i++) {
+		if (addr >= main_obj_exec_segs[i].start && addr < main_obj_exec_segs[i].end)
+			return true;
+	}
+
+	return false;
+}
+
+static enum dw_exec_mapping_kind classify_exec_mapping_path(const char *path)
+{
+	if (path != NULL && strstr(path, "memfd:libpatch:") != NULL)
+		return DW_EXEC_MAP_LIBPATCH_GENERATED;
+
+	if (path != NULL && path[0] == '/')
+		return DW_EXEC_MAP_FILE_BACKED;
+
+	return DW_EXEC_MAP_OTHER;
+}
+
+static void add_exec_mapping(uintptr_t start, uintptr_t end, enum dw_exec_mapping_kind kind)
+{
+	if (start == 0 || end <= start)
+		return;
+
+	if (exec_mapping_count > 0) {
+		struct dw_exec_mapping *prev = &exec_mappings[exec_mapping_count - 1];
+		if (prev->kind == kind && start <= prev->end) {
+			if (end > prev->end)
+				prev->end = end;
+			return;
+		}
+	}
+
+	if (exec_mapping_count >= DW_EXEC_MAPPING_MAX_REGIONS) {
+		DW_LOG(WARNING, MAIN,
+			   "Executable mapping cache capacity reached; some regions were ignored.\n");
+		return;
+	}
+
+	exec_mappings[exec_mapping_count++] =
+		(struct dw_exec_mapping){.start = start, .end = end, .kind = kind};
+}
+
+static void refresh_exec_mapping_cache(void)
+{
+	FILE *maps;
+	char line[DW_EXEC_MAPPING_LINE_MAX];
+
+	exec_mapping_count = 0;
+	exec_mapping_last_idx = -1;
+
+	maps = fopen("/proc/self/maps", "r");
+	if (maps == NULL) {
+		DW_LOG(WARNING, MAIN, "Unable to open /proc/self/maps for executable classification.\n");
+		return;
+	}
+
+	while (fgets(line, sizeof(line), maps) != NULL) {
+		unsigned long start_raw, end_raw;
+		char perms[5];
+		char path[DW_EXEC_MAPPING_PATH_MAX];
+		char *trimmed;
+		int fields;
+
+		start_raw = 0;
+		end_raw = 0;
+		perms[0] = '\0';
+		path[0] = '\0';
+
+		fields = sscanf(line, "%lx-%lx %4s %*s %*s %*s %2047[^\n]",
+						&start_raw, &end_raw, perms, path);
+		if (fields < 3)
+			continue;
+		if (strchr(perms, 'x') == NULL)
+			continue;
+
+		trimmed = path;
+		if (fields >= 4) {
+			while (*trimmed == ' ' || *trimmed == '\t')
+				trimmed++;
+		} else {
+			trimmed = "";
+		}
+
+		add_exec_mapping((uintptr_t)start_raw, (uintptr_t)end_raw,
+					 classify_exec_mapping_path(trimmed));
+	}
+
+	fclose(maps);
+}
+
+static const struct dw_exec_mapping *find_exec_mapping(uintptr_t addr)
+{
+	if (exec_mapping_last_idx >= 0) {
+		const struct dw_exec_mapping *mapping = &exec_mappings[exec_mapping_last_idx];
+		if (addr >= mapping->start && addr < mapping->end)
+			return mapping;
+	}
+
+	for (size_t i = 0; i < exec_mapping_count; i++) {
+		const struct dw_exec_mapping *mapping = &exec_mappings[i];
+		if (addr < mapping->start)
+			break;
+		if (addr >= mapping->start && addr < mapping->end) {
+			exec_mapping_last_idx = (int)i;
+			return mapping;
+		}
+	}
+
+	return NULL;
+}
+
+void dw_exec_policy_init(void)
+{
+	init_main_object_range();
+	refresh_exec_mapping_cache();
+}
+
+bool dw_patch_disabled_for_addr(uintptr_t addr)
+{
+	const struct dw_exec_mapping *mapping;
+
+	if (dw_main_object_range_available() && dw_addr_in_main_object(addr))
+		return false;
+
+	mapping = find_exec_mapping(addr);
+	if (mapping == NULL) {
+		refresh_exec_mapping_cache();
+		mapping = find_exec_mapping(addr);
+	}
+
+	if (mapping == NULL)
+		return true;
+
+	return mapping->kind != DW_EXEC_MAP_FILE_BACKED;
+}
