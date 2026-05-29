@@ -142,8 +142,8 @@ static bool dw_instruction_entry_patch_strategy(struct insn_entry *entry,
 		s = patch_attr_set_trap_policy(&attr, PATCH_TRAP_POLICY_FORCE);
 		check_patch(s, "set policy FORCE");
 	} else if (strategy == DW_PATCH_JUMP) {
-		s = patch_attr_set_trap_policy(&attr, PATCH_TRAP_POLICY_FORBID);
-		check_patch(s, "set policy FORBID");
+		s = patch_attr_set_trap_policy(&attr, PATCH_TRAP_POLICY_ALLOW);
+		check_patch(s, "set policy ALLOW");
 	} else {
 		DW_LOG(ERROR, PATCH, "Unknown patching strategy\n");
 	}
