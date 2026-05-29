@@ -29,7 +29,8 @@ struct insn_table {
 	struct insn_entry *entries;
 };
 
-__thread struct insn_entry_runtime insn_rt_slots[MAX_SCAN_INST_COUNT];
+__thread struct insn_entry_runtime insn_rt_slots[MAX_SCAN_INST_COUNT]
+	__attribute__((tls_model("initial-exec")));
 
 struct capstone_context {
 	csh handle;
@@ -37,7 +38,8 @@ struct capstone_context {
 	bool ready;
 };
 
-__thread struct capstone_context cs_ctx;
+__thread struct capstone_context cs_ctx
+	__attribute__((tls_model("initial-exec")));
 static pthread_key_t cs_key;
 static pthread_once_t cs_key_once = PTHREAD_ONCE_INIT;
 

@@ -15,7 +15,7 @@ struct func_cache_entry {
 
 struct patch_exec_context;
 
-extern __thread void *bt_signal_seed;
+extern __thread void *bt_signal_seed __attribute__((tls_model("initial-exec")));
 
 void dw_bt_seed_patch_set(const struct patch_exec_context *ctx);
 void dw_bt_seed_patch_clear(void);

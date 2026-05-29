@@ -21,7 +21,7 @@
  * We are within the MallocSan internals, do not protect heap objects
  * This variable should be thread local storage for multi-threading
  */
-extern __thread bool dw_protect_active;
+extern __thread bool dw_protect_active __attribute__((tls_model("initial-exec")));
 
 /* Initialize the module */
 void dw_protect_init();

@@ -15,7 +15,7 @@ const uintptr_t untaint_mask  = (uintptr_t) 0x0000ffffffffffff;
 const uintptr_t default_taint = (uintptr_t) 0x0001000000000000;
 
 /* Start without protecting objects, wait until libdw is fully initialized */
-bool dw_protect_active = false;
+__thread bool dw_protect_active __attribute__((tls_model("initial-exec"))) = false;
 
 void dw_protect_init()
 {

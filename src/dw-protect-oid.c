@@ -105,7 +105,7 @@ static inline void dw_oid_free(unsigned oid)
 }
 
 /* Start without protecting objects, wait until libdw is fully initialized. */
-__thread bool dw_protect_active = false;
+__thread bool dw_protect_active __attribute__((tls_model("initial-exec"))) = false;
 
 void dw_protect_init()
 {

@@ -73,7 +73,7 @@ struct trampoline_context {
 	siginfo_t siginfo;
 };
 
-static __thread struct trampoline_context tramp_ctx;
+static __thread struct trampoline_context tramp_ctx __attribute__((tls_model("initial-exec")));
 
 static bool forward_to_saved_handler(int sig, siginfo_t *info, void *uctx);
 
@@ -94,7 +94,7 @@ struct step_state {
 	struct step_reg regs[DW_STEP_MAX_REGS];
 };
 
-static __thread struct step_state step_state;
+static __thread struct step_state step_state __attribute__((tls_model("initial-exec")));
 
 static inline void step_state_clear(void)
 {

@@ -29,8 +29,9 @@ struct bt_patch_seed {
 	patch_reg gprs[PATCH_ARCH_GREGS_COUNT];
 };
 
-__thread void *bt_signal_seed = NULL;
-static __thread struct bt_patch_seed bt_patch_seed;
+__thread void *bt_signal_seed __attribute__((tls_model("initial-exec"))) = NULL;
+static __thread struct bt_patch_seed bt_patch_seed
+	__attribute__((tls_model("initial-exec")));
 
 
 void dw_bt_seed_patch_set(const struct patch_exec_context *ctx)
