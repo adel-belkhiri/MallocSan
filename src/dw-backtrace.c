@@ -22,34 +22,24 @@ static __thread int func_cache_entries_used = 0;
 static __thread int func_cache_last_idx = -1;
 static __thread int func_cache_rr_hand = 0; // round-robin pointer
 
-struct bt_patch_seed {
-	int valid;
-	patch_reg pc;
-	patch_reg sp;
-	patch_reg gprs[PATCH_ARCH_GREGS_COUNT];
-};
-
 __thread void *bt_signal_seed __attribute__((tls_model("initial-exec"))) = NULL;
-static __thread struct bt_patch_seed bt_patch_seed
-	__attribute__((tls_model("initial-exec")));
+/*
+ * Backtraces emitted from a probe happen synchronously while libpatch's
+ * patch_exec_context is still live, so we can keep a TLS pointer instead of
+ * snapshotting all GPRs on every pre/post handler invocation.
+ */
+static __thread const struct patch_exec_context *bt_patch_seed_ctx
+	__attribute__((tls_model("initial-exec"))) = NULL;
 
 
 void dw_bt_seed_patch_set(const struct patch_exec_context *ctx)
 {
-	if (!ctx) {
-		bt_patch_seed.valid = 0;
-		return;
-	}
-
-	bt_patch_seed.pc = ctx->program_counter;
-	bt_patch_seed.sp = ctx->stack_pointer;
-	__builtin_memcpy(bt_patch_seed.gprs, ctx->general_purpose_registers, sizeof(bt_patch_seed.gprs));
-	bt_patch_seed.valid = 1;
+	bt_patch_seed_ctx = ctx;
 }
 
 void dw_bt_seed_patch_clear(void)
 {
-	bt_patch_seed.valid = 0;
+	bt_patch_seed_ctx = NULL;
 }
 
 /*
@@ -156,26 +146,27 @@ static void dw_unwind_print_filtered(int fd, unw_cursor_t *cur, enum dw_backtrac
 	}
 }
 
-static inline void dw_set_cursor_from_patch_seed(unw_cursor_t *cur)
+static inline void dw_set_cursor_from_patch_seed(unw_cursor_t *cur,
+						 const struct patch_exec_context *ctx)
 {
-	unw_set_reg(cur, UNW_REG_IP, (unw_word_t)bt_patch_seed.pc);
-	unw_set_reg(cur, UNW_REG_SP, (unw_word_t)bt_patch_seed.sp);
+	unw_set_reg(cur, UNW_REG_IP, (unw_word_t)ctx->program_counter);
+	unw_set_reg(cur, UNW_REG_SP, (unw_word_t)ctx->stack_pointer);
 
-	unw_set_reg(cur, UNW_X86_64_RAX, (unw_word_t)bt_patch_seed.gprs[PATCH_X86_64_RAX]);
-	unw_set_reg(cur, UNW_X86_64_RBX, (unw_word_t)bt_patch_seed.gprs[PATCH_X86_64_RBX]);
-	unw_set_reg(cur, UNW_X86_64_RCX, (unw_word_t)bt_patch_seed.gprs[PATCH_X86_64_RCX]);
-	unw_set_reg(cur, UNW_X86_64_RDX, (unw_word_t)bt_patch_seed.gprs[PATCH_X86_64_RDX]);
-	unw_set_reg(cur, UNW_X86_64_RSI, (unw_word_t)bt_patch_seed.gprs[PATCH_X86_64_RSI]);
-	unw_set_reg(cur, UNW_X86_64_RDI, (unw_word_t)bt_patch_seed.gprs[PATCH_X86_64_RDI]);
-	unw_set_reg(cur, UNW_X86_64_RBP, (unw_word_t)bt_patch_seed.gprs[PATCH_X86_64_RBP]);
-	unw_set_reg(cur, UNW_X86_64_R8, (unw_word_t)bt_patch_seed.gprs[PATCH_X86_64_R8]);
-	unw_set_reg(cur, UNW_X86_64_R9, (unw_word_t)bt_patch_seed.gprs[PATCH_X86_64_R9]);
-	unw_set_reg(cur, UNW_X86_64_R10, (unw_word_t)bt_patch_seed.gprs[PATCH_X86_64_R10]);
-	unw_set_reg(cur, UNW_X86_64_R11, (unw_word_t)bt_patch_seed.gprs[PATCH_X86_64_R11]);
-	unw_set_reg(cur, UNW_X86_64_R12, (unw_word_t)bt_patch_seed.gprs[PATCH_X86_64_R12]);
-	unw_set_reg(cur, UNW_X86_64_R13, (unw_word_t)bt_patch_seed.gprs[PATCH_X86_64_R13]);
-	unw_set_reg(cur, UNW_X86_64_R14, (unw_word_t)bt_patch_seed.gprs[PATCH_X86_64_R14]);
-	unw_set_reg(cur, UNW_X86_64_R15, (unw_word_t)bt_patch_seed.gprs[PATCH_X86_64_R15]);
+	unw_set_reg(cur, UNW_X86_64_RAX, (unw_word_t)ctx->general_purpose_registers[PATCH_X86_64_RAX]);
+	unw_set_reg(cur, UNW_X86_64_RBX, (unw_word_t)ctx->general_purpose_registers[PATCH_X86_64_RBX]);
+	unw_set_reg(cur, UNW_X86_64_RCX, (unw_word_t)ctx->general_purpose_registers[PATCH_X86_64_RCX]);
+	unw_set_reg(cur, UNW_X86_64_RDX, (unw_word_t)ctx->general_purpose_registers[PATCH_X86_64_RDX]);
+	unw_set_reg(cur, UNW_X86_64_RSI, (unw_word_t)ctx->general_purpose_registers[PATCH_X86_64_RSI]);
+	unw_set_reg(cur, UNW_X86_64_RDI, (unw_word_t)ctx->general_purpose_registers[PATCH_X86_64_RDI]);
+	unw_set_reg(cur, UNW_X86_64_RBP, (unw_word_t)ctx->general_purpose_registers[PATCH_X86_64_RBP]);
+	unw_set_reg(cur, UNW_X86_64_R8, (unw_word_t)ctx->general_purpose_registers[PATCH_X86_64_R8]);
+	unw_set_reg(cur, UNW_X86_64_R9, (unw_word_t)ctx->general_purpose_registers[PATCH_X86_64_R9]);
+	unw_set_reg(cur, UNW_X86_64_R10, (unw_word_t)ctx->general_purpose_registers[PATCH_X86_64_R10]);
+	unw_set_reg(cur, UNW_X86_64_R11, (unw_word_t)ctx->general_purpose_registers[PATCH_X86_64_R11]);
+	unw_set_reg(cur, UNW_X86_64_R12, (unw_word_t)ctx->general_purpose_registers[PATCH_X86_64_R12]);
+	unw_set_reg(cur, UNW_X86_64_R13, (unw_word_t)ctx->general_purpose_registers[PATCH_X86_64_R13]);
+	unw_set_reg(cur, UNW_X86_64_R14, (unw_word_t)ctx->general_purpose_registers[PATCH_X86_64_R14]);
+	unw_set_reg(cur, UNW_X86_64_R15, (unw_word_t)ctx->general_purpose_registers[PATCH_X86_64_R15]);
 }
 
 void dw_backtrace(int fd, enum dw_backtrace_kind kind)
@@ -190,14 +181,14 @@ void dw_backtrace(int fd, enum dw_backtrace_kind kind)
 	}
 
 	// Print APP backtrace from libpatch probe context
-	if (kind == DW_BT_APP && bt_patch_seed.valid) {
+	if (kind == DW_BT_APP && bt_patch_seed_ctx != NULL) {
 		unw_context_t uc;
 		unw_getcontext(&uc);
 		if (unw_init_local(&cur, &uc) < 0)
 			return;
 
 		// Reconstruct cursor from saved registers
-		dw_set_cursor_from_patch_seed(&cur);
+		dw_set_cursor_from_patch_seed(&cur, bt_patch_seed_ctx);
 
 		if (!dw_self_fbase()) {
 			dw_unwind_print(fd, &cur, 0);
