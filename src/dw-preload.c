@@ -105,6 +105,16 @@ static inline void step_state_clear(void)
 	step_state.nb_regs = 0;
 }
 
+static bool step_state_needs_reprotect(void)
+{
+	for (size_t i = 0; i < step_state.nb_regs; i++) {
+		if (step_state.regs[i].should_reprotect)
+			return true;
+	}
+
+	return false;
+}
+
 static void step_state_add_reg(int ucontext_index, uintptr_t taint, bool should_reprotect)
 {
 	for (size_t i = 0; i < step_state.nb_regs; i++) {
@@ -126,7 +136,8 @@ static void step_state_add_reg(int ucontext_index, uintptr_t taint, bool should_
 /*
  * Prepare single-step processing for a patch-disabled faulting instruction.
  * We unprotect tainted registers in the signal ucontext, remember their
- * original tainted values for later reprotection in signal_trap(), and arm TF.
+ * original tainted values for later reprotection in signal_trap(), and arm TF
+ * only when at least one register needs to be reprotected after the instruction.
  */
 static bool prepare_patch_disabled_step(const struct insn_entry *entry, ucontext_t *uctx)
 {
@@ -195,6 +206,16 @@ static bool prepare_patch_disabled_step(const struct insn_entry *entry, ucontext
 
 	if (step_state.nb_regs == 0)
 		return false;
+
+	/*
+	 * If every tainted base/index register is overwritten by the instruction,
+	 * executing it with untainted operands is enough. The single-step trap would
+	 * only clear state and return without reprotecting anything.
+	 */
+	if (!step_state_needs_reprotect()) {
+		step_state_clear();
+		return true;
+	}
 
 	step_state.active = true;
 	uctx->uc_mcontext.gregs[REG_EFL] |= (greg_t)DW_EFLAGS_TF;
