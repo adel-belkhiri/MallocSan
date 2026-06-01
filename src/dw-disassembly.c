@@ -1052,7 +1052,24 @@ static bool dw_populate_instruction_entry(instruction_table *table, struct insn_
 			   entry->insn);
 
 	bool all_tainted_overwritten = true;
+	bool has_compound = false;
 	for (int i = 0; i < entry->nb_arg_m; i++) {
+		/*
+		 * Detect compound (strength-reduced) SIB taint, where the protected
+		 * object-id is carried by the aggregate base+index*scale+disp rather
+		 * than a single register. Such instructions need their base restored in
+		 * the post handler, so the post handler must stay enabled and the
+		 * reprotection must not be deferred.
+		 */
+		if (dw_sib_base_carries_compound_taint(
+			    entry_rt.arg_m[i].base_addr, entry_rt.arg_m[i].index_addr,
+			    entry->arg_m[i].scale, entry->arg_m[i].displacement,
+			    entry_rt.arg_m[i].base_taint != 0,
+			    entry_rt.arg_m[i].index_taint != 0)) {
+			need_immediate_reprotection = true;
+			has_compound = true;
+		}
+
 		if (!base_index_overwritten(cs->insn, entry, &entry_rt, i)) {
 			// If the base or index register is not fully overwritten and corresponds to
 			// a register argument, it must be immediately re-tainted.
@@ -1083,7 +1100,8 @@ static bool dw_populate_instruction_entry(instruction_table *table, struct insn_
 	}
 
 	// If all tainted registers are overwritten by the instruction, there is no point in installing a post handler
-	if (all_tainted_overwritten) {
+	// (unless the base carries compound taint and must be restored afterwards).
+	if (all_tainted_overwritten && !has_compound) {
 		entry->post_handler = false;
 
 		DW_LOG(DEBUG, DISASSEMBLY,
@@ -1359,7 +1377,7 @@ static void check_vsib_access(struct memory_arg *mem, struct memory_arg_runtime 
 
 static void check_sib_access(struct memory_arg *mem, struct memory_arg_runtime* mem_rt,
 					uintptr_t valueb, unsigned idx, bool repeat,
-					struct patch_exec_context *ctx)
+					struct patch_exec_context *ctx, bool can_restore_base)
 {
 	bool index_is_protected, base_is_protected;
 	uintptr_t valuei = 0, valuei_clean = 0, addr;
@@ -1369,6 +1387,8 @@ static void check_sib_access(struct memory_arg *mem, struct memory_arg_runtime* 
 	mem_rt->index_addr = 0;
 	mem_rt->saved_address = 0;
 	mem_rt->saved_value = 0;
+	mem_rt->saved_base_value = 0;
+	mem_rt->restore_base = false;
 
 	index_is_protected = false;
 	base_is_protected = dw_is_protected((void *) valueb);
@@ -1389,6 +1409,45 @@ static void check_sib_access(struct memory_arg *mem, struct memory_arg_runtime* 
 
 		} else {
 			mem_rt->index_taint = 0;
+		}
+	}
+
+	/*
+	 * Compound taint: the protected object-id is carried by the aggregate
+	 * base + index*scale + disp, not by a single register. The base holds a
+	 * scaled taint residue whose MSB is set, so dw_is_protected() rejects it
+	 * and only the index gets untainted above. Left alone, the out-of-line
+	 * instruction copy would refault on a noncanonical effective address.
+	 *
+	 * Rewrite the base to an execution value so the executed EA equals the
+	 * clean target, and remember to restore the original (tainted) base in
+	 * the post handler. Detection is self-certifying: an unrelated base will
+	 * not make the aggregate resolve to a live object-id.
+	 */
+	if (dw_sib_base_carries_compound_taint(valueb, valuei, mem->scale,
+					       mem->displacement, base_is_protected,
+					       index_is_protected)) {
+		const struct reg_entry *reb = mem->base_re;
+		if (reb != NULL && mem->base != X86_REG_INVALID) {
+			uintptr_t valueb_exec = dw_sib_compound_base_exec(
+				valueb, valuei, valuei_clean, mem->scale, mem->displacement);
+			dw_set_register(ctx, reb->libpatch_index, valueb_exec);
+
+			/*
+			 * Restore the original (tainted) base after the access, unless the
+			 * instruction overwrites the base register itself - in that case the
+			 * instruction's result is the live value and must be kept.
+			 */
+			if ((mem->base_access & CS_AC_WRITE) == 0) {
+				if (can_restore_base) {
+					mem_rt->saved_base_value = valueb;
+					mem_rt->restore_base = true;
+				} else {
+					DW_LOG(WARNING, DISASSEMBLY,
+					       "Compound SIB taint at mem arg %u but base cannot be "
+					       "restored (no post handler); register stays clean\n", idx);
+				}
+			}
 		}
 	}
 
@@ -1491,7 +1550,8 @@ void dw_unprotect_context(struct patch_exec_context *ctx)
 
 		// Handle the index register
 		if (mem->index == X86_REG_INVALID || reg_is_gpr(mem->index))
-			check_sib_access(mem, mem_rt, valueb, i, entry->repeat, ctx);
+			check_sib_access(mem, mem_rt, valueb, i, entry->repeat, ctx,
+					 entry->post_handler);
 		else if (reg_is_avx(mem->index))
 			check_vsib_access(mem, mem_rt, valueb, i, ctx->extended_states);
 		else
@@ -1638,6 +1698,20 @@ void dw_reprotect_context(struct patch_exec_context *ctx)
 			const void* valuei_new = (const void*) dw_get_register(ctx, re->libpatch_index);
 			dw_set_register(ctx, re->libpatch_index,
 					(uint64_t) dw_reprotect((void *) valuei_new, (void *) mem_rt->index_taint));
+		}
+
+		/*
+		 * Compound taint: the base was rewritten to an execution value in the
+		 * pre handler so the access would land on the clean target. Restore the
+		 * original (tainted) base value here. We restore the exact saved value
+		 * rather than re-deriving a taint, because the residue carried by the
+		 * base is not a simple object-id taint.
+		 */
+		if (mem_rt->restore_base) {
+			re = mem->base_re;
+			if (re != NULL && mem->base != X86_REG_INVALID)
+				dw_set_register(ctx, re->libpatch_index, mem_rt->saved_base_value);
+			mem_rt->restore_base = false;
 		}
 
 		/*

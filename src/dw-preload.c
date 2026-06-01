@@ -83,8 +83,13 @@ static bool forward_to_saved_handler(int sig, siginfo_t *info, void *uctx);
 
 struct step_reg {
 	int ucontext_index;
+	/* Normally the object-id taint to reapply after the step. For a
+	 * restore_exact entry this holds the verbatim value to write back. */
 	uintptr_t taint;
 	bool should_reprotect;
+	/* Compound-taint base: set the register to `taint` verbatim after the
+	 * step instead of deriving a taint via dw_reprotect(). */
+	bool restore_exact;
 };
 
 struct step_state {
@@ -108,7 +113,7 @@ static inline void step_state_clear(void)
 static bool step_state_needs_reprotect(void)
 {
 	for (size_t i = 0; i < step_state.nb_regs; i++) {
-		if (step_state.regs[i].should_reprotect)
+		if (step_state.regs[i].should_reprotect || step_state.regs[i].restore_exact)
 			return true;
 	}
 
@@ -131,6 +136,31 @@ static void step_state_add_reg(int ucontext_index, uintptr_t taint, bool should_
 
 	step_state.regs[step_state.nb_regs++] = (struct step_reg){
 		.ucontext_index = ucontext_index, .taint = taint, .should_reprotect = should_reprotect};
+}
+
+/*
+ * Register a base register that was rewritten to an execution value for a
+ * compound-taint SIB access. After the single step, its original (tainted)
+ * value must be restored verbatim rather than re-derived from an object-id.
+ */
+static void step_state_add_restore(int ucontext_index, uintptr_t exact_value)
+{
+	for (size_t i = 0; i < step_state.nb_regs; i++) {
+		if (step_state.regs[i].ucontext_index != ucontext_index)
+			continue;
+
+		step_state.regs[i].taint = exact_value;
+		step_state.regs[i].should_reprotect = true;
+		step_state.regs[i].restore_exact = true;
+		return;
+	}
+
+	if (step_state.nb_regs >= DW_STEP_MAX_REGS)
+		return;
+
+	step_state.regs[step_state.nb_regs++] = (struct step_reg){
+		.ucontext_index = ucontext_index, .taint = exact_value,
+		.should_reprotect = true, .restore_exact = true};
 }
 
 /*
@@ -183,6 +213,31 @@ static bool prepare_patch_disabled_step(const struct insn_entry *entry, ucontext
 			step_state_add_reg(re_index->ucontext_index, valuei, reprotect);
 			dw_set_register(uctx, re_index->ucontext_index,
 							(uintptr_t)dw_unprotect((void *)valuei));
+		}
+
+		/*
+		 * Compound taint: the protected object-id is carried by the aggregate
+		 * base+index*scale+disp, not by a single register. Only the index was
+		 * untainted above; the base holds a scaled taint residue with its MSB
+		 * set. Rewrite the base to an execution value so the single-stepped
+		 * instruction lands on the clean target, and remember to restore the
+		 * original base verbatim after the step.
+		 */
+		if (re_base && re_base->ucontext_index >= 0 &&
+		    dw_sib_base_carries_compound_taint(valueb, valuei, mem->scale,
+						       mem->displacement, base_protected,
+						       index_protected)) {
+			uintptr_t valuei_clean = (uintptr_t)dw_unprotect((void *)valuei);
+			uintptr_t valueb_exec = dw_sib_compound_base_exec(
+				valueb, valuei, valuei_clean, mem->scale, mem->displacement);
+			dw_set_register(uctx, re_base->ucontext_index, valueb_exec);
+
+			/*
+			 * Restore the original (tainted) base after the step, unless the
+			 * instruction overwrites the base register itself.
+			 */
+			if ((mem->base_access & CS_AC_WRITE) == 0)
+				step_state_add_restore(re_base->ucontext_index, valueb);
 		}
 
 		if (base_protected || index_protected) {
@@ -535,6 +590,13 @@ static void signal_trap(int sig, siginfo_t *info, void *context)
 
 			for (size_t i = 0; i < step_state.nb_regs; i++) {
 				const struct step_reg *r = &step_state.regs[i];
+
+				/* Compound-taint base: restore the original value verbatim. */
+				if (r->restore_exact) {
+					dw_set_register(uctx, r->ucontext_index, r->taint);
+					continue;
+				}
+
 				if (!r->should_reprotect)
 					continue;
 

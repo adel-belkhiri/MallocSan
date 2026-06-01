@@ -10,6 +10,8 @@
 
 #include <libpatch/patch.h>
 
+#include "dw-protect.h"
+
 #define MAX_MEM_ARG 3
 #define MAX_REG_ARG 6
 #define MAX_MOD_REG 6
@@ -19,6 +21,72 @@
 #define DW_TAIL_CANDIDATE_BUDGET 2
 #define MAX_VSIB_INDEX_WIDTH 8  // 64 bits index
 #define MIN_VSIB_INDEX_WIDTH 4  // 32 bits index
+
+/*
+ * Effective address of a SIB memory operand:
+ *   EA = base + index * scale + displacement
+ * computed in 64-bit modular arithmetic, matching x86 address generation.
+ */
+static inline uintptr_t dw_sib_effective_address(uintptr_t base, uintptr_t index,
+						 int scale, int64_t disp)
+{
+	return base + index * (uint64_t)scale + (uint64_t)disp;
+}
+
+/*
+ * Detect a "compound taint" SIB operand.
+ *
+ * MallocSan normally finds the object-id taint inside a single base or index
+ * register. But strength-reduced address arithmetic can distribute the taint
+ * across several operands so that no single register is recognized as
+ * protected, while the *aggregate* effective address still carries exactly one
+ * valid object-id. The shape the compiler typically emits is:
+ *
+ *   index = P + c1               (recognized as protected)
+ *   base  = (1 - scale) * P + c2 (looks non-canonical/negative, NOT protected)
+ *   EA    = base + index*scale + disp  ==  P + offset  (protected)
+ *
+ * We detect it generically and coefficient-agnostically: the index is the
+ * protected operand, the base is not individually protected, scale > 1 (so the
+ * taint cannot be carried cleanly by the index alone), and the aggregate EA
+ * computed from the *original* register values resolves to a live object-id.
+ * The final dw_is_protected() check is self-certifying: an unrelated base value
+ * will not make the aggregate resolve to a live object-id.
+ *
+ * `base`/`index` are the original (pre-untaint) register values.
+ */
+static inline bool dw_sib_base_carries_compound_taint(uintptr_t base, uintptr_t index,
+						      int scale, int64_t disp,
+						      bool base_protected,
+						      bool index_protected)
+{
+	if (base_protected || !index_protected || scale <= 1)
+		return false;
+
+	return dw_is_protected((void *)dw_sib_effective_address(base, index, scale, disp));
+}
+
+/*
+ * Value to load into the base register before executing a compound-taint SIB
+ * instruction so that the executed effective address equals the clean target.
+ *
+ * Solved coefficient-agnostically from the aggregate, absorbing all residual
+ * taint into the base:
+ *   EA_clean  = dw_unprotect(base + index*scale + disp)
+ *   base_exec = EA_clean - index_clean*scale - disp
+ *
+ * `base`/`index` are the original (pre-untaint) values; `index_clean` is the
+ * value the index register will hold at execution time.
+ */
+static inline uintptr_t dw_sib_compound_base_exec(uintptr_t base, uintptr_t index,
+						  uintptr_t index_clean,
+						  int scale, int64_t disp)
+{
+	uintptr_t ea = dw_sib_effective_address(base, index, scale, disp);
+	uintptr_t ea_clean = (uintptr_t)dw_unprotect((void *)ea);
+
+	return ea_clean - index_clean * (uint64_t)scale - (uint64_t)disp;
+}
 
 
 enum dw_strategies {DW_PATCH_TRAP=0, DW_PATCH_JUMP, DW_PATCH_MIXED, DW_PATCH_UNKNOWN};
@@ -106,6 +174,16 @@ struct memory_arg_runtime {
 			 * in the unprotect handler. We thus save the address and the value.
 			 */
 			uintptr_t saved_address, saved_value;
+			/*
+			 * Compound-taint compensation (strength-reduced SIB): when the
+			 * taint is carried by the aggregate base+index*scale+disp rather
+			 * than a single register, the base is rewritten to an execution
+			 * value before the access and must be restored to its original
+			 * (still-tainted) value afterwards. saved_base_value holds the
+			 * original base; restore_base flags that the restore is pending.
+			 */
+			uintptr_t saved_base_value;
+			bool restore_base;
 		};
 		//VSIB:
 		struct {
