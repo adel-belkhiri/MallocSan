@@ -1558,7 +1558,8 @@ DW_INTERNAL void dw_unprotect_context(struct patch_exec_context *ctx)
 			DW_LOG(ERROR, DISASSEMBLY, "Invalid index register %u for mem arg %u\n", mem->index, i);
 	}
 
-	atomic_fetch_add_explicit(&entry->hit_count, 1, memory_order_relaxed);
+	if (unlikely(dw_stats_enabled))
+		atomic_fetch_add_explicit(&entry->hit_count, 1, memory_order_relaxed);
 
 	if (unlikely(dw_check_handling)) {
 			DW_LOG(DEBUG, DISASSEMBLY, "-- After unprotecting instruction 0x%llx\n", entry->insn);

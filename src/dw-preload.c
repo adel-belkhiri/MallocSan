@@ -656,7 +656,8 @@ void signal_protected(int sig, siginfo_t *info, void *context)
 	 * going through the trampoline, avoiding early TRAP_TRACE in trampoline code.
 	 */
 	if (entry && entry->patch_disabled) {
-		atomic_fetch_add_explicit(&entry->hit_count, 1, memory_order_relaxed);
+		if (unlikely(dw_stats_enabled))
+			atomic_fetch_add_explicit(&entry->hit_count, 1, memory_order_relaxed);
 
 		if (prepare_patch_disabled_step(entry, uctx)) {
 			dw_protect_active = save_active;
@@ -718,9 +719,10 @@ static bool dump_memory_map = false;
 /* Verbosity of messages */
 static enum dw_log_level log_level = 0;
 
+DW_INTERNAL bool dw_stats_enabled = false;
+
 /*
- * Generate a statistics file with instructions hits
- * static char *stats_file = NULL;
+ * Generate a statistics file with instruction hits when stats are enabled.
  */
 static char *stats_file = ".taintstats.txt";
 
@@ -751,6 +753,9 @@ dw_init()
 
 	arg = getenv("DW_STATS_FILE");
 	if (arg != NULL) stats_file = arg;
+
+	arg = getenv("DW_STATS_ENABLED");
+	if (arg != NULL && atoi(arg) != 0) dw_stats_enabled = true;
 
 	arg = getenv("DW_CHECK_HANDLING");
 	if (arg != NULL && atoi(arg) == 1) { check_handling = true; dw_set_check_handling(check_handling); }
@@ -789,7 +794,8 @@ dw_init()
 		"============================================================\n",
 		min_protect_size, max_protect_size, first_protected, max_nb_protected,
 		nb_insn_olx_entries, strategy_name(dw_strategy), check_handling ? "enabled" : "disabled",
-		log_level, dump_memory_map ? "enabled" : "disabled", stats_file);
+		log_level, dump_memory_map ? "enabled" : "disabled",
+		dw_stats_enabled ? stats_file : "disabled");
 	}
 
 	// Initialise the different modules
@@ -851,7 +857,7 @@ dw_init()
 extern void __attribute__((destructor)) dw_fini()
 {
 	// Generate a statistics file
-	if (stats_file != NULL) {
+	if (dw_stats_enabled) {
 		int fd = open(stats_file, O_WRONLY | O_CREAT | O_TRUNC,
 				S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 		if (fd < 0)

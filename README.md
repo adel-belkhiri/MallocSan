@@ -70,6 +70,7 @@ The following environment variables control pointer tainting and library's opera
 | `DW_LOG_LEVEL`        | Log verbosity: `0` = silent, `4` = debug (errors, warnings, info, debug).                          |
 | `DW_DUMP_MEMORY_MAP`  | Dump `/proc/self/maps` once at warning and error logging levels (`1` = on, default = `0`).   |
 | `DW_STATS_FILE`       | Output file for patching statistics (default: `.taintstats.txt`).                                  |
+| `DW_STATS_ENABLED`    | Set to a nonzero value to enable statistics file generation (default: `0`).                        |
 | `DW_CHECK_HANDLING`   | Enable extra consistency checks (`1` = on, default = `0`).                                         |
 | `DW_SHOW_BANNER`      | Show MallocSan banner printed at startup (`1` = show, default = `0`).                              |
 

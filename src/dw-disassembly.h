@@ -22,6 +22,8 @@
 #define MAX_VSIB_INDEX_WIDTH 8  // 64 bits index
 #define MIN_VSIB_INDEX_WIDTH 4  // 32 bits index
 
+DW_INTERNAL extern bool dw_stats_enabled;
+
 /*
  * Effective address of a SIB memory operand:
  *   EA = base + index * scale + displacement
