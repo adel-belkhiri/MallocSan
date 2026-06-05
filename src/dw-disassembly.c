@@ -1265,8 +1265,10 @@ done:
 	*out_bits = bits;
 }
 
-static void check_vsib_access(struct memory_arg *mem, struct memory_arg_runtime *mem_rt,
-					    uintptr_t valueb, unsigned idx, void *xsave_ptr)
+static void check_vsib_access(struct memory_arg *mem,
+							  struct memory_arg_runtime *mem_rt,
+							  uintptr_t valueb, unsigned idx, void *xsave_ptr,
+							  struct patch_exec_context *ctx)
 {
 	uint8_t width, count;
 	uint8_t index_buffer[64] = {0}; /* ZMM registers are 64 bytes */
@@ -1349,7 +1351,7 @@ static void check_vsib_access(struct memory_arg *mem, struct memory_arg_runtime 
 		/* Check whether the access is valid for each enabled lane. */
 		if (mem_rt->mask_bv & (1ull << i)) {
 			uintptr_t addr = valueb + valuei * mem->scale + mem->displacement;
-			dw_check_access((void *) addr, mem->length);
+			dw_check_access_ctx((void *) addr, mem->length, ctx);
 		}
 
 		/* If the index width is 8 bytes, it might be a protected absolute address. */
@@ -1373,7 +1375,6 @@ static void check_vsib_access(struct memory_arg *mem, struct memory_arg_runtime 
 				   index_re->name, bytes_count, index_size);
 	}
 }
-
 
 static void check_sib_access(struct memory_arg *mem, struct memory_arg_runtime* mem_rt,
 					uintptr_t valueb, unsigned idx, bool repeat,
@@ -1460,9 +1461,9 @@ static void check_sib_access(struct memory_arg *mem, struct memory_arg_runtime* 
 	// Check if the access is valid, and use the repeat count if present.
 	if (repeat) {
 		size_t count = dw_get_register(ctx, dw_get_reg_entry(X86_REG_RCX)->libpatch_index);
-		dw_check_access((void *) addr, mem->length * count);
+		dw_check_access_ctx((void *) addr, mem->length * count, ctx);
 	} else {
-		dw_check_access((void *) addr, mem->length);
+		dw_check_access_ctx((void *) addr, mem->length, ctx);
 	}
 
 	/*
@@ -1506,8 +1507,6 @@ void dw_unprotect_context(struct patch_exec_context *ctx)
 	unsigned regb;
 	uintptr_t valueb;
 	struct insn_entry_runtime rt_slot, *rt_slot_p;
-
-	dw_bt_seed_patch_set(ctx);
 
 	if (dw_check_handling) {
 		DW_LOG(DEBUG, DISASSEMBLY, "(-) Before unprotecting instruction 0x%llx: %s\n",
@@ -1553,7 +1552,7 @@ void dw_unprotect_context(struct patch_exec_context *ctx)
 			check_sib_access(mem, mem_rt, valueb, i, entry->repeat, ctx,
 					 entry->post_handler);
 		else if (reg_is_avx(mem->index))
-			check_vsib_access(mem, mem_rt, valueb, i, ctx->extended_states);
+			check_vsib_access(mem, mem_rt, valueb, i, ctx->extended_states, ctx);
 		else
 			DW_LOG(ERROR, DISASSEMBLY, "Invalid index register %u for mem arg %u\n", mem->index, i);
 	}
@@ -1568,9 +1567,6 @@ void dw_unprotect_context(struct patch_exec_context *ctx)
 				DW_LOG(DEBUG, DISASSEMBLY, "%s, %llx\n", re->name, ctx->general_purpose_registers[i]);
 			}
 	}
-
-	if (!entry->post_handler)
-		dw_bt_seed_patch_clear();
 }
 
 static void check_updated_regs (struct insn_entry *entry, struct insn_entry_runtime *entry_rt, struct patch_exec_context *ctx) {
@@ -1754,7 +1750,6 @@ void dw_reprotect_context(struct patch_exec_context *ctx)
 	}
 
 	dw_release_rt_slot(slot_idx);
-	dw_bt_seed_patch_clear();
 }
 
 /*

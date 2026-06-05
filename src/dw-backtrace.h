@@ -17,8 +17,23 @@ struct patch_exec_context;
 
 extern __thread void *bt_signal_seed __attribute__((tls_model("initial-exec")));
 
-void dw_bt_seed_patch_set(const struct patch_exec_context *ctx);
-void dw_bt_seed_patch_clear(void);
+/*
+ * Seed pointer used to reconstruct an application backtrace from a live
+ * libpatch exec context. It is set/cleared around the cold out-of-bounds
+ * report path, so keep the accessors as direct TLS stores with no PLT call.
+ */
+extern __thread const struct patch_exec_context *bt_patch_seed_ctx
+	__attribute__((tls_model("initial-exec")));
+
+static inline void dw_bt_seed_patch_set(const struct patch_exec_context *ctx)
+{
+	bt_patch_seed_ctx = ctx;
+}
+
+static inline void dw_bt_seed_patch_clear(void)
+{
+	bt_patch_seed_ctx = NULL;
+}
 
 void dw_backtrace(int fd, enum dw_backtrace_kind kind);
 

@@ -28,19 +28,8 @@ __thread void *bt_signal_seed __attribute__((tls_model("initial-exec"))) = NULL;
  * patch_exec_context is still live, so we can keep a TLS pointer instead of
  * snapshotting all GPRs on every pre/post handler invocation.
  */
-static __thread const struct patch_exec_context *bt_patch_seed_ctx
+__thread const struct patch_exec_context *bt_patch_seed_ctx
 	__attribute__((tls_model("initial-exec"))) = NULL;
-
-
-void dw_bt_seed_patch_set(const struct patch_exec_context *ctx)
-{
-	bt_patch_seed_ctx = ctx;
-}
-
-void dw_bt_seed_patch_clear(void)
-{
-	bt_patch_seed_ctx = NULL;
-}
 
 /*
  * Get the base address of our shared object MallocSan

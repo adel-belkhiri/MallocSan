@@ -29,6 +29,18 @@ void dw_protect_init();
 /* Check that the pointer to the object is within bounds */
 bool dw_check_access(const void *ptr, size_t size);
 
+/*
+ * Same bounds check, but used on the patch-probe (handler) path. On a
+ * violation it makes the supplied probe context available to the APP backtrace
+ * so the report unwinds the application stack rather than libpatch internals.
+ * The seed is set only on the (rare) out-of-bounds path, so the in-bounds
+ * steady-state access pays no thread-local store. A NULL ctx behaves exactly
+ * like dw_check_access().
+ */
+struct patch_exec_context;
+bool dw_check_access_ctx(const void *ptr, size_t size,
+						 const struct patch_exec_context *ctx);
+
 /* Get the allocated size of a protected object */
 size_t dw_get_size(void *ptr);
 
