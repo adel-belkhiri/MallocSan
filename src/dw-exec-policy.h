@@ -9,6 +9,12 @@ bool dw_main_object_range_available(void);
 bool dw_addr_in_main_object(uintptr_t addr);
 
 void dw_exec_policy_init(void);
-bool dw_patch_disabled_for_addr(uintptr_t addr);
+
+/*
+ * Returns true when MallocSan should single-step the instruction instead of
+ * installing a patch.  For relocated libpatch OLX instructions this returns
+ * false and stores the original patchable PC in patch_insn_out.
+ */
+bool dw_patch_disabled_for_addr(uintptr_t addr, uintptr_t *patch_insn_out);
 
 #endif /* DW_EXEC_POLICY_H */
