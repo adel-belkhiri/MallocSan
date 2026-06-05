@@ -118,7 +118,73 @@ void dw_protect_init()
 	atomic_store_explicit(&oids_head, oids_head_pack(1, 0), memory_order_release);
 }
 
-bool dw_check_access(const void *ptr, size_t size)
+static __attribute__((noinline))
+void dw_report_oob(unsigned oid, uintptr_t base, size_t sz,
+				   uintptr_t real_addr, size_t size, void *alloc_ip,
+				   const struct patch_exec_context *seed_ctx)
+{
+	/* Get the symbol of the function where the object was allocated */
+	char proc_name[256];
+	char *proc_name_p = proc_name;
+	uint64_t offset = 0;
+	struct func_cache_entry *e = func_cache_lookup((uintptr_t)alloc_ip);
+	if (!e) {
+		uintptr_t start, end;
+		dw_lookup_symbol((uintptr_t)alloc_ip, proc_name, sizeof(proc_name), &start, &end);
+		if (start != 0 && end > start)
+			e = func_cache_insert(start, end, proc_name);
+	}
+
+	if (e) {
+		proc_name_p = e->func_name;
+		offset = (uintptr_t)alloc_ip - e->start_ip;
+	}
+
+	uintptr_t alloc_end  = base + sz;
+	uintptr_t access_end = real_addr + size;
+	size_t diff_bytes = 0;
+	const char *viol_kind = (real_addr < base) ? "underflows allocation" : "overflows allocation";
+
+	if (real_addr < base) {
+		diff_bytes = (size_t)(base - real_addr);
+	} else if (access_end > alloc_end) {
+		diff_bytes = (size_t)(access_end - alloc_end);
+	}
+
+	/*
+	 * Make the probe context available to the APP backtrace only here,
+	 * on the cold violation path. The steady-state in-bounds path never
+	 * touches this thread-local. A NULL seed_ctx (wrapper/signal callers)
+	 * leaves the existing backtrace behavior untouched.
+	 */
+	if (seed_ctx)
+		dw_bt_seed_patch_set(seed_ctx);
+
+	DW_LOG_APP(WARNING, PROTECT,
+			"Out-of-bounds access detected (oid=%u)\n"
+			"  Allocation:\n"
+			"    base   = 0x%llx\n"
+			"    size   = %zu bytes\n"
+			"    range  = [0x%llx..0x%llx)\n"
+			"    site   = (%s+0x%lx)\n"
+			"  Access:\n"
+			"    addr   = 0x%llx\n"
+			"    size   = %zu bytes\n"
+			"    range  = [0x%llx..0x%llx)\n"
+			"  Violation:\n"
+			"    %s by %zu bytes\n"
+			"  Backtrace:\n",
+			oid, (unsigned long long)base, (size_t)sz, (unsigned long long)base,
+			(unsigned long long)alloc_end, proc_name_p, offset,
+			(unsigned long long)real_addr, (size_t)size, (unsigned long long)real_addr,
+			(unsigned long long)access_end, viol_kind, diff_bytes);
+
+	if (seed_ctx)
+		dw_bt_seed_patch_clear();
+}
+
+bool dw_check_access_ctx(const void *ptr, size_t size,
+			 const struct patch_exec_context *seed_ctx)
 {
 	uintptr_t raw_addr = (uintptr_t)ptr;
 
@@ -149,58 +215,17 @@ invalid:
 
 	/* Check [real_addr, real_addr + size) ⊆ [base, base + sz). */
 	if (size > sz || real_addr < base || real_addr > base + sz - size) {
-		// Get the symbol of the function where the object was allocated
-		char proc_name[256];
-		char* proc_name_p = proc_name;
-		uint64_t offset = 0;
-		void *alloc_ip = oids[oid].alloc_ip;
-		struct func_cache_entry *e = func_cache_lookup((uintptr_t)alloc_ip);
-		if (!e) {
-			uintptr_t start, end;
-			dw_lookup_symbol((uintptr_t)alloc_ip, proc_name, sizeof(proc_name), &start, &end);
-			if (start != 0 && end > start)
-				e = func_cache_insert(start, end, proc_name);
-		}
-
-		if (e) {
-			proc_name_p = e->func_name;
-			offset = (uintptr_t)alloc_ip - e->start_ip;
-		}
-
-		uintptr_t alloc_end  = base + sz;
-		uintptr_t access_end = real_addr + size;
-		size_t diff_bytes = 0;
-		const char *viol_kind = (real_addr < base) ? "underflows allocation" : "overflows allocation";
-
-		if (real_addr < base) {
-			diff_bytes = (size_t)(base - real_addr);
-		} else if (access_end > alloc_end) {
-			diff_bytes = (size_t)(access_end - alloc_end);
-		}
-
-		DW_LOG_APP(WARNING, PROTECT,
-				"Out-of-bounds access detected (oid=%u)\n"
-				"  Allocation:\n"
-				"    base   = 0x%llx\n"
-				"    size   = %zu bytes\n"
-				"    range  = [0x%llx..0x%llx)\n"
-				"    site   = (%s+0x%lx)\n"
-				"  Access:\n"
-				"    addr   = 0x%llx\n"
-				"    size   = %zu bytes\n"
-				"    range  = [0x%llx..0x%llx)\n"
-				"  Violation:\n"
-				"    %s by %zu bytes\n"
-				"  Backtrace:\n",
-				oid, (unsigned long long)base, (size_t)sz, (unsigned long long)base,
-				(unsigned long long)alloc_end, proc_name_p, offset,
-				(unsigned long long)real_addr, (size_t)size, (unsigned long long)real_addr,
-				(unsigned long long)access_end, viol_kind, diff_bytes);
-
+		dw_report_oob(oid, base, sz, real_addr, size,
+			      oids[oid].alloc_ip, seed_ctx);
 		return false;
 	}
 
 	return true;
+}
+
+bool dw_check_access(const void *ptr, size_t size)
+{
+	return dw_check_access_ctx(ptr, size, NULL);
 }
 
 size_t dw_get_size(void *ptr)
