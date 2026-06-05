@@ -7,6 +7,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <libpatch/patch.h>
+
 #include "dw-exec-policy.h"
 #include "dw-log.h"
 
@@ -22,7 +24,6 @@ struct dw_exec_region {
 
 enum dw_exec_mapping_kind {
 	DW_EXEC_MAP_FILE_BACKED = 0,
-	DW_EXEC_MAP_LIBPATCH_GENERATED,
 	DW_EXEC_MAP_OTHER,
 };
 
@@ -131,13 +132,22 @@ bool dw_addr_in_main_object(uintptr_t addr)
 
 static enum dw_exec_mapping_kind classify_exec_mapping_path(const char *path)
 {
-	if (path != NULL && strstr(path, "memfd:libpatch:") != NULL)
-		return DW_EXEC_MAP_LIBPATCH_GENERATED;
-
 	if (path != NULL && path[0] == '/')
 		return DW_EXEC_MAP_FILE_BACKED;
 
 	return DW_EXEC_MAP_OTHER;
+}
+
+static bool find_olx_original_pc(uintptr_t addr, uintptr_t *patch_insn_out)
+{
+	uintptr_t patch_insn = 0;
+
+	if (patch_olx_original_pc(addr, &patch_insn) != PATCH_OK || patch_insn == 0)
+		return false;
+
+	if (patch_insn_out)
+		*patch_insn_out = patch_insn;
+	return true;
 }
 
 static void add_exec_mapping(uintptr_t start, uintptr_t end, enum dw_exec_mapping_kind kind)
@@ -239,14 +249,27 @@ void dw_exec_policy_init(void)
 	refresh_exec_mapping_cache();
 }
 
-bool dw_patch_disabled_for_addr(uintptr_t addr)
+bool dw_patch_disabled_for_addr(uintptr_t addr, uintptr_t *patch_insn_out)
 {
 	const struct dw_exec_mapping *mapping;
 
-	if (dw_main_object_range_available() && dw_addr_in_main_object(addr))
+	if (patch_insn_out)
+		*patch_insn_out = 0;
+
+	if (dw_addr_in_main_object(addr))
 		return false;
 
 	mapping = find_exec_mapping(addr);
+	if (mapping != NULL && mapping->kind == DW_EXEC_MAP_FILE_BACKED)
+		return false;
+
+	/*
+	 * libpatch may create OLX mappings after the /proc/self/maps cache was
+	 * built.  Ask libpatch directly before forcing a cache refresh.
+	 */
+	if (find_olx_original_pc(addr, patch_insn_out))
+		return false;
+
 	if (mapping == NULL) {
 		refresh_exec_mapping_cache();
 		mapping = find_exec_mapping(addr);

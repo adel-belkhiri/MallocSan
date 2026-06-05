@@ -238,6 +238,7 @@ struct insn_entry {
 	bool patch_disabled;
 	bool has_vsib;
 	uintptr_t insn;
+	uintptr_t patch_insn;
 	uintptr_t next_insn;
 	uintptr_t olx_buffer;
 	atomic_ulong hit_count;

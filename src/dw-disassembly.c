@@ -927,7 +927,8 @@ fill_instruction_operands(struct insn_entry *entry, struct insn_entry_runtime* e
  * information.
  */
 static bool dw_populate_instruction_entry(instruction_table *table, struct insn_entry *entry,
-					   uintptr_t fault, ucontext_t *uctx,
+					   uintptr_t fault, uintptr_t patch_insn,
+					   ucontext_t *uctx,
 					   struct post_safe_site_rb *safe_sites)
 {
 	size_t sizeds = 15; /* x86 max insn length */
@@ -945,6 +946,7 @@ static bool dw_populate_instruction_entry(instruction_table *table, struct insn_
 			   fault, error_code);
 
 	entry->insn = fault;
+	entry->patch_insn = patch_insn;
 	entry->insn_length = cs->insn->size;
 	entry->next_insn = insn_addr;
 	entry->post_handler = true;
@@ -990,6 +992,7 @@ static bool dw_populate_instruction_entry(instruction_table *table, struct insn_
 	cs_detail *detail = cs->insn->detail;
 	cs_x86 *x86 = &(detail->x86);
 	bool need_immediate_reprotection = false;
+	bool overlap_child = patch_insn != 0;
 
 	/*
 	 * For control flow instructions, we need to reapply the taint immediatly.
@@ -1113,6 +1116,9 @@ static bool dw_populate_instruction_entry(instruction_table *table, struct insn_
 	if (entry->repeat)
 		need_immediate_reprotection = true;
 
+	if (overlap_child)
+		need_immediate_reprotection = true;
+
 	/*
 	 * Scan forward from the faulting instruction to determine whether the post-handler can be
 	 * safely skipped or installed at a later instruction.
@@ -1146,7 +1152,16 @@ struct insn_entry *dw_create_instruction_entry(instruction_table *table, uintptr
 											   ucontext_t *uctx, bool *created_out,
 											   struct post_safe_site_rb *safe_sites_out)
 {
-	const bool patch_disabled = dw_patch_disabled_for_addr(fault);
+	uintptr_t overlap_patch_insn = 0;
+	const bool patch_disabled = dw_patch_disabled_for_addr(fault, &overlap_patch_insn);
+	const bool overlap_child = overlap_patch_insn != 0;
+
+	if (overlap_child) {
+		DW_LOG(DEBUG, DISASSEMBLY,
+		       "Instruction 0x%llx is relocated in OLX from original 0x%llx; "
+		       "attempting overlapping patch\n",
+		       (unsigned long long)fault, (unsigned long long)overlap_patch_insn);
+	}
 
 	if (!patch_disabled && safe_sites_out == NULL) {
 		DW_LOG(WARNING, MAIN,
@@ -1180,7 +1195,9 @@ struct insn_entry *dw_create_instruction_entry(instruction_table *table, uintptr
 				e->patch_disabled = patch_disabled;
 				e->strategy = DW_PATCH_UNKNOWN;
 
-				bool ok = dw_populate_instruction_entry(table, e, fault, uctx, &safe_sites);
+				bool ok = dw_populate_instruction_entry(table, e, fault,
+									overlap_child ? overlap_patch_insn : 0,
+									uctx, &safe_sites);
 				if (!ok) {
 					atomic_store_explicit(&e->state, ENTRY_FAILED, memory_order_release);
 					DW_LOG(WARNING, MAIN, "Problem creating entry for instruction 0x%llx\n", fault);
@@ -1781,7 +1798,7 @@ void dw_print_instruction_entries(instruction_table *table, int fd)
 		if (atomic_load_explicit(&entry->state, memory_order_acquire) != ENTRY_READY)
 			continue;
 
-		fault = entry->insn;
+		fault = entry->patch_insn ? entry->patch_insn : entry->insn;
 		start = 0;
 		end = 0;
 		proc_name_p = proc_name;

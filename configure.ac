@@ -47,6 +47,23 @@ AS_IF([test "x$with_bundled_libpatch" = "xyes"], [
   PKG_CHECK_MODULES([LIBPATCH], [libpatch >= 1.7],
     [AC_SUBST([LIBPATCH_CFLAGS]) AC_SUBST([LIBPATCH_LIBS])],
     [AC_MSG_ERROR([libpatch not found. Install it or use --with-bundled-libpatch])])
+
+  save_CPPFLAGS="$CPPFLAGS"
+  save_LIBS="$LIBS"
+  CPPFLAGS="$CPPFLAGS $LIBPATCH_CFLAGS"
+  LIBS="$LIBS $LIBPATCH_LIBS"
+
+  AC_LINK_IFELSE(
+    [AC_LANG_PROGRAM(
+      [[#include <stdint.h>
+        #include <libpatch/patch.h>]],
+      [[uintptr_t original_pc = 0;
+        return patch_olx_original_pc((uintptr_t)0, &original_pc) != PATCH_OK;]])],
+    [],
+    [AC_MSG_ERROR([libpatch is missing patch_olx_original_pc; use adel-belkhiri/libpatch x86_64-probe-performance commit 8f296d7/e01eaf0 or newer])])
+
+  CPPFLAGS="$save_CPPFLAGS"
+  LIBS="$save_LIBS"
 ])
 
 dnl ----------------------------------------------------------------------

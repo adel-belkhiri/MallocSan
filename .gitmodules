@@ -3,4 +3,5 @@
 	url = https://git.sr.ht/~old/libolx
 [submodule "external/libpatch"]
 	path = external/libpatch
-	url = https://git.sr.ht/~old/libpatch
+	url = https://github.com/adel-belkhiri/libpatch.git
+	branch = x86_64-probe-performance

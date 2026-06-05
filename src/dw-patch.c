@@ -88,7 +88,8 @@ static void check_patch(patch_status s, const char *msg)
 static void patch_handler(struct patch_exec_context *ctx, uint8_t post)
 {
 	struct insn_entry *entry = ctx->user_data;
-	if (post || ctx->program_counter != entry->insn)
+	uintptr_t patch_insn = entry->patch_insn ? entry->patch_insn : entry->insn;
+	if (post || ctx->program_counter != patch_insn)
 		dw_reprotect_context(ctx);
 	else
 		dw_unprotect_context(ctx);
@@ -105,7 +106,7 @@ static bool dw_instruction_entry_patch_strategy(struct insn_entry *entry,
 		.type = PATCH_LOCATION_ADDRESS,
 		.direction = PATCH_LOCATION_FORWARD,
 		.algorithm = PATCH_LOCATION_FIRST,
-		.address = entry->insn,
+		.address = entry->patch_insn ? entry->patch_insn : entry->insn,
 	};
 
 	struct patch_exec_model exec_model = {
@@ -167,13 +168,22 @@ static bool dw_instruction_entry_patch_strategy(struct insn_entry *entry,
 static enum dw_strategies do_patch(struct insn_entry *entry, bool deferred)
 {
 	const char *patch_type = deferred ? "deferred" : "initial";
-	uintptr_t patch_addr = deferred ? entry->next_insn : entry->insn;
+	uintptr_t patch_addr = deferred ? entry->next_insn :
+		(entry->patch_insn ? entry->patch_insn : entry->insn);
 	enum dw_strategies strategy = DW_PATCH_UNKNOWN;
 
 	if (dw_instruction_entry_patch_strategy(entry, DW_PATCH_JUMP, deferred))
 		strategy = DW_PATCH_JUMP;
 	else if (dw_instruction_entry_patch_strategy(entry, DW_PATCH_TRAP, deferred))
 		strategy = DW_PATCH_TRAP;
+	else if (entry->patch_insn)
+		/*
+		 * Overlapping patch for a relocated (OLX) instruction failed. This
+		 * is non-fatal: the caller falls back to single-stepping the OLX
+		 * instruction, so warn instead of aborting via ERROR.
+		 */
+		DW_LOG(WARNING, PATCH, "Patching %s location 0x%llx failed (origin 0x%llx).\n",
+			   patch_type, patch_addr, entry->insn);
 	else
 		DW_LOG(ERROR, PATCH, "Patching %s location 0x%llx failed (origin 0x%llx).\n",
 			   patch_type, patch_addr, entry->insn);
