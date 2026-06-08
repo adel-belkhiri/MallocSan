@@ -118,7 +118,7 @@ void dw_protect_init()
 	atomic_store_explicit(&oids_head, oids_head_pack(1, 0), memory_order_release);
 }
 
-static __attribute__((noinline))
+static DW_NOINLINE
 void dw_report_oob(unsigned oid, uintptr_t base, size_t sz,
 				   uintptr_t real_addr, size_t size, void *alloc_ip,
 				   const struct patch_exec_context *seed_ctx)
@@ -183,13 +183,13 @@ void dw_report_oob(unsigned oid, uintptr_t base, size_t sz,
 		dw_bt_seed_patch_clear();
 }
 
-bool dw_check_access_ctx(const void *ptr, size_t size,
-			 const struct patch_exec_context *seed_ctx)
+DW_INTERNAL bool dw_check_access_ctx(const void *ptr, size_t size,
+				     const struct patch_exec_context *seed_ctx)
 {
 	uintptr_t raw_addr = (uintptr_t)ptr;
 
 	/* Skip checking for pointers with MSB set */
-	if (raw_addr & (1ULL << 63))
+	if (unlikely(raw_addr & (1ULL << 63)))
 		return true;
 
 	unsigned oid = raw_addr >> 48;
@@ -199,11 +199,11 @@ bool dw_check_access_ctx(const void *ptr, size_t size,
 	if (oid == 0)
 		return true;
 
-	if (oid >= oids_size)
+	if (unlikely(oid >= oids_size))
 		goto invalid;
 
 	void *base_addr = atomic_load_explicit(&oids[oid].base_addr, memory_order_acquire);
-	if (base_addr == NULL) {
+	if (unlikely(base_addr == NULL)) {
 invalid:
 		DW_LOG(WARNING, PROTECT,
 			   "Invalid taint value %u for %p\n", oid, ptr);
@@ -214,7 +214,7 @@ invalid:
 	size_t sz = atomic_load_explicit(&oids[oid].size, memory_order_relaxed);
 
 	/* Check [real_addr, real_addr + size) ⊆ [base, base + sz). */
-	if (size > sz || real_addr < base || real_addr > base + sz - size) {
+	if (unlikely(size > sz || real_addr < base || real_addr > base + sz - size)) {
 		dw_report_oob(oid, base, sz, real_addr, size,
 			      oids[oid].alloc_ip, seed_ctx);
 		return false;
@@ -223,7 +223,7 @@ invalid:
 	return true;
 }
 
-bool dw_check_access(const void *ptr, size_t size)
+DW_INTERNAL bool dw_check_access(const void *ptr, size_t size)
 {
 	return dw_check_access_ctx(ptr, size, NULL);
 }
@@ -235,10 +235,10 @@ size_t dw_get_size(void *ptr)
 	if (oid == 0)
 		return malloc_usable_size(ptr);
 
-	if (oid > oids_size - 1)
+	if (unlikely(oid > oids_size - 1))
 		goto invalid;
 
-	if (atomic_load_explicit(&oids[oid].base_addr, memory_order_acquire) == NULL) {
+	if (unlikely(atomic_load_explicit(&oids[oid].base_addr, memory_order_acquire) == NULL)) {
 invalid:
 		DW_LOG(WARNING, PROTECT, "Invalid taint value %u for %p\n", oid, ptr);
 		return 0;
@@ -253,11 +253,11 @@ void* dw_get_base_addr(void *ptr)
 	if (oid == 0)
 		return 0;
 
-	if (oid > oids_size - 1)
+	if (unlikely(oid > oids_size - 1))
 		goto invalid;
 
 	void *base_addr = atomic_load_explicit(&oids[oid].base_addr, memory_order_acquire);
-	if (base_addr == NULL) {
+	if (unlikely(base_addr == NULL)) {
 invalid:
 		DW_LOG(WARNING, PROTECT, "Invalid taint value %u for %p\n", oid, ptr);
 		return 0;
@@ -271,7 +271,7 @@ invalid:
 static void *dw_protect(void *ptr, size_t size, void* caller)
 {
 	unsigned oid = dw_oid_alloc();
-	if (oid == 0) {
+	if (unlikely(oid == 0)) {
 		DW_LOG(WARNING, PROTECT, "OID table exhausted, cannot taint pointer %p\n", ptr);
 		return ptr;
 	}
@@ -289,12 +289,12 @@ static void *dw_protect(void *ptr, size_t size, void* caller)
 /*
  * Put back the taint on the modified (incremented) pointer.
  */
-inline void *dw_reprotect(const void *ptr, const void *old_ptr)
+DW_INTERNAL inline void *dw_reprotect(const void *ptr, const void *old_ptr)
 {
-	if (!ptr)
+	if (unlikely(!ptr))
 		return NULL;
 
-	if ((uintptr_t)old_ptr & (1ULL << 63)) /*MSB*/
+	if (unlikely((uintptr_t)old_ptr & (1ULL << 63))) /*MSB*/
 		return (void*) ptr;
 
 	uintptr_t taint_bits = (uintptr_t) old_ptr & taint_mask;
@@ -306,7 +306,8 @@ inline void *dw_reprotect(const void *ptr, const void *old_ptr)
 	// Decode tag
 	uintptr_t oid = taint_bits >> 48;
 
-	if (oid >= oids_size || atomic_load_explicit(&oids[oid].base_addr, memory_order_acquire) == NULL) {
+	if (unlikely(oid >= oids_size ||
+		     atomic_load_explicit(&oids[oid].base_addr, memory_order_acquire) == NULL)) {
 		DW_LOG(ERROR, PROTECT, "Invalid taint bits %p from old pointer %p\n", (void *)taint_bits, old_ptr);
 		return (void *)ptr;
 	}
@@ -315,43 +316,12 @@ inline void *dw_reprotect(const void *ptr, const void *old_ptr)
 }
 
 /*
- * Remove the taint or mprotect.
- */
-inline void *dw_unprotect(const void *ptr)
-{
-	if (!dw_is_protected(ptr))
-		return (void*) ptr;
-
-	return (void *) ((uintptr_t) ptr & untaint_mask);
-}
-
-
-inline bool dw_is_protected(const void *ptr)
-{
-	if (!ptr)
-		return false;
-
-	if ((uintptr_t)ptr & (1ULL << 63)) /*MSB*/
-		return false;
-
-	unsigned oid = (uintptr_t) ptr >> 48;
-	if (oid == 0)
-		return false;
-
-	// Case of dangling freed object
-	//if (oid >= oids_size || oids[oid].base_addr == 0)
-	//	return false;
-
-	return true;
-}
-
-/*
  * Alloc and return the tainted pointer.
  */
 void *dw_malloc_protect(size_t size, void* caller)
 {
 	void *result = __libc_malloc(size);
-	if (result != NULL)
+	if (likely(result != NULL))
 		result = dw_protect(result, size, caller);
 	return result;
 }
@@ -379,7 +349,7 @@ void dw_free_protect(void *ptr)
 void *dw_memalign_protect(size_t alignment, size_t size, void* caller)
 {
 	void *result = __libc_memalign(alignment, size);
-	if (result != NULL)
+	if (likely(result != NULL))
 		result = dw_protect(result, size, caller);
 	return result;
 }

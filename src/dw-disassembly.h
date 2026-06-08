@@ -27,8 +27,8 @@
  *   EA = base + index * scale + displacement
  * computed in 64-bit modular arithmetic, matching x86 address generation.
  */
-static inline uintptr_t dw_sib_effective_address(uintptr_t base, uintptr_t index,
-						 int scale, int64_t disp)
+static inline uintptr_t
+dw_sib_effective_address(uintptr_t base, uintptr_t index, int scale, int64_t disp)
 {
 	return base + index * (uint64_t)scale + (uint64_t)disp;
 }
@@ -55,10 +55,10 @@ static inline uintptr_t dw_sib_effective_address(uintptr_t base, uintptr_t index
  *
  * `base`/`index` are the original (pre-untaint) register values.
  */
-static inline bool dw_sib_base_carries_compound_taint(uintptr_t base, uintptr_t index,
-						      int scale, int64_t disp,
-						      bool base_protected,
-						      bool index_protected)
+static inline bool
+dw_sib_base_carries_compound_taint(uintptr_t base, uintptr_t index, int scale,
+				   int64_t disp, bool base_protected,
+				   bool index_protected)
 {
 	if (base_protected || !index_protected || scale <= 1)
 		return false;
@@ -78,8 +78,8 @@ static inline bool dw_sib_base_carries_compound_taint(uintptr_t base, uintptr_t 
  * `base`/`index` are the original (pre-untaint) values; `index_clean` is the
  * value the index register will hold at execution time.
  */
-static inline uintptr_t dw_sib_compound_base_exec(uintptr_t base, uintptr_t index,
-						  uintptr_t index_clean,
+static inline uintptr_t
+dw_sib_compound_base_exec(uintptr_t base, uintptr_t index, uintptr_t index_clean,
 						  int scale, int64_t disp)
 {
 	uintptr_t ea = dw_sib_effective_address(base, index, scale, disp);
@@ -267,10 +267,10 @@ struct insn_entry *dw_create_instruction_entry(instruction_table *table,
 		struct post_safe_site_rb *safe_sites_out);
 
 /* A potentially tainted pointer is accessed, unprotect it before the access */
-void dw_unprotect_context(struct patch_exec_context *ctx);
+DW_INTERNAL void dw_unprotect_context(struct patch_exec_context *ctx);
 
 /* A potentially tainted pointer was accessed, reprotect it after the access */
-void dw_reprotect_context(struct patch_exec_context *ctx);
+DW_INTERNAL void dw_reprotect_context(struct patch_exec_context *ctx);
 
 /* List all the instructions in the table along with their statistics */
 void dw_print_instruction_entries(instruction_table *table, int fd);

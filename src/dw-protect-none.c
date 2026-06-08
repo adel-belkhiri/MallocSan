@@ -21,7 +21,7 @@ void dw_protect_init()
 {
 }
 
-int dw_check_access(const void *ptr, size_t size)
+DW_INTERNAL bool dw_check_access(const void *ptr, size_t size)
 {
 	if (ptr == NULL)
 		DW_LOG(WARNING, PROTECT, "Null pointer access\n");
@@ -43,30 +43,9 @@ void *dw_protect(const void *ptr)
 /*
  * Put back the taint on the modified (incremented) pointer.
  */
-void *dw_reprotect(const void *ptr, const void *old_ptr)
+DW_INTERNAL void *dw_reprotect(const void *ptr, const void *old_ptr)
 {
 	return (void *) ((uintptr_t) ptr | ((uintptr_t) old_ptr & taint_mask));
-}
-
-/*
- * Remove the taint or mprotect.
- */
-void *dw_unprotect(const void *ptr)
-{
-	return (void *) ((uintptr_t) ptr & untaint_mask);
-}
-
-/*
- * For now insure that it is the taint that we put, and not corruption.
- */
-int dw_is_protected(const void *ptr)
-{
-	uintptr_t taint = (uintptr_t)ptr >> 48;
-	if(taint == 0) return 0;
-	if(taint == 1) return 1;
-
-	DW_LOG(WARNING, MAIN, "Taint should be 1, pointer %p\n", ptr);
-	return 1;
 }
 
 /*
