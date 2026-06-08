@@ -2,6 +2,8 @@ AM_CFLAGS   = -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-builtin -Wall -fPIC -O0
 AM_CPPFLAGS = $(AM_CFLAGS)
 
 lib_LTLIBRARIES = libmallocsan.la
+noinst_HEADERS = attributes.h
+
 libmallocsan_la_SOURCES = \
     dw-backtrace.c \
     dw-exec-policy.c \

@@ -15,6 +15,7 @@
 #include <capstone/capstone.h> /* CS_AC_* */
 #include <libpatch/tools.h>
 
+#include "attributes.h"
 #include "dw-cpuid.h"
 #include "dw-disassembly.h"
 #include "dw-exec-policy.h"
@@ -353,7 +354,7 @@ static void dw_init_xsave_state(void)
 	dw_xsave_enabled = 1;
 }
 
-__attribute__((noinline, used))
+DW_NOINLINE DW_USED
 static uintptr_t handle_seg_fault(struct trampoline_gpr_frame *frame)
 {
 	uintptr_t fault_rip = tramp_ctx.fault_rip;
@@ -726,7 +727,7 @@ static char *stats_file = ".taintstats.txt";
 /*
  * This is the initialisation function called at preload time
  */
-extern void __attribute__((constructor(65535)))
+extern void DW_CONSTRUCTOR(65535)
 dw_init()
 {
 	// Get the parameters passed as environment variables

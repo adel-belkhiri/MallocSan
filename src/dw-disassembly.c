@@ -1425,9 +1425,9 @@ static void check_sib_access(struct memory_arg *mem, struct memory_arg_runtime* 
 	 * the post handler. Detection is self-certifying: an unrelated base will
 	 * not make the aggregate resolve to a live object-id.
 	 */
-	if (dw_sib_base_carries_compound_taint(valueb, valuei, mem->scale,
-					       mem->displacement, base_is_protected,
-					       index_is_protected)) {
+	if (unlikely(dw_sib_base_carries_compound_taint(valueb, valuei, mem->scale,
+						   mem->displacement, base_is_protected,
+						   index_is_protected))) {
 		const struct reg_entry *reb = mem->base_re;
 		if (reb != NULL && mem->base != X86_REG_INVALID) {
 			uintptr_t valueb_exec = dw_sib_compound_base_exec(
@@ -1452,14 +1452,14 @@ static void check_sib_access(struct memory_arg *mem, struct memory_arg_runtime* 
 		}
 	}
 
-	if (!base_is_protected && !index_is_protected)
+	if (unlikely(!base_is_protected && !index_is_protected))
 		return;
 
 	// The effective address computed from tainted base and/or tainted index
 	addr = valueb + valuei * mem->scale + mem->displacement;
 
 	// Check if the access is valid, and use the repeat count if present.
-	if (repeat) {
+	if (unlikely(repeat)) {
 		size_t count = dw_get_register(ctx, dw_get_reg_entry(X86_REG_RCX)->libpatch_index);
 		dw_check_access_ctx((void *) addr, mem->length * count, ctx);
 	} else {
@@ -1482,8 +1482,9 @@ static void check_sib_access(struct memory_arg *mem, struct memory_arg_runtime* 
 	* - For a memory write, register write, not sure what to do. Not retaint the register but
 	* retaint memory?
 	*/
-	if ((mem->length == sizeof(uintptr_t)) &&
-	    ((mem->base_access && mem_rt->base_taint != 0) || (mem->index_access && mem_rt->index_taint != 0))) {
+	if (unlikely((mem->length == sizeof(uintptr_t)) &&
+				 ((mem->base_access && mem_rt->base_taint != 0) ||
+				  (mem->index_access && mem_rt->index_taint != 0)))) {
 
 		/* Saving memory address must be done in the pre-handler. e.g., mov rdi, qword ptr [rdi+0x10] */
 		uintptr_t valueb_clean = (uintptr_t) dw_unprotect((void *) valueb);
@@ -1499,7 +1500,7 @@ static void check_sib_access(struct memory_arg *mem, struct memory_arg_runtime* 
 	}
 }
 
-void dw_unprotect_context(struct patch_exec_context *ctx)
+DW_INTERNAL void dw_unprotect_context(struct patch_exec_context *ctx)
 {
 	struct insn_entry *entry = ctx->user_data;
 	struct memory_arg *mem;
@@ -1508,7 +1509,7 @@ void dw_unprotect_context(struct patch_exec_context *ctx)
 	uintptr_t valueb;
 	struct insn_entry_runtime rt_slot, *rt_slot_p;
 
-	if (dw_check_handling) {
+	if (unlikely(dw_check_handling)) {
 		DW_LOG(DEBUG, DISASSEMBLY, "(-) Before unprotecting instruction 0x%llx: %s\n",
 			    entry->insn, entry->disasm_insn);
 		dw_print_regs(ctx);
@@ -1516,7 +1517,7 @@ void dw_unprotect_context(struct patch_exec_context *ctx)
 
 	if (entry->post_handler) {
 		int rt_idx = 0;
-		if (!dw_acquire_runtime_slot(entry, &rt_idx))
+		if (unlikely(!dw_acquire_runtime_slot(entry, &rt_idx)))
 			DW_LOG(ERROR, DISASSEMBLY, "Problem getting a runtime slot for instruction 0x%llx\n", entry->insn);
 
 		rt_slot_p = &insn_rt_slots[rt_idx];
@@ -1559,7 +1560,7 @@ void dw_unprotect_context(struct patch_exec_context *ctx)
 
 	atomic_fetch_add_explicit(&entry->hit_count, 1, memory_order_relaxed);
 
-	if (dw_check_handling) {
+	if (unlikely(dw_check_handling)) {
 			DW_LOG(DEBUG, DISASSEMBLY, "-- After unprotecting instruction 0x%llx\n", entry->insn);
 			for (int i = 0; i < dw_nb_saved_registers; i++) {
 				struct reg_entry *re = dw_get_reg_entry(dw_saved_registers[i]);
@@ -1632,7 +1633,7 @@ static void check_updated_regs (struct insn_entry *entry, struct insn_entry_runt
  * in the pre handler. There are a few special cases when the same register is
  * used as a base or index to access the memory and as argument.
  */
-void dw_reprotect_context(struct patch_exec_context *ctx)
+DW_INTERNAL void dw_reprotect_context(struct patch_exec_context *ctx)
 {
 	struct insn_entry *entry = ctx->user_data;
 	struct memory_arg *mem;
@@ -1643,12 +1644,12 @@ void dw_reprotect_context(struct patch_exec_context *ctx)
 
 	/* If the runtime slot was not found, it means we jumped into an address between the
 	   pre- and post-handler. Therefore, we simply ignore the post-handler invocation */
-	if (!dw_find_runtime_slot(entry, &slot_idx))
+	if (unlikely(!dw_find_runtime_slot(entry, &slot_idx)))
 		return;
 
 	struct insn_entry_runtime *runtime_slot = &insn_rt_slots[slot_idx];
 
-	if (dw_check_handling) {
+	if (unlikely(dw_check_handling)) {
 		DW_LOG(DEBUG, DISASSEMBLY, "(+) Before reprotecting instruction 0x%llx: %s\n",
 				    entry->insn, entry->disasm_insn);
 		dw_print_regs(ctx);
@@ -1703,7 +1704,7 @@ void dw_reprotect_context(struct patch_exec_context *ctx)
 		 * rather than re-deriving a taint, because the residue carried by the
 		 * base is not a simple object-id taint.
 		 */
-		if (mem_rt->restore_base) {
+		if (unlikely(mem_rt->restore_base)) {
 			re = mem->base_re;
 			if (re != NULL && mem->base != X86_REG_INVALID)
 				dw_set_register(ctx, re->libpatch_index, mem_rt->saved_base_value);
@@ -1714,7 +1715,9 @@ void dw_reprotect_context(struct patch_exec_context *ctx)
 		* If the tainted register, base or index, was also a register argument, we have special
 		* cases to consider.
 		*/
-		if ((mem->length == sizeof(uintptr_t)) && ((mem->base_access && mem_rt->base_taint) || (mem->index_access && mem_rt->index_taint))) {
+		if (unlikely((mem->length == sizeof(uintptr_t)) &&
+					 ((mem->base_access && mem_rt->base_taint) ||
+					  (mem->index_access && mem_rt->index_taint)))) {
 			/*
 			* If the memory was read and the tainted register, base or index, was a read register
 			* argument, we presumably have a comparison. The memory value was untainted in
@@ -1743,7 +1746,7 @@ void dw_reprotect_context(struct patch_exec_context *ctx)
 		}
 	}
 
-	if (dw_check_handling) {
+	if (unlikely(dw_check_handling)) {
 		DW_LOG(DEBUG, DISASSEMBLY, "-- After reprotecting instruction 0x%llx: %s\n",
 			entry->insn, entry->disasm_insn);
 		dw_print_regs(ctx);
