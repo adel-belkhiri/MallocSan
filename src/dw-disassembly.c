@@ -1282,6 +1282,16 @@ done:
 	*out_bits = bits;
 }
 
+/*
+ * The functions below run as libpatch probe callbacks. The gated generic_handler
+ * skips the unconditional xmm0-7 save/restore for GPR-only probes, so these
+ * callbacks must never touch xmm registers (otherwise the application's live xmm
+ * state is silently corrupted across the probe). Force the compiler to emit no
+ * SSE here (it would otherwise vectorize the struct/array zeroing).
+ */
+#pragma GCC push_options
+#pragma GCC target("general-regs-only")
+
 static void check_vsib_access(struct memory_arg *mem,
 							  struct memory_arg_runtime *mem_rt,
 							  uintptr_t valueb, unsigned idx, void *xsave_ptr,
@@ -1443,8 +1453,8 @@ static void check_sib_access(struct memory_arg *mem, struct memory_arg_runtime* 
 	 * not make the aggregate resolve to a live object-id.
 	 */
 	if (unlikely(dw_sib_base_carries_compound_taint(valueb, valuei, mem->scale,
-						   mem->displacement, base_is_protected,
-						   index_is_protected))) {
+							   mem->displacement, base_is_protected,
+							   index_is_protected))) {
 		const struct reg_entry *reb = mem->base_re;
 		if (reb != NULL && mem->base != X86_REG_INVALID) {
 			uintptr_t valueb_exec = dw_sib_compound_base_exec(
@@ -1772,6 +1782,8 @@ DW_INTERNAL void dw_reprotect_context(struct patch_exec_context *ctx)
 
 	dw_release_rt_slot(slot_idx);
 }
+
+#pragma GCC pop_options
 
 /*
  * Print the content of the instruction table. Dump one row per instruction entry,

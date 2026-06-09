@@ -118,6 +118,14 @@ void dw_protect_init()
 	atomic_store_explicit(&oids_head, oids_head_pack(1, 0), memory_order_release);
 }
 
+/*
+ * Cold out-of-bounds report body. Compiled normally (SSE allowed): the symbol
+ * lookup and the formatted DW_LOG_APP both emit SSE. It is reached only through
+ * dw_report_oob_xmm_safe(), which brackets it with an explicit save/restore of
+ * the application's xmm0-7. Kept noinline so the general-regs-only wrapper never
+ * absorbs this SSE codegen (a target-attribute mismatch already prevents
+ * inlining; noinline makes the call boundary explicit and robust).
+ */
 static DW_NOINLINE
 void dw_report_oob(unsigned oid, uintptr_t base, size_t sz,
 				   uintptr_t real_addr, size_t size, void *alloc_ip,
@@ -183,6 +191,81 @@ void dw_report_oob(unsigned oid, uintptr_t base, size_t sz,
 		dw_bt_seed_patch_clear();
 }
 
+static DW_NOINLINE
+void dw_report_invalid_taint(unsigned oid, const void *ptr)
+{
+	DW_LOG(WARNING, PROTECT,
+	       "Invalid taint value %u for %p\n", oid, ptr);
+}
+
+/*
+ * xmm-preserving bracket for the cold OOB report path.
+ *
+ * The probe runs with libpatch's xmm0-7 save/restore skipped (the callback
+ * chain is declared SSE-free, TRAMPOLINE_SKIP_XMM), so the application's live
+ * xmm0-7 are still in the physical registers when we get here. dw_report_oob()
+ * emits SSE and would clobber them, so this wrapper explicitly stashes xmm0-7
+ * to a stack buffer and restores them around the call. Compiled
+ * general-regs-only so the compiler itself emits no SSE; the only xmm traffic
+ * is the explicit movdqu below (opaque to the target attribute, handled by the
+ * assembler). The %%xmm registers are intentionally NOT in a clobber list
+ * (which general-regs-only would reject); the "memory" clobber plus the
+ * volatile asm ordering is sufficient since nothing else reads them here.
+ */
+#pragma GCC push_options
+#pragma GCC target("general-regs-only")
+
+static inline DW_ALWAYS_INLINE void dw_save_xmm0_7(unsigned char *xmm)
+{
+	__asm__ __volatile__(
+		"movdqu %%xmm0, 0x00(%0)\n\t"
+		"movdqu %%xmm1, 0x10(%0)\n\t"
+		"movdqu %%xmm2, 0x20(%0)\n\t"
+		"movdqu %%xmm3, 0x30(%0)\n\t"
+		"movdqu %%xmm4, 0x40(%0)\n\t"
+		"movdqu %%xmm5, 0x50(%0)\n\t"
+		"movdqu %%xmm6, 0x60(%0)\n\t"
+		"movdqu %%xmm7, 0x70(%0)\n\t"
+		: : "r"(xmm) : "memory");
+}
+
+static inline DW_ALWAYS_INLINE void dw_restore_xmm0_7(unsigned char *xmm)
+{
+	__asm__ __volatile__(
+		"movdqu 0x00(%0), %%xmm0\n\t"
+		"movdqu 0x10(%0), %%xmm1\n\t"
+		"movdqu 0x20(%0), %%xmm2\n\t"
+		"movdqu 0x30(%0), %%xmm3\n\t"
+		"movdqu 0x40(%0), %%xmm4\n\t"
+		"movdqu 0x50(%0), %%xmm5\n\t"
+		"movdqu 0x60(%0), %%xmm6\n\t"
+		"movdqu 0x70(%0), %%xmm7\n\t"
+		: : "r"(xmm) : "memory");
+}
+
+static DW_NOINLINE
+void dw_report_oob_xmm_safe(unsigned oid, uintptr_t base, size_t sz,
+			    uintptr_t real_addr, size_t size, void *alloc_ip,
+			    const struct patch_exec_context *seed_ctx)
+{
+	unsigned char xmm[128] DW_ALIGNED(16);
+
+	dw_save_xmm0_7(xmm);
+	dw_report_oob(oid, base, sz, real_addr, size, alloc_ip, seed_ctx);
+	dw_restore_xmm0_7(xmm);
+}
+
+static DW_NOINLINE
+void dw_report_invalid_taint_xmm_safe(unsigned oid, const void *ptr)
+{
+	unsigned char xmm[128] DW_ALIGNED(16);
+
+	dw_save_xmm0_7(xmm);
+	dw_report_invalid_taint(oid, ptr);
+	dw_restore_xmm0_7(xmm);
+}
+#pragma GCC pop_options
+
 DW_INTERNAL bool dw_check_access_ctx(const void *ptr, size_t size,
 				     const struct patch_exec_context *seed_ctx)
 {
@@ -205,8 +288,7 @@ DW_INTERNAL bool dw_check_access_ctx(const void *ptr, size_t size,
 	void *base_addr = atomic_load_explicit(&oids[oid].base_addr, memory_order_acquire);
 	if (unlikely(base_addr == NULL)) {
 invalid:
-		DW_LOG(WARNING, PROTECT,
-			   "Invalid taint value %u for %p\n", oid, ptr);
+		dw_report_invalid_taint_xmm_safe(oid, ptr);
 		return false;
 	}
 
@@ -215,8 +297,15 @@ invalid:
 
 	/* Check [real_addr, real_addr + size) ⊆ [base, base + sz). */
 	if (unlikely(size > sz || real_addr < base || real_addr > base + sz - size)) {
-		dw_report_oob(oid, base, sz, real_addr, size,
-			      oids[oid].alloc_ip, seed_ctx);
+		/*
+		 * Cold violation path. Route through the xmm-preserving wrapper so
+		 * the SSE-emitting report body cannot corrupt the application's
+		 * live xmm0-7 (libpatch skipped saving them for this SSE-free
+		 * probe). dw_check_access_ctx itself stays xmm-clean: only integer
+		 * compares and this call.
+		 */
+		dw_report_oob_xmm_safe(oid, base, sz, real_addr, size,
+				       oids[oid].alloc_ip, seed_ctx);
 		return false;
 	}
 

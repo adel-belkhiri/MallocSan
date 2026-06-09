@@ -53,6 +53,11 @@ AS_IF([test "x$with_bundled_libpatch" = "xyes"], [
   CPPFLAGS="$CPPFLAGS $LIBPATCH_CFLAGS"
   LIBS="$LIBS $LIBPATCH_LIBS"
 
+  AC_CHECK_DECLS([PATCH_REGS_GP_ONLY],
+    [],
+    [AC_MSG_ERROR([libpatch is missing PATCH_REGS_GP_ONLY; use adel-belkhiri/libpatch x86_64-probe-performance commit 33d9016 or newer])],
+    [[#include <libpatch/patch.h>]])
+
   AC_LINK_IFELSE(
     [AC_LANG_PROGRAM(
       [[#include <stdint.h>

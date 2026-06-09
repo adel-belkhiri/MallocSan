@@ -113,7 +113,7 @@ static bool dw_instruction_entry_patch_strategy(struct insn_entry *entry,
 		.type = PATCH_EXEC_MODEL_PROBE,
 		.probe.read_registers = 0,
 		.probe.write_registers = 0,
-		.probe.clobber_registers = (1ULL << PATCH_ARCH_GREGS_COUNT) - 1,
+		.probe.clobber_registers = PATCH_REGS_GP_ONLY,
 		.probe.user_data = entry,
 		.probe.procedure = patch_handler,
 	};
