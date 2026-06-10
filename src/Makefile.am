@@ -28,7 +28,7 @@ libmallocsan_la_LIBADD = $(CAPSTONE_LIBS) $(UNWIND_LIBS)
 
 if BUNDLED_LIBPATCH
 # Ensure the external tree is built before we link.
-# libmallocsan_la_DEPENDENCIES = $(top_builddir)/libpatch.stamp
+libmallocsan_la_DEPENDENCIES = $(top_builddir)/libpatch.stamp
 
 # Headers and libs from the in-tree builds
 AM_CPPFLAGS += -I$(LIBOLX_SRC_DIR)/include -I$(LIBPATCH_SRC_DIR)/include
