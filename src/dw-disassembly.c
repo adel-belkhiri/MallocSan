@@ -372,6 +372,22 @@ static inline uint8_t vsib_index_width(x86_insn id)
 }
 
 /*
+ * REPE/REPNE CMPS/SCAS stop on a data condition, so the RCX prefix count is
+ * only an upper bound on the number of iterations (unlike REP MOVS/STOS, which
+ * always run exactly RCX times). Bounds checks must not assume the full count.
+ */
+static inline bool instruction_is_rep_conditional(unsigned id)
+{
+	switch (id) {
+	case X86_INS_CMPSB: case X86_INS_CMPSW: case X86_INS_CMPSD: case X86_INS_CMPSQ:
+	case X86_INS_SCASB: case X86_INS_SCASW: case X86_INS_SCASD: case X86_INS_SCASQ:
+		return true;
+	default:
+		return false;
+	}
+}
+
+/*
  * This function is used for deferring the post-handler. It checks if the memory
  * access is similar to the one in the entry. The base and index registers must
  * match, but the displacement, scale, and length can be different. In the latter
@@ -381,6 +397,20 @@ static bool similar_memory_access(unsigned int ins_id, const cs_x86_op *arg,
 		const struct memory_arg *m, const struct memory_arg_runtime *m_rt, ucontext_t *uctx, bool repeat)
 {
 	uintptr_t addr;
+
+	/*
+	 * Never defer across a REP-prefixed conditional scan (REPE/REPNE
+	 * CMPS/SCAS). Its extent is data-dependent (RCX is only an upper bound),
+	 * so it can only be validated by a post-execution extent check on its
+	 * own entry. If it were stepped over here, it would run with an
+	 * already-unprotected pointer and no post hook, reading past the object
+	 * undetected. Returning false stops the scan: the pointer is retainted
+	 * before this instruction, which then faults and is handled as its own
+	 * entry. (Checked before the addressing-mode test below, which would
+	 * otherwise wave it through via the fast path.)
+	 */
+	if (repeat && instruction_is_rep_conditional(ins_id))
+		return false;
 
 	/* Fast path: same addressing mode (base/index/scale/disp) and size. */
 	if (arg->mem.base != m->base || arg->mem.index != m->index)
@@ -414,16 +444,28 @@ static bool similar_memory_access(unsigned int ins_id, const cs_x86_op *arg,
 	 * SIB case: base + index * scale + disp.
 	 */
 	uintptr_t index_addr = (m->index != X86_REG_INVALID) ? m_rt->index_addr : 0;
-	size_t access_size = arg->size;
 
 	addr = m_rt->base_addr + index_addr * arg->mem.scale + arg->mem.disp;
 
+	uint64_t count = 0;
+	bool df = false;
 	if (repeat) {
-		size_t count = dw_get_register(uctx, dw_get_reg_entry(X86_REG_RCX)->ucontext_index);
-		access_size *= count;
+		count = dw_get_register(uctx, dw_get_reg_entry(X86_REG_RCX)->ucontext_index);
+		df = (uctx->uc_mcontext.gregs[REG_EFL] & DW_EFLAGS_DF) != 0;
 	}
 
-	return dw_check_access((void *) addr, access_size);
+	uintptr_t check_addr;
+	size_t check_size;
+	/* Conditional REP scans were already rejected above, so any repeat that
+	 * reaches here is unconditional (an exact RCX-count access). */
+	string_access_range(addr, arg->size, count, repeat, false, df,
+			       &check_addr, &check_size);
+
+	/* Size 0 (REP with RCX==0) means no access: trivially within bounds. */
+	if (check_size == 0)
+		return true;
+
+	return dw_check_access((void *) check_addr, check_size);
 }
 
 #define UNW_LOCAL_ONLY
@@ -1010,6 +1052,7 @@ static bool dw_populate_instruction_entry(instruction_table *table, struct insn_
 				(x86->prefix[0] == X86_PREFIX_REP ||
 				 x86->prefix[0] == X86_PREFIX_REPE ||
 				 x86->prefix[0] == X86_PREFIX_REPNE);
+	entry->repeat_conditional = entry->repeat && instruction_is_rep_conditional(cs->insn->id);
 
 	unsigned reg;
 	cs_regs regs_read, regs_write;
@@ -1104,7 +1147,13 @@ static bool dw_populate_instruction_entry(instruction_table *table, struct insn_
 
 	// If all tainted registers are overwritten by the instruction, there is no point in installing a post handler
 	// (unless the base carries compound taint and must be restored afterwards).
-	if (all_tainted_overwritten && !has_compound) {
+	//
+	// REP string instructions are excluded: Capstone reports RSI/RDI as written,
+	// but that is only the auto-advance - the pointers still reference the
+	// protected object and must be retainted by the post handler (see
+	// dw_reg_si_di), and conditional scans (REPE/REPNE CMPS/SCAS) additionally
+	// need the post handler for the exact post-execution extent check.
+	if (all_tainted_overwritten && !has_compound && !entry->repeat) {
 		entry->post_handler = false;
 
 		DW_LOG(DEBUG, DISASSEMBLY,
@@ -1405,6 +1454,7 @@ static void check_vsib_access(struct memory_arg *mem,
 
 static void check_sib_access(struct memory_arg *mem, struct memory_arg_runtime* mem_rt,
 					uintptr_t valueb, unsigned idx, bool repeat,
+					bool repeat_conditional,
 					struct patch_exec_context *ctx, bool can_restore_base)
 {
 	bool index_is_protected, base_is_protected;
@@ -1485,13 +1535,23 @@ static void check_sib_access(struct memory_arg *mem, struct memory_arg_runtime* 
 	// The effective address computed from tainted base and/or tainted index
 	addr = valueb + valuei * mem->scale + mem->displacement;
 
-	// Check if the access is valid, and use the repeat count if present.
+	// Check if the access is valid, honoring REP semantics (count, direction).
+	uint64_t count = 0;
+	bool df = false;
 	if (unlikely(repeat)) {
-		size_t count = dw_get_register(ctx, dw_get_reg_entry(X86_REG_RCX)->libpatch_index);
-		dw_check_access_ctx((void *) addr, mem->length * count, ctx);
-	} else {
-		dw_check_access_ctx((void *) addr, mem->length, ctx);
+		count = dw_get_register(ctx, dw_get_reg_entry(X86_REG_RCX)->libpatch_index);
+		/* libpatch stores the application RFLAGS in status_register. */
+		df = (ctx->status_register & DW_EFLAGS_DF) != 0;
 	}
+
+	uintptr_t check_addr;
+	size_t check_size;
+	string_access_range(addr, mem->length, count, repeat, repeat_conditional, df,
+			       &check_addr, &check_size);
+
+	/* Size 0 (REP with RCX==0) means no access: nothing to check. */
+	if (likely(check_size != 0))
+		dw_check_access_ctx((void *) check_addr, check_size, ctx);
 
 	/*
 	* We have a special case, the same register is used to access the memory and as argument.
@@ -1577,7 +1637,8 @@ DW_INTERNAL void dw_unprotect_context(struct patch_exec_context *ctx)
 
 		// Handle the index register
 		if (mem->index == X86_REG_INVALID || reg_is_gpr(mem->index))
-			check_sib_access(mem, mem_rt, valueb, i, entry->repeat, ctx,
+			check_sib_access(mem, mem_rt, valueb, i, entry->repeat,
+					 entry->repeat_conditional, ctx,
 					 entry->post_handler);
 		else if (reg_is_avx(mem->index))
 			check_vsib_access(mem, mem_rt, valueb, i, ctx->extended_states, ctx);
@@ -1687,6 +1748,28 @@ DW_INTERNAL void dw_reprotect_context(struct patch_exec_context *ctx)
 	for (int i = 0; i < entry->nb_arg_m; i++) {
 		mem = &(entry->arg_m[i]);
 		mem_rt = &runtime_slot->arg_m[i];
+
+		/*
+		 * Conditional REP scan (REPE/REPNE CMPS/SCAS): the pre handler could
+		 * vouch for the first element only, because RCX is just an upper
+		 * bound on the iteration count. Now that the scan has executed, the
+		 * advanced pointer register exposes its exact extent; validate it
+		 * while the register still holds the clean (not yet retainted) value.
+		 */
+		if (unlikely(entry->repeat_conditional) && mem_rt->base_taint &&
+		    mem->base_re != NULL) {
+			uintptr_t initial = (uintptr_t)dw_unprotect((void *)mem_rt->base_taint);
+			uintptr_t final = (uintptr_t)dw_unprotect(
+				(void *)dw_get_register(ctx, mem->base_re->libpatch_index));
+			uintptr_t scan_addr;
+			size_t scan_size;
+
+			if (string_scan_extent(initial, final, mem->length,
+						  &scan_addr, &scan_size))
+				dw_check_access_ctx(
+					dw_reprotect((void *)scan_addr, (void *)mem_rt->base_taint),
+					scan_size, ctx);
+		}
 
 		/*
 		 * The tainted register, base or index, is retainted unless the same register was also

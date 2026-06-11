@@ -91,6 +91,106 @@ dw_sib_compound_base_exec(uintptr_t base, uintptr_t index, uintptr_t index_clean
 }
 
 
+/* x86 RFLAGS direction flag: when set, string operations decrement RSI/RDI. */
+#define DW_EFLAGS_DF (1ULL << 10)
+
+/*
+ * Compute the memory range a (possibly REP-prefixed) string memory operand
+ * touches, for bounds checking. The result is written to *out_addr / *out_size.
+ *
+ *   addr        : effective address of the first element (current RSI/RDI)
+ *   length      : element size in bytes
+ *   count       : RCX iteration count (only consulted when repeat is set)
+ *   repeat      : the instruction carries a REP/REPE/REPNE prefix
+ *   conditional : REPE/REPNE CMPS/SCAS, where RCX is only an upper bound on the
+ *                 iteration count (the scan stops on a data condition)
+ *   df          : direction flag; when true the pointers decrement
+ */
+static inline void
+string_access_range(uintptr_t addr, size_t length, uint64_t count,
+				    bool repeat, bool conditional, bool df,
+				    uintptr_t *out_addr, size_t *out_size)
+{
+	/*
+	 * RCX == 0: a REP-prefixed instruction performs no memory access at
+	 * all (conditional or not). Callers must skip the bounds check when
+	 * the returned size is 0: the pointer may legally rest anywhere.
+	 */
+	if (repeat && count == 0) {
+		*out_addr = addr;
+		*out_size = 0;
+		return;
+	}
+
+	/*
+	 * Non-repeating access, or a data-terminated scan (REPE/REPNE
+	 * CMPS/SCAS): only the first element at `addr` is guaranteed to be
+	 * touched. For the conditional scans RCX is just an upper bound, so
+	 * multiplying by it would falsely flag strlen/strcmp-style loops whose
+	 * RCX is a large sentinel. The post handlers validate the full extent
+	 * of conditional scans after execution (string_scan_extent), when
+	 * the final pointer value is known.
+	 */
+	if (!repeat || conditional) {
+		*out_addr = addr;
+		*out_size = length;
+		return;
+	}
+
+	/*
+	 * Total span of the count elements, clamped so length*count cannot
+	 * overflow size_t. An overflowing count is necessarily out of bounds,
+	 * which the size check in dw_check_access then reports.
+	 */
+	size_t span;
+	if (length != 0 && count > (size_t)-1 / length)
+		span = (size_t)-1;
+	else
+		span = (size_t)(length * count);
+
+	/*
+	 * DF=1: pointers decrement. The elements touched are addr,
+	 * addr-length, ..., addr-length*(count-1); the lowest address is
+	 * addr-length*(count-1) and the range ends one element above addr.
+	 * When the span saturated, keep `addr` as the range start: the size
+	 * alone exceeds any object, and the subtraction would wrap to a
+	 * meaningless address that garbles the report.
+	 */
+	if (df && span != (size_t)-1)
+		*out_addr = addr - (span - length);
+	else
+		*out_addr = addr;
+	*out_size = span;
+}
+
+/*
+ * Exact post-execution range of a REP string scan, derived from the pointer
+ * register's value before (initial) and after (final) the instruction; both
+ * untainted. Hardware leaves the pointer one element past the last accessed
+ * element, in the scan direction, so the direction is inferred from the
+ * pointer movement and the caller does not need DF. Used for REPE/REPNE
+ * CMPS/SCAS, whose pre-execution extent is unknowable (RCX is only an upper
+ * bound). Returns false when no element was accessed (final == initial).
+ */
+static inline bool
+string_scan_extent(uintptr_t initial, uintptr_t final, size_t length,
+					  uintptr_t *out_addr, size_t *out_size)
+{
+	if (final == initial)
+		return false;
+
+	if (final > initial) {
+		/* DF=0: elements at initial .. final-length. */
+		*out_addr = initial;
+		*out_size = (size_t)(final - initial);
+	} else {
+		/* DF=1: elements at initial down to final+length. */
+		*out_addr = final + length;
+		*out_size = (size_t)(initial - final);
+	}
+	return true;
+}
+
 enum dw_strategies {DW_PATCH_TRAP=0, DW_PATCH_JUMP, DW_PATCH_MIXED, DW_PATCH_UNKNOWN};
 
 enum entry_state {ENTRY_EMPTY = 0, ENTRY_INITIALIZING /* one thread is creating this entry */, ENTRY_READY /* fully initialized */, ENTRY_FAILED /* creation failed, don't retry */};
@@ -233,6 +333,7 @@ struct insn_entry {
 	unsigned nb_arg_m;
 	unsigned nb_arg_r;
 	bool repeat;
+	bool repeat_conditional;
 	bool post_handler;
 	bool deferred_post_handler;
 	bool patch_disabled;

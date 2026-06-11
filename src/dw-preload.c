@@ -97,6 +97,9 @@ struct step_state {
 	bool active;
 	uintptr_t fault_rip;
 	bool repeat_insn;
+	/* Entry being stepped; consulted by the trap handler for the exact
+	 * post-execution extent check of conditional REP scans. */
+	const struct insn_entry *entry;
 	size_t nb_regs;
 	struct step_reg regs[DW_STEP_MAX_REGS];
 };
@@ -108,6 +111,7 @@ static inline void step_state_clear(void)
 	step_state.active = false;
 	step_state.fault_rip = 0;
 	step_state.repeat_insn = false;
+	step_state.entry = NULL;
 	step_state.nb_regs = 0;
 }
 
@@ -137,6 +141,49 @@ static void step_state_add_reg(int ucontext_index, uintptr_t taint, bool should_
 
 	step_state.regs[step_state.nb_regs++] = (struct step_reg){
 		.ucontext_index = ucontext_index, .taint = taint, .should_reprotect = should_reprotect};
+}
+
+/*
+ * Exact post-execution bounds check for a single-stepped conditional REP scan
+ * (REPE/REPNE CMPS/SCAS). The pre-step check could vouch for the first element
+ * only, because RCX is just an upper bound on the iteration count. After the
+ * step, the advanced RSI/RDI in the trap ucontext expose the exact extent;
+ * compare it against each tainted pointer operand saved in step_state (the
+ * registers are still clean at this point, before reprotection).
+ */
+static void step_check_conditional_extent(ucontext_t *uctx)
+{
+	const struct insn_entry *entry = step_state.entry;
+
+	if (!entry || !entry->repeat_conditional)
+		return;
+
+	for (unsigned i = 0; i < entry->nb_arg_m; i++) {
+		const struct memory_arg *mem = &entry->arg_m[i];
+
+		if (!mem->base_re || mem->base_re->ucontext_index < 0)
+			continue;
+
+		for (size_t j = 0; j < step_state.nb_regs; j++) {
+			const struct step_reg *r = &step_state.regs[j];
+
+			if (r->ucontext_index != mem->base_re->ucontext_index ||
+			    r->restore_exact || !r->should_reprotect)
+				continue;
+
+			uintptr_t initial = (uintptr_t)dw_unprotect((void *)r->taint);
+			uintptr_t final = (uintptr_t)dw_unprotect(
+				(void *)dw_get_register(uctx, r->ucontext_index));
+			uintptr_t scan_addr;
+			size_t scan_size;
+
+			if (string_scan_extent(initial, final, mem->length,
+						  &scan_addr, &scan_size))
+				dw_check_access(dw_reprotect((void *)scan_addr, (void *)r->taint),
+						scan_size);
+			break;
+		}
+	}
 }
 
 /*
@@ -178,6 +225,7 @@ static bool prepare_patch_disabled_step(const struct insn_entry *entry, ucontext
 
 	step_state.fault_rip = entry->insn;
 	step_state.repeat_insn = entry->repeat;
+	step_state.entry = entry;
 	size_t repeat_count = 1;
 
 	if (entry->repeat) {
@@ -243,20 +291,18 @@ static bool prepare_patch_disabled_step(const struct insn_entry *entry, ucontext
 
 		if (base_protected || index_protected) {
 			uintptr_t addr = valueb + valuei * mem->scale + mem->displacement;
-			size_t access_size = mem->length;
+			bool df = (uctx->uc_mcontext.gregs[REG_EFL] & DW_EFLAGS_DF) != 0;
+			uintptr_t check_addr;
+			size_t check_size;
 
-			if (entry->repeat) {
-				/* RCX==0 means REP does not perform any memory access. */
-				if (repeat_count == 0)
-					continue;
+			string_access_range(addr, mem->length,
+					       entry->repeat ? repeat_count : 0,
+					       entry->repeat, entry->repeat_conditional, df,
+					       &check_addr, &check_size);
 
-				if (mem->length > ((size_t)-1) / repeat_count)
-					access_size = (size_t)-1;
-				else
-					access_size = mem->length * repeat_count;
-			}
-
-			dw_check_access((void *)addr, access_size);
+			/* Size 0 (REP with RCX==0) means no access: nothing to check. */
+			if (check_size != 0)
+				dw_check_access((void *)check_addr, check_size);
 		}
 	}
 
@@ -597,6 +643,10 @@ static void signal_trap(int sig, siginfo_t *info, void *context)
 
 			/* Stop single-stepping first. */
 			uctx->uc_mcontext.gregs[REG_EFL] &= ~(greg_t)DW_EFLAGS_TF;
+
+			/* Validate the exact extent of conditional REP scans before
+			 * the pointer registers are retainted below. */
+			step_check_conditional_extent(uctx);
 
 			for (size_t i = 0; i < step_state.nb_regs; i++) {
 				const struct step_reg *r = &step_state.regs[i];
