@@ -18,11 +18,18 @@ struct dw_log_category {
 	int backtrace_level;
 };
 
-struct dw_log_category dw_log_categories[] = {{"protect", 1, ERROR, 1},
-											  {"disassembly", 1, ERROR, 1},
-											  {"main", 1, ERROR, 1},
-											  {"wrap", 1, ERROR, 1},
-											  {"patch", 1, ERROR, 1}};
+/*
+ * Indexed by enum dw_log_category_name. Use designated initializers so the
+ * names stay bound to the enum values and cannot drift out of order if the
+ * enum is reordered or extended.
+ */
+struct dw_log_category dw_log_categories[] = {
+	[PROTECT]     = {"protect", 1, ERROR, 1},
+	[DISASSEMBLY] = {"disassembly", 1, ERROR, 1},
+	[MAIN]        = {"main", 1, ERROR, 1},
+	[PATCH]       = {"patch", 1, ERROR, 1},
+	[WRAP]        = {"wrap", 1, ERROR, 1},
+};
 static bool dump_memory_map_enabled = false;
 
 inline unsigned string_copy(char *dest, char *src, size_t n)
@@ -63,9 +70,14 @@ static bool dw_log_v(enum dw_log_level level, enum dw_log_category_name topic,
 	nbc -= ret;
 	cursor += ret;
 
-	// Then write the user supplied format and arguments
+	// Then write the user supplied format and arguments.
+	// dw_vsnprintf returns the would-be length; on truncation only
+	// nbc - 1 characters (plus the NUL) were actually stored.
 	ret = dw_vsnprintf(cursor, nbc, fmt, args);
-	nbc -= ret;
+	if (ret < 0)
+		ret = 0;
+	else if ((unsigned)ret >= nbc)
+		ret = (int)(nbc - 1);
 	cursor += ret;
 	__write(2, buffer, cursor - buffer);
 
