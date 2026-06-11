@@ -497,9 +497,9 @@ static uintptr_t dw_defer_post_handler(struct insn_entry *entry,
 			"Cannot get function bounds for address 0x%llx, so we cancel post-handler deferring\n",
 			start_addr);
 		if (scanned_count)
-			scanned_count = 0;
+			*scanned_count = 0;
 		if (similar_access_count)
-			similar_access_count = 0;
+			*similar_access_count = 0;
 		return 0;
 	}
 

@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 
+#include <pthread.h>
 #include <stdbool.h>
 #include <link.h>
 #include <stddef.h>
@@ -39,6 +40,14 @@ static bool main_obj_range_ready = false;
 static struct dw_exec_mapping exec_mappings[DW_EXEC_MAPPING_MAX_REGIONS];
 static size_t exec_mapping_count = 0;
 static __thread int exec_mapping_last_idx = -1;
+/*
+ * Serializes lookups against the /proc/self/maps rebuild: the refresh resets
+ * exec_mapping_count and rewrites exec_mappings[] in place, so concurrent
+ * faulting threads would otherwise read a torn cache. Only taken on the cold
+ * instruction-entry creation path (trampoline context, never in a signal
+ * handler).
+ */
+static pthread_mutex_t exec_mapping_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static void add_main_object_exec_seg(uintptr_t start, uintptr_t end)
 {
@@ -174,7 +183,8 @@ static void add_exec_mapping(uintptr_t start, uintptr_t end, enum dw_exec_mappin
 		(struct dw_exec_mapping){.start = start, .end = end, .kind = kind};
 }
 
-static void refresh_exec_mapping_cache(void)
+/* Caller must hold exec_mapping_mu. */
+static void refresh_exec_mapping_cache_locked(void)
 {
 	FILE *maps;
 	char line[DW_EXEC_MAPPING_LINE_MAX];
@@ -222,9 +232,14 @@ static void refresh_exec_mapping_cache(void)
 	fclose(maps);
 }
 
-static const struct dw_exec_mapping *find_exec_mapping(uintptr_t addr)
+/* Caller must hold exec_mapping_mu. */
+static const struct dw_exec_mapping *find_exec_mapping_locked(uintptr_t addr)
 {
-	if (exec_mapping_last_idx >= 0) {
+	/*
+	 * The hint may predate a rebuild that shrank the cache, so it is only
+	 * trusted when it still points at a live entry.
+	 */
+	if (exec_mapping_last_idx >= 0 && (size_t)exec_mapping_last_idx < exec_mapping_count) {
 		const struct dw_exec_mapping *mapping = &exec_mappings[exec_mapping_last_idx];
 		if (addr >= mapping->start && addr < mapping->end)
 			return mapping;
@@ -243,15 +258,44 @@ static const struct dw_exec_mapping *find_exec_mapping(uintptr_t addr)
 	return NULL;
 }
 
+/*
+ * Thread-safe lookup. The kind is copied out under the lock because a
+ * concurrent refresh rewrites the array slots in place, so a returned
+ * pointer would not be safe to dereference after unlocking. When
+ * refresh_first is set, the cache is rebuilt from /proc/self/maps before
+ * the lookup (both under the same critical section).
+ */
+static bool find_exec_mapping_kind(uintptr_t addr, bool refresh_first,
+				   enum dw_exec_mapping_kind *kind_out)
+{
+	const struct dw_exec_mapping *mapping;
+	bool found = false;
+
+	(void)pthread_mutex_lock(&exec_mapping_mu);
+	if (refresh_first)
+		refresh_exec_mapping_cache_locked();
+	mapping = find_exec_mapping_locked(addr);
+	if (mapping != NULL) {
+		*kind_out = mapping->kind;
+		found = true;
+	}
+	(void)pthread_mutex_unlock(&exec_mapping_mu);
+
+	return found;
+}
+
 void dw_exec_policy_init(void)
 {
 	init_main_object_range();
-	refresh_exec_mapping_cache();
+	(void)pthread_mutex_lock(&exec_mapping_mu);
+	refresh_exec_mapping_cache_locked();
+	(void)pthread_mutex_unlock(&exec_mapping_mu);
 }
 
 bool dw_patch_disabled_for_addr(uintptr_t addr, uintptr_t *patch_insn_out)
 {
-	const struct dw_exec_mapping *mapping;
+	enum dw_exec_mapping_kind kind = DW_EXEC_MAP_OTHER;
+	bool found;
 
 	if (patch_insn_out)
 		*patch_insn_out = 0;
@@ -259,8 +303,8 @@ bool dw_patch_disabled_for_addr(uintptr_t addr, uintptr_t *patch_insn_out)
 	if (dw_addr_in_main_object(addr))
 		return false;
 
-	mapping = find_exec_mapping(addr);
-	if (mapping != NULL && mapping->kind == DW_EXEC_MAP_FILE_BACKED)
+	found = find_exec_mapping_kind(addr, false, &kind);
+	if (found && kind == DW_EXEC_MAP_FILE_BACKED)
 		return false;
 
 	/*
@@ -270,13 +314,11 @@ bool dw_patch_disabled_for_addr(uintptr_t addr, uintptr_t *patch_insn_out)
 	if (find_olx_original_pc(addr, patch_insn_out))
 		return false;
 
-	if (mapping == NULL) {
-		refresh_exec_mapping_cache();
-		mapping = find_exec_mapping(addr);
-	}
+	if (!found)
+		found = find_exec_mapping_kind(addr, true, &kind);
 
-	if (mapping == NULL)
+	if (!found)
 		return true;
 
-	return mapping->kind != DW_EXEC_MAP_FILE_BACKED;
+	return kind != DW_EXEC_MAP_FILE_BACKED;
 }

@@ -135,6 +135,7 @@ static ssize_t (*libc_pwrite64)(int fd, const void *buf, size_t count, off64_t o
 static void *(*libc_mmap64)(void *addr, size_t length, int prot, int flags, int fd, off64_t offset);
 static int (*libc_munmap)(void *addr, size_t length);
 static int (*libc_fcntl64)(int fd, int cmd, ...);
+static int (*libc_fcntl)(int fd, int cmd, ...);
 static ssize_t (*libc_read)(int fd, void *buf, size_t count);
 extern ssize_t __read(int fd, void *buf, size_t count);
 static ssize_t (*libc_write)(int fd, const void *buf, size_t count);
@@ -213,7 +214,16 @@ pthread_once_t dw_init_stubs = PTHREAD_ONCE_INIT;
  */
 void dw_init_syscall_stubs()
 {
-	libc_strlen = dw_strlen;
+	/*
+	 * Use glibc's optimized (SIMD) strlen for the per-wrapper length and
+	 * bounds computations; it is always called on the untainted copy, so it
+	 * never faults. Fall back to our byte-at-a-time dw_strlen only if the
+	 * symbol cannot be resolved, since nearly every string wrapper depends on
+	 * libc_strlen.
+	 */
+	libc_strlen = dlsym_check(RTLD_NEXT, "strlen");
+	if (libc_strlen == NULL)
+		libc_strlen = dw_strlen;
 	libc_strchr = dlsym_check(RTLD_NEXT, "strchr");
 	libc_strrchr = dlsym_check(RTLD_NEXT, "strrchr");
 	libc_strcmp = dlsym_check(RTLD_NEXT, "strcmp");
@@ -252,6 +262,7 @@ void dw_init_syscall_stubs()
 	libc_mmap64 = dlsym_check(RTLD_NEXT, "mmap64");
 	libc_munmap = dlsym_check(RTLD_NEXT, "munmap");
 	libc_fcntl64 = dlsym_check(RTLD_NEXT, "fcntl64");
+	libc_fcntl = dlsym_check(RTLD_NEXT, "fcntl");
 	libc_read = __read; // dlsym_check(RTLD_NEXT, "read");
 	libc_write = dlsym_check(RTLD_NEXT, "write");
 	libc_statfs = dlsym_check(RTLD_NEXT, "statfs");
@@ -507,7 +518,7 @@ int dw_libc_sigaction(int signum, const struct sigaction *act)
  * to it from the dest pointer.
  */
 
-size_t strlen(const char *s) { sin(); char *ns = (char *) dw_unprotect((void *) s); dw_check_access((void *) s, libc_strlen(ns) + 1); size_t ret = libc_strlen(ns); sout(); return ret; }
+size_t strlen(const char *s) { sin(); char *ns = (char *) dw_unprotect((void *) s); size_t ret = libc_strlen(ns); dw_check_access((void *) s, ret + 1); sout(); return ret; }
 
 static inline void fputc_wrapper(char c, void *extra_arg)
 {
@@ -872,55 +883,64 @@ ssize_t pwrite64(int fd, const void *buf, size_t count, off64_t offset)
 }
 void *mmap64(void *addr, size_t length, int prot, int flags, int fd, off64_t offset) { sin(); void *ret = libc_mmap64 ? libc_mmap64(dw_unprotect(addr), length, prot, flags, fd, offset) : mmap(dw_unprotect(addr), length, prot, flags, fd, (off_t)offset); sout(); return ret; }
 int munmap(void *addr, size_t length) { sin(); int ret = libc_munmap ? libc_munmap(dw_unprotect(addr), length) : -1; sout(); return ret; }
+/*
+ * Shared taint handling for fcntl/fcntl64. The optional third argument has
+ * already been read as a pointer-sized word (exactly as glibc's own fcntl
+ * does), so it is forwarded intact for every command instead of being dropped.
+ * Commands that take a pointer have it bounds-checked and unprotected; for
+ * everything else the word is unprotected defensively: an int argument carries
+ * no taint bits and passes through unchanged, and no-argument commands ignore
+ * it (as the kernel does).
+ */
+static int dw_fcntl_dispatch(int fd, int cmd, void *arg3, int (*real)(int, int, ...))
+{
+	switch (cmd)
+	{
+	/* struct flock * argument, including the open file description locks. */
+	case F_SETLK:
+	case F_SETLKW:
+	case F_GETLK:
+#ifdef F_OFD_SETLK
+	case F_OFD_SETLK:
+	case F_OFD_SETLKW:
+	case F_OFD_GETLK:
+#endif
+		dw_check_access(arg3, sizeof(struct flock));
+		return real(fd, cmd, dw_unprotect(arg3));
+
+#ifdef F_GETOWN_EX
+	/* struct f_owner_ex * argument. */
+	case F_GETOWN_EX:
+	case F_SETOWN_EX:
+		dw_check_access(arg3, sizeof(struct f_owner_ex));
+		return real(fd, cmd, dw_unprotect(arg3));
+#endif
+
+	default:
+		return real(fd, cmd, dw_unprotect(arg3));
+	}
+}
+
 int fcntl64(int fd, int cmd, ...)
 {
 	sin();
-	int ret = -1;
-
 	va_list arg;
 	va_start(arg, cmd);
-
-	switch (cmd)
-	{
-	/* Pointer argument. */
-	case F_SETLK:
-	case F_SETLKW:
-	case F_GETLK: {
-		void *lockp = va_arg(arg, void *);
-		dw_check_access(lockp, sizeof(struct flock));
-		ret = libc_fcntl64(fd, cmd, dw_unprotect(lockp));
-		break;
-	}
-
-	/* Integer argument (promoted). */
-	case F_DUPFD:
-	case F_DUPFD_CLOEXEC:
-	case F_SETFD:
-	case F_SETFL:
-	case F_SETOWN:
-	case F_SETSIG:
-		ret = libc_fcntl64(fd, cmd, va_arg(arg, int));
-		break;
-
-	/* No 3rd argument (we still pass a dummy value to the variadic libc call). */
-	case F_GETFD:
-	case F_GETFL:
-	case F_GETOWN:
-	case F_GETSIG:
-		ret = libc_fcntl64(fd, cmd, 0);
-		break;
-
-	default:
-		/*
-		 * Unknown command: avoid touching varargs (which may be absent) to
-		 * prevent UB. Pass a dummy argument.
-		 */
-		ret = libc_fcntl64(fd, cmd, 0);
-		break;
-	}
-
+	void *arg3 = va_arg(arg, void *);
 	va_end(arg);
+	int ret = dw_fcntl_dispatch(fd, cmd, arg3, libc_fcntl64);
+	sout();
+	return ret;
+}
 
+int fcntl(int fd, int cmd, ...)
+{
+	sin();
+	va_list arg;
+	va_start(arg, cmd);
+	void *arg3 = va_arg(arg, void *);
+	va_end(arg);
+	int ret = dw_fcntl_dispatch(fd, cmd, arg3, libc_fcntl ? libc_fcntl : libc_fcntl64);
 	sout();
 	return ret;
 }
@@ -983,7 +1003,7 @@ wchar_t *wmemcpy(wchar_t *restrict dest, const wchar_t *restrict src, size_t n) 
 char *setlocale(int category, const char *locale) { sin(); char *nlocale = dw_unprotect((void *)locale); if (nlocale) dw_check_access((void *)locale, libc_strlen(nlocale) + 1); char *ret = libc_setlocale(category, nlocale); sout(); return ret; }
 char *textdomain(const char * domainname) { sin(); char *ndomainname = dw_unprotect((void *)domainname); dw_check_access((void *)domainname, libc_strlen(ndomainname) + 1); char *ret = libc_textdomain(ndomainname); sout(); return ret; }
 int execve(const char *pathname, char *const argv[], char *const envp[]) { sin(); char *npathname = dw_unprotect((void *) pathname); dw_check_access((void *) pathname, libc_strlen(npathname) + 1); char *const *nargv = (char *const *) dw_unprotect((void *) argv); char *const *nenvp = envp ? (char *const *) dw_unprotect((void *) envp) : NULL; if (nargv) dw_check_access((void *) argv, arglen((char *const *) nargv)); if (nenvp) dw_check_access((void *) envp, arglen((char *const *) nenvp)); int ret = libc_execve(npathname, (char *const *) nargv, (char *const *) nenvp); sout(); return ret; }
-int execv(const char *pathname, char *const argv[]) { sin(); char *npathname = dw_unprotect((void *)pathname); dw_check_access((void *)pathname, libc_strlen(npathname) + 1); dw_check_access((void *)argv, arglen(argv)); int ret = libc_execv(npathname, dw_unprotect(argv)); sout(); return ret; }
+int execv(const char *pathname, char *const argv[]) { sin(); char *npathname = dw_unprotect((void *)pathname); dw_check_access((void *)pathname, libc_strlen(npathname) + 1); char *const *nargv = (char *const *) dw_unprotect((void *) argv); if (nargv) dw_check_access((void *) argv, arglen(nargv)); int ret = libc_execv(npathname, nargv); sout(); return ret; }
 int execvp(const char *file, char *const argv[]) { sin(); char *nfile = (char *) dw_unprotect((void *) file); dw_check_access((void *) file, libc_strlen(nfile) + 1); char *const *nargv = (char *const *) dw_unprotect((void *) argv); if (nargv) dw_check_access((void *) argv, arglen(nargv)); int ret = libc_execvp(nfile, (char *const *) nargv); sout(); return ret; }
 int execvpe(const char *file, char *const argv[], char *const envp[]) { sin(); char *nfile = (char *) dw_unprotect((void *) file); dw_check_access((void *) file, libc_strlen(nfile) + 1); char *const *nargv = (char *const *) dw_unprotect((void *) argv); char *const *nenvp = envp ? (char *const *) dw_unprotect((void *) envp) : NULL; if (nargv) dw_check_access((void *) argv, arglen(nargv)); if (nenvp) dw_check_access((void *) envp, arglen(nenvp)); int ret = libc_execvpe(nfile, (char *const *) nargv, (char *const *) nenvp); sout(); return ret; }
 

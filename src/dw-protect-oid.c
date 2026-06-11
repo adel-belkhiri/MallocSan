@@ -417,19 +417,63 @@ void *dw_malloc_protect(size_t size, void* caller)
 
 /*
  * Remove the taint and free the object.
+ *
+ * The OID and the freed pointer are validated before any state is mutated:
+ * the object is released to glibc and its metadata recycled only for an exact
+ * free of a live object (dw_unprotect(ptr) == tracked base_addr). A stale or
+ * double free, an out-of-range taint, or a free of an interior pointer is
+ * reported and ignored, so we never hand glibc a pointer it did not allocate
+ * and never free the same object twice.
  */
 void dw_free_protect(void *ptr)
 {
 	unsigned oid = (uintptr_t) ptr >> 48;
-	if (oid != 0) {
-		if ((oid > oids_size - 1) ||
-			(atomic_exchange_explicit(&oids[oid].base_addr, NULL, memory_order_acq_rel) == NULL)) {
-			DW_LOG(WARNING, PROTECT, "Invalid taint value %u for %p\n", oid, ptr);
-		} else {
-			dw_oid_free(oid);
-		}
+
+	/* Untainted pointer: nothing is tracked, free the raw allocation. */
+	if (oid == 0) {
+		__libc_free(ptr);
+		return;
 	}
-	__libc_free(dw_unprotect(ptr));
+
+	if (oid > oids_size - 1) {
+		DW_LOG(WARNING, PROTECT, "Invalid free: taint %u out of range for %p\n", oid, ptr);
+		return;
+	}
+
+	void *base = atomic_load_explicit(&oids[oid].base_addr, memory_order_acquire);
+	void *real = dw_unprotect(ptr);
+
+	/* Stale taint: the slot is not live (already freed, or never allocated). */
+	if (base == NULL) {
+		DW_LOG(WARNING, PROTECT,
+			   "Invalid free: oid %u is not live (double free?) for %p\n", oid, ptr);
+		return;
+	}
+
+	/* Interior free: the pointer does not match the tracked allocation base. */
+	if (real != base) {
+		DW_LOG(WARNING, PROTECT,
+			   "Invalid free: interior pointer %p does not match base %p (oid %u)\n",
+			   ptr, base, oid);
+		return;
+	}
+
+	/*
+	 * Claim the slot: only succeed while base_addr is still exactly our base.
+	 * A compare-exchange (not a blind exchange) means a slot freed and recycled
+	 * by another thread is left intact, and a concurrent double free can win at
+	 * most once.
+	 */
+	void *expected = base;
+	if (!atomic_compare_exchange_strong_explicit(&oids[oid].base_addr, &expected, NULL,
+						     memory_order_acq_rel, memory_order_acquire)) {
+		DW_LOG(WARNING, PROTECT,
+			   "Invalid free: concurrent free race on oid %u for %p\n", oid, ptr);
+		return;
+	}
+
+	dw_oid_free(oid);
+	__libc_free(base);
 }
 
 /*

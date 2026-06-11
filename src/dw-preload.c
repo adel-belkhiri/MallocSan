@@ -1045,9 +1045,16 @@ void *memalign(size_t alignment, size_t size)
 
 void *calloc(size_t nmemb, size_t size)
 {
-	void *ret = malloc2(nmemb * size, __builtin_return_address(0));
+	size_t total;
+
+	if (__builtin_mul_overflow(nmemb, size, &total)) {
+		errno = ENOMEM;
+		return NULL;
+	}
+
+	void *ret = malloc2(total, __builtin_return_address(0));
 	if (ret != NULL)
-		__builtin_memset(dw_unprotect(ret), 0, nmemb * size);
+		__builtin_memset(dw_unprotect(ret), 0, total);
 
 	return ret;
 }
