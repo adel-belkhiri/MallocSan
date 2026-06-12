@@ -395,9 +395,38 @@ DW_INTERNAL inline void *dw_reprotect(const void *ptr, const void *old_ptr)
 	// Decode tag
 	uintptr_t oid = taint_bits >> 48;
 
-	if (unlikely(oid >= oids_size ||
-		     atomic_load_explicit(&oids[oid].base_addr, memory_order_acquire) == NULL)) {
-		DW_LOG(ERROR, PROTECT, "Invalid taint bits %p from old pointer %p\n", (void *)taint_bits, old_ptr);
+	/*
+	 * The saved taint cannot be reapplied: there is no live object to re-tag.
+	 * Drop the taint and return the value as-is -- we must not leave a stale or
+	 * out-of-range OID on it, or the next dw_check_access() would index oids[]
+	 * out of bounds. Both sub-cases below are recoverable and handled the way
+	 * dw_get_size()/dw_get_base_addr() handle them: a non-fatal WARNING rather
+	 * than a fatal ERROR that would abort the whole process. The trade-off is
+	 * that this particular pointer is no longer bounds-checked -- unavoidable
+	 * once its backing object is gone.
+	 */
+	if (unlikely(oid >= oids_size)) {
+		/*
+		 * Out of range: the allocator never hands out an OID this large, so
+		 * this is corrupted tag bits or a non-pointer value misidentified as
+		 * tainted -- not a freed object. Kept non-fatal (aborting would kill
+		 * correct programs on a misidentification) but logged distinctly.
+		 */
+		DW_LOG(WARNING, PROTECT,
+		       "Cannot reapply taint: oid %u out of range (old pointer %p); dropping taint\n",
+		       (unsigned)oid, old_ptr);
+		return (void *)ptr;
+	}
+
+	if (unlikely(atomic_load_explicit(&oids[oid].base_addr, memory_order_acquire) == NULL)) {
+		/*
+		 * Freed / no longer live: the application kept a pointer whose object
+		 * was freed before this retaint ran (a deferred post-handler, or a
+		 * dangling pointer left in a register). Expected and benign.
+		 */
+		DW_LOG(WARNING, PROTECT,
+		       "Cannot reapply taint: oid %u (old pointer %p) is no longer live\n",
+		       (unsigned)oid, old_ptr);
 		return (void *)ptr;
 	}
 
