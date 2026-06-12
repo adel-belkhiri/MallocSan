@@ -301,9 +301,7 @@ struct memory_arg_runtime {
 };
 
 struct insn_entry_runtime {
-	struct insn_entry *entry;
 	struct memory_arg_runtime arg_m[MAX_MEM_ARG];
-	bool used;
 };
 
 extern enum dw_strategies dw_strategy;
@@ -319,6 +317,17 @@ static inline const char *strategy_name(enum dw_strategies s)
 }
 
 extern __thread struct insn_entry_runtime insn_rt_slots[MAX_SCAN_INST_COUNT];
+
+/*
+ * Compact, per-thread ownership map for the runtime slots above. slot_owner[i]
+ * is the insn_entry that currently owns insn_rt_slots[i], or NULL when the slot
+ * is free. It is the single source of truth for slot occupancy. Keeping it as a
+ * separate, densely-packed array (one pointer per slot) means the acquire/find
+ * scans touch ~2 KiB of contiguous, prefetchable memory instead of striding the
+ * first/last cache line of every 304-byte insn_entry_runtime, which matters on
+ * the hot probe pre-handler path.
+ */
+extern __thread struct insn_entry *slot_owner[MAX_SCAN_INST_COUNT];
 
 struct reg_arg {
 	unsigned reg;
