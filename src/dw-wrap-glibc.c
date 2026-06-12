@@ -167,6 +167,25 @@ static char* (*libc_strcat_chk)(char *dest, const char *src, size_t destlen);
 static char* (*libc_strncat_chk)(char *dest, const char *src, size_t n, size_t destlen);
 static char* (*libc_strncpy)(char *restrict dest, const char *restrict src, size_t n);
 static void* (*libc_strncpy_chk)(void *dest, const void *src, size_t n, size_t destlen);
+/*
+ * Fortified (_FORTIFY_SOURCE) variants of the I/O functions that write into a
+ * caller-supplied buffer. Distro binaries are typically built with
+ * _FORTIFY_SOURCE, which redirects read()->__read_chk(), readlink()->
+ * __readlink_chk(), fread()->__fread_chk(), etc. Those redirected calls bypass
+ * the plain wrappers, so the tainted destination buffer would reach the kernel
+ * and fail with EFAULT. We wrap the _chk variants too and untaint the buffer
+ * just like their unfortified counterparts.
+ */
+static ssize_t (*libc_read_chk)(int fd, void *buf, size_t nbytes, size_t buflen);
+static ssize_t (*libc_pread_chk)(int fd, void *buf, size_t nbytes, off_t offset, size_t buflen);
+static ssize_t (*libc_pread64_chk)(int fd, void *buf, size_t nbytes, off64_t offset, size_t buflen);
+static ssize_t (*libc_readlink_chk)(const char *path, char *buf, size_t len, size_t buflen);
+static ssize_t (*libc_readlinkat_chk)(int dirfd, const char *path, char *buf, size_t len, size_t buflen);
+static size_t (*libc_fread_chk)(void *ptr, size_t ptrlen, size_t size, size_t n, FILE *stream);
+static size_t (*libc_fread_unlocked_chk)(void *ptr, size_t ptrlen, size_t size, size_t n, FILE *stream);
+static char* (*libc_fgets_chk)(char *s, size_t size, int n, FILE *stream);
+static char* (*libc_fgets_unlocked_chk)(char *s, size_t size, int n, FILE *stream);
+static char* (*libc_getcwd_chk)(char *buf, size_t size, size_t buflen);
 static size_t (*libc_strspn)(const char *str1, const char *str2);
 static char* (*libc_strstr)(const char *str1, const char *str2);
 static size_t (*libc_strcspn)(const char *str1, const char *str2);
@@ -291,6 +310,16 @@ void dw_init_syscall_stubs()
 	libc_strncat_chk = dlsym_check(RTLD_NEXT, "__strncat_chk");
 	libc_strncpy = dlsym_check(RTLD_NEXT, "strncpy");
 	libc_strncpy_chk = dlsym_check(RTLD_NEXT, "__strncpy_chk");
+	libc_read_chk = dlsym_check(RTLD_NEXT, "__read_chk");
+	libc_pread_chk = dlsym_check(RTLD_NEXT, "__pread_chk");
+	libc_pread64_chk = dlsym_check(RTLD_NEXT, "__pread64_chk");
+	libc_readlink_chk = dlsym_check(RTLD_NEXT, "__readlink_chk");
+	libc_readlinkat_chk = dlsym_check(RTLD_NEXT, "__readlinkat_chk");
+	libc_fread_chk = dlsym_check(RTLD_NEXT, "__fread_chk");
+	libc_fread_unlocked_chk = dlsym_check(RTLD_NEXT, "__fread_unlocked_chk");
+	libc_fgets_chk = dlsym_check(RTLD_NEXT, "__fgets_chk");
+	libc_fgets_unlocked_chk = dlsym_check(RTLD_NEXT, "__fgets_unlocked_chk");
+	libc_getcwd_chk = dlsym_check(RTLD_NEXT, "__getcwd_chk");
 	libc_strspn = dlsym_check(RTLD_NEXT, "strspn");
 	libc_strcspn = dlsym_check(RTLD_NEXT, "strcspn");
 	libc_strstr = dlsym_check(RTLD_NEXT, "strstr");
@@ -946,6 +975,23 @@ int fcntl(int fd, int cmd, ...)
 }
 ssize_t read(int fd, void *buf, size_t count) { sin(); dw_check_access(buf, count); ssize_t ret = libc_read(fd, dw_unprotect(buf), count); sout(); return ret; }
 ssize_t write(int fd, const void *buf, size_t count) { sin(); dw_check_access(buf, count); ssize_t ret = libc_write(fd, (const void *)dw_unprotect(buf), count); sout(); return ret; }
+
+/*
+ * Fortified (_FORTIFY_SOURCE) variants of the buffer-writing I/O functions.
+ * The trailing buflen is the compiler-known object size; we untaint the
+ * destination buffer exactly as the unfortified wrappers do and fall back to
+ * the plain libc entry point when the _chk symbol is unavailable.
+ */
+ssize_t __read_chk(int fd, void *buf, size_t nbytes, size_t buflen) { sin(); dw_check_access(buf, nbytes); void *nbuf = dw_unprotect(buf); ssize_t ret = libc_read_chk ? libc_read_chk(fd, nbuf, nbytes, buflen) : libc_read(fd, nbuf, nbytes); sout(); return ret; }
+ssize_t __pread_chk(int fd, void *buf, size_t nbytes, off_t offset, size_t buflen) { sin(); dw_check_access(buf, nbytes); void *nbuf = dw_unprotect(buf); ssize_t ret = libc_pread_chk ? libc_pread_chk(fd, nbuf, nbytes, offset, buflen) : libc_pread(fd, nbuf, nbytes, offset); sout(); return ret; }
+ssize_t __pread64_chk(int fd, void *buf, size_t nbytes, off64_t offset, size_t buflen) { sin(); dw_check_access(buf, nbytes); void *nbuf = dw_unprotect(buf); ssize_t ret = libc_pread64_chk ? libc_pread64_chk(fd, nbuf, nbytes, offset, buflen) : (libc_pread64 ? libc_pread64(fd, nbuf, nbytes, offset) : libc_pread(fd, nbuf, nbytes, (off_t)offset)); sout(); return ret; }
+ssize_t __readlink_chk(const char *path, char *buf, size_t len, size_t buflen) { sin(); char *npath = dw_unprotect((void *)path); dw_check_access((void *)path, libc_strlen(npath) + 1); dw_check_access(buf, len); char *nbuf = dw_unprotect(buf); ssize_t ret = libc_readlink_chk ? libc_readlink_chk(npath, nbuf, len, buflen) : libc_readlink(npath, nbuf, len); sout(); return ret; }
+ssize_t __readlinkat_chk(int dirfd, const char *path, char *buf, size_t len, size_t buflen) { sin(); char *npath = dw_unprotect((void *)path); dw_check_access((void *)path, libc_strlen(npath) + 1); dw_check_access(buf, len); ssize_t ret = libc_readlinkat_chk(dirfd, npath, dw_unprotect(buf), len, buflen); sout(); return ret; }
+size_t __fread_chk(void *ptr, size_t ptrlen, size_t size, size_t n, FILE *stream) { sin(); dw_check_access(ptr, size * n); void *nptr = dw_unprotect(ptr); size_t ret = libc_fread_chk ? libc_fread_chk(nptr, ptrlen, size, n, stream) : libc_fread(nptr, size, n, stream); sout(); return ret; }
+size_t __fread_unlocked_chk(void *ptr, size_t ptrlen, size_t size, size_t n, FILE *stream) { sin(); dw_check_access(ptr, size * n); size_t ret = libc_fread_unlocked_chk(dw_unprotect(ptr), ptrlen, size, n, stream); sout(); return ret; }
+char *__fgets_chk(char *s, size_t size, int n, FILE *stream) { sin(); dw_check_access(s, size); char *ns = dw_unprotect(s); char *ret = libc_fgets_chk(ns, size, n, stream); sout(); return ret == ns ? s : ret; }
+char *__fgets_unlocked_chk(char *s, size_t size, int n, FILE *stream) { sin(); dw_check_access(s, size); char *ns = dw_unprotect(s); char *ret = libc_fgets_unlocked_chk(ns, size, n, stream); sout(); return ret == ns ? s : ret; }
+char *__getcwd_chk(char *buf, size_t size, size_t buflen) { sin(); char *nbuf = dw_unprotect(buf); dw_check_access(buf, size); char *ret = libc_getcwd_chk ? libc_getcwd_chk(nbuf, size, buflen) : libc_getcwd(nbuf, size); sout(); return ret == nbuf ? buf : ret; }
 int statfs(const char *path, struct statfs *buf) { sin(); char *npath = dw_unprotect((void *)path); dw_check_access((void *)path, libc_strlen(npath) + 1); dw_check_access((void *)buf, sizeof(struct statfs)); int ret = libc_statfs(npath, (struct statfs *)dw_unprotect((void *)buf)); sout(); return ret; }
 int fstatfs(int fd, struct statfs *buf) { sin(); dw_check_access((void *)buf, sizeof(struct statfs)); int ret = libc_fstatfs(fd, (struct statfs *)dw_unprotect((void *)buf)); sout(); return ret; }
 ssize_t getdents64(int fd, void *dirp, size_t count) { sin(); dw_check_access(dirp, count); ssize_t ret = libc_getdents64(fd, dw_unprotect(dirp), count); sout(); return ret; }
