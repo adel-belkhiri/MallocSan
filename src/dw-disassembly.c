@@ -33,6 +33,9 @@ struct insn_table {
 __thread struct insn_entry_runtime insn_rt_slots[MAX_SCAN_INST_COUNT]
 	__attribute__((tls_model("initial-exec")));
 
+__thread struct insn_entry *slot_owner[MAX_SCAN_INST_COUNT]
+	__attribute__((tls_model("initial-exec")));
+
 struct capstone_context {
 	csh handle;
 	cs_insn *insn;
@@ -169,19 +172,40 @@ struct insn_entry *dw_get_instruction_entry(instruction_table *table, uintptr_t 
 
 static inline bool dw_acquire_runtime_slot(struct insn_entry *entry, int *idx_out)
 {
+	int first_free = -1;
+
+	/*
+	 * Scan the whole ownership map before allocating: if the entry already
+	 * owns a slot we must reuse it, even when a free slot sits at a lower
+	 * index. Bailing out at the first free slot would leak a second slot for
+	 * the same entry.
+	 *
+	 * An entry owns a slot when a previous pre-handler (dw_unprotect_context)
+	 * acquired it but the matching post-handler (dw_reprotect_context) never
+	 * ran to release it. This happens when libpatch installs only the pre
+	 * probe of a PROBE_AROUND patch (e.g. for some VEX/AVX instructions, where
+	 * the post probe is silently dropped), or when control left the
+	 * out-of-line copy before reaching the post site. Reusing the existing
+	 * slot keeps each entry to at most one slot, so a hot instruction can no
+	 * longer exhaust the table or spam a fatal "shouldn't be used" error.
+	 */
 	for (int i = 0; i < MAX_SCAN_INST_COUNT; ++i) {
-		if (!insn_rt_slots[i].used) {
+		struct insn_entry *owner = slot_owner[i];
+
+		if (owner == entry) {
 			*idx_out = i;
-			insn_rt_slots[i].used = true;
-			insn_rt_slots[i].entry = entry;
 			return true;
 		}
-
-		if (insn_rt_slots[i].entry == entry)
-			DW_LOG(ERROR, DISASSEMBLY,
-				   "Runtime slot %d for instruction 0x%llx shouldn't be used!\n",
-				   i, entry->insn);
+		if (owner == NULL && first_free < 0)
+			first_free = i;
 	}
+
+	if (first_free >= 0) {
+		slot_owner[first_free] = entry;
+		*idx_out = first_free;
+		return true;
+	}
+
 	// Out of slots
 	DW_LOG(ERROR, DISASSEMBLY, "Runtime slots shouldn't be exhausted!\n");
 	return false;
@@ -190,7 +214,7 @@ static inline bool dw_acquire_runtime_slot(struct insn_entry *entry, int *idx_ou
 static inline bool dw_find_runtime_slot(struct insn_entry *entry, int *idx_out)
 {
 	for (int i = 0; i < MAX_SCAN_INST_COUNT; i++) {
-		if (insn_rt_slots[i].used && insn_rt_slots[i].entry == entry) {
+		if (slot_owner[i] == entry) {
 			if (idx_out)
 				*idx_out = i;
 			return true;
@@ -205,8 +229,7 @@ static inline void dw_release_rt_slot(int idx)
 	if (idx < 0 || idx >= MAX_SCAN_INST_COUNT)
 		return;
 
-	insn_rt_slots[idx].entry = NULL;
-	insn_rt_slots[idx].used = false;
+	slot_owner[idx] = NULL;
 }
 
 /*
@@ -1085,7 +1108,6 @@ static bool dw_populate_instruction_entry(instruction_table *table, struct insn_
 	}
 
 	struct insn_entry_runtime entry_rt = {0};
-	entry_rt.entry = entry;
 	unsigned nb_protected = fill_instruction_operands(entry, &entry_rt, cs->handle, cs->insn, x86, uctx);
 	if (nb_protected == 0) {
 		DW_LOG(WARNING, DISASSEMBLY,
@@ -1609,7 +1631,6 @@ DW_INTERNAL void dw_unprotect_context(struct patch_exec_context *ctx)
 
 		rt_slot_p = &insn_rt_slots[rt_idx];
 	} else {
-		rt_slot.entry = entry;
 		rt_slot_p = &rt_slot;
 	}
 
