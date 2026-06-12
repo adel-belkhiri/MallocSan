@@ -457,9 +457,18 @@ static uintptr_t handle_seg_fault(struct trampoline_gpr_frame *frame)
 					   entry->insn, entry->post_handler ? "Yes" : "No",
 					   entry->deferred_post_handler ? "Yes" : "No", strategy_name(entry->strategy));
 			} else {
-				atomic_store_explicit(&entry->state, ENTRY_FAILED, memory_order_release);
-				DW_LOG(WARNING, MAIN, "Failed to patch instruction 0x%llx (rc=%d)\n", entry->insn,
-					   patch_rc);
+				/*
+				 * Patching failed: no JUMP/TRAP could be installed at this site.
+				 * Degrade to single-stepping rather than marking the entry FAILED
+				 * (which would refault and ultimately abort with no saved handler):
+				 * mark it patch-disabled and READY so the signal handler's single-step
+				 * path takes over on every subsequent fault on this instruction.
+				 */
+				entry->patch_disabled = true;
+				atomic_store_explicit(&entry->state, ENTRY_READY, memory_order_release);
+				DW_LOG(WARNING, MAIN,
+					   "Failed to patch instruction 0x%llx (rc=%d); falling back to single-step\n",
+					   entry->insn, patch_rc);
 			}
 		}
 	}
