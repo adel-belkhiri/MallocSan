@@ -176,16 +176,18 @@ static enum dw_strategies do_patch(struct insn_entry *entry, bool deferred)
 		strategy = DW_PATCH_JUMP;
 	else if (dw_instruction_entry_patch_strategy(entry, DW_PATCH_TRAP, deferred))
 		strategy = DW_PATCH_TRAP;
-	else if (entry->patch_insn)
-		/*
-		 * Overlapping patch for a relocated (OLX) instruction failed. This
-		 * is non-fatal: the caller falls back to single-stepping the OLX
-		 * instruction, so warn instead of aborting via ERROR.
-		 */
-		DW_LOG(WARNING, PATCH, "Patching %s location 0x%llx failed (origin 0x%llx).\n",
-			   patch_type, patch_addr, entry->insn);
 	else
-		DW_LOG(ERROR, PATCH, "Patching %s location 0x%llx failed (origin 0x%llx).\n",
+		/*
+		 * Neither JUMP nor TRAP could be installed (e.g. a libpatch
+		 * limitation at this site, or a failed overlapping patch for a
+		 * relocated OLX instruction). This is non-fatal: the caller
+		 * (handle_seg_fault) degrades the entry to single-stepping. Warn
+		 * instead of aborting via ERROR, which would kill the whole
+		 * application over a recoverable patching failure.
+		 */
+		DW_LOG(WARNING, PATCH,
+			   "Patching %s location 0x%llx failed (origin 0x%llx); "
+			   "falling back to single-step.\n",
 			   patch_type, patch_addr, entry->insn);
 
 	DW_LOG(DEBUG, PATCH, "Patched %s site 0x%llx with %s strategy.\n",
@@ -351,11 +353,17 @@ int dw_patch_entry(struct insn_entry *entry, const struct post_safe_site_rb *saf
 	if (!atomic_load_explicit(&patch_w_started, memory_order_acquire))
 		return patch_entry_sync(entry, safe_sites);
 
-	/* Abort if patching is requested from the worker thread itself. */
+	/*
+	 * A patch request from the worker thread itself must not be queued: it
+	 * would block forever waiting for the worker (us) to drain the queue.
+	 * Patch synchronously instead of aborting.
+	 */
 	if (atomic_load_explicit(&worker_tid_set, memory_order_acquire) &&
-	    pthread_equal(pthread_self(), worker_tid))
-		DW_LOG(ERROR, PATCH,
-			   "Cannot patch instruction from worker patch thread itself.\n");
+	    pthread_equal(pthread_self(), worker_tid)) {
+		DW_LOG(WARNING, PATCH,
+			   "Patch requested from the worker thread; patching synchronously.\n");
+		return patch_entry_sync(entry, safe_sites);
+	}
 
 	patch_request_t req = {
 		.entry = entry,
