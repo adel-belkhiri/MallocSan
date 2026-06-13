@@ -176,14 +176,6 @@ static enum dw_strategies do_patch(struct insn_entry *entry, bool deferred)
 		strategy = DW_PATCH_JUMP;
 	else if (dw_instruction_entry_patch_strategy(entry, DW_PATCH_TRAP, deferred))
 		strategy = DW_PATCH_TRAP;
-	else if (entry->patch_insn)
-		/*
-		 * Overlapping patch for a relocated (OLX) instruction failed. This
-		 * is non-fatal: the caller falls back to single-stepping the OLX
-		 * instruction, so warn instead of aborting via ERROR.
-		 */
-		DW_LOG(WARNING, PATCH, "Patching %s location 0x%llx failed (origin 0x%llx).\n",
-			   patch_type, patch_addr, entry->insn);
 	else
 		/*
 		 * Neither JUMP nor TRAP could be installed (e.g. a libpatch
