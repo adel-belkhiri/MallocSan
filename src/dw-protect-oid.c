@@ -46,6 +46,38 @@ static const unsigned oids_size = 32767;
 static _Atomic uint64_t oids_head = 0;
 static struct object_id oids[32767];
 
+/*
+ *
+ * A hot loop that repeatedly dereferences pointers into the same object hits
+ * the same OID millions of times; each hit otherwise reloads base_addr/size
+ * from the shared ~768 KB oids[] array -- a likely cache miss on a random slot.
+ * This thread-local entry memoises {base,size} for the last validated OID so a
+ * repeat hit collapses to two integer compares against a thread-private line.
+ *
+ * Soundness rests on one fact about the table: a *live* slot's {base,size} is
+ * immutable. dw_protect() sets them once at allocation; realloc() is a fresh
+ * dw_protect() plus a free() of the old slot (see realloc() in dw-preload.c);
+ * the only mutation of a live slot is base_addr -> NULL at free(). So a cached
+ * entry can be invalidated by exactly one kind of event: a free. dw_free_protect()
+ * bumps the global epoch below, and an entry is trusted only while its recorded
+ * epoch still equals the current one -- i.e. no free of any object has happened
+ * since it was filled, which guarantees this OID's slot still holds the same
+ * live object. Conservative (an unrelated free invalidates every thread's
+ * cache) but always correct, and alloc-only / free-free hot loops (e.g. mcf)
+ * keep the epoch stable.
+ */
+static _Atomic uint64_t dw_oid_epoch = 0;
+
+struct dw_oid_cache {
+	unsigned  oid;    /* 0 means empty; OID 0 is "no taint" and is never cached. */
+	uint64_t  epoch;
+	uintptr_t base;
+	size_t    size;
+};
+
+static __thread struct dw_oid_cache dw_tls_oid_cache
+	__attribute__((tls_model("initial-exec")));
+
 #define OIDS_HEAD_IDX_MASK UINT64_C(0xFFFF)
 
 static inline unsigned oids_head_get_idx(uint64_t head)
@@ -199,19 +231,50 @@ DW_INTERNAL bool dw_check_access_ctx(const void *ptr, size_t size,
 	if (oid == 0)
 		return true;
 
-	if (unlikely(oid >= oids_size))
-		goto invalid;
+	uintptr_t base;
+	size_t sz;
 
-	void *base_addr = atomic_load_explicit(&oids[oid].base_addr, memory_order_acquire);
-	if (unlikely(base_addr == NULL)) {
+	/*
+	 * Fast path: one-entry per-thread cache (see dw_tls_oid_cache). Trust it
+	 * only while no free has happened since it was filled (epoch unchanged),
+	 * which guarantees this OID's slot still holds the same live object with
+	 * the same {base,size}. A hit avoids touching the shared oids[] line.
+	 */
+	struct dw_oid_cache *cache = &dw_tls_oid_cache;
+	uint64_t epoch = atomic_load_explicit(&dw_oid_epoch, memory_order_acquire);
+
+	if (likely(cache->oid == oid && cache->epoch == epoch)) {
+		base = cache->base;
+		sz   = cache->size;
+	} else {
+		if (unlikely(oid >= oids_size))
+			goto invalid;
+
+		void *base_addr = atomic_load_explicit(&oids[oid].base_addr, memory_order_acquire);
+		if (unlikely(base_addr == NULL)) {
 invalid:
-		DW_LOG(WARNING, PROTECT,
-			   "Invalid taint value %u for %p\n", oid, ptr);
-		return false;
-	}
+			DW_LOG(WARNING, PROTECT,
+				   "Invalid taint value %u for %p\n", oid, ptr);
+			return false;
+		}
 
-	uintptr_t base = (uintptr_t)base_addr;
-	size_t sz = atomic_load_explicit(&oids[oid].size, memory_order_relaxed);
+		base = (uintptr_t)base_addr;
+		sz   = atomic_load_explicit(&oids[oid].size, memory_order_relaxed);
+
+		/*
+		 * Refill. Publish base/size before the {oid,epoch} key so that an
+		 * async signal re-entering this function on the same thread can only
+		 * see a stale-but-consistent entry or a clean miss -- never a fresh
+		 * key paired with another object's base/size. The fence is
+		 * compiler-only: the cache is thread-private TLS, so no CPU barrier
+		 * is needed, only prevention of store reordering across a signal.
+		 */
+		cache->base = base;
+		cache->size = sz;
+		atomic_signal_fence(memory_order_release);
+		cache->oid   = oid;
+		cache->epoch = epoch;
+	}
 
 	/* Check [real_addr, real_addr + size) ⊆ [base, base + sz). */
 	if (unlikely(size > sz || real_addr < base || real_addr > base + sz - size)) {
@@ -411,6 +474,18 @@ void dw_free_protect(void *ptr)
 			   "Invalid free: concurrent free race on oid %u for %p\n", oid, ptr);
 		return;
 	}
+
+	/*
+	 * Invalidate every thread's one-entry OID cache *before* the slot is
+	 * recycled below. Any cached {base,size} for any OID may no longer be
+	 * trusted once this slot can be reused. The base_addr -> NULL claim above
+	 * is sequenced before this release bump, so a reader that observes the new
+	 * epoch also observes the freed slot. Bumping here -- ahead of
+	 * dw_oid_free() returning the slot to the free list -- closes the window in
+	 * which another thread could pop this slot off the free list and install a
+	 * different object while a stale cache, still at the old epoch, is trusted.
+	 */
+	atomic_fetch_add_explicit(&dw_oid_epoch, 1, memory_order_release);
 
 	dw_oid_free(oid);
 	__libc_free(base);
