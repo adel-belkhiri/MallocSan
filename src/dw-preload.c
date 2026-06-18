@@ -102,6 +102,23 @@ struct step_state {
 	const struct insn_entry *entry;
 	size_t nb_regs;
 	struct step_reg regs[DW_STEP_MAX_REGS];
+
+	/*
+	 * NOTE: to be landed as a separate commit -- single-step base==source
+	 * store memory-retaint.
+	 *
+	 * A pointer-width store whose source register is also the tainted
+	 * base/index register (e.g. `mov [rbx+0x10], rbx`) single-steps with the
+	 * register untainted, so it writes the *clean* pointer to memory. The
+	 * patched post-handler retaints that slot (dw_reprotect_context,
+	 * base==source WRITE case in dw-disassembly.c), but the single-step path
+	 * did not -- leaving an untainted pointer in memory. These fields carry the
+	 * pending memory retaint from prepare_patch_disabled_step() to
+	 * signal_trap(), applied after the step writes the slot.
+	 */
+	bool mem_retaint;
+	uintptr_t mem_retaint_addr;
+	uintptr_t mem_retaint_taint;
 };
 
 static __thread struct step_state step_state __attribute__((tls_model("initial-exec")));
@@ -113,6 +130,10 @@ static inline void step_state_clear(void)
 	step_state.repeat_insn = false;
 	step_state.entry = NULL;
 	step_state.nb_regs = 0;
+	/* Separate commit: base==source store memory-retaint (see struct). */
+	step_state.mem_retaint = false;
+	step_state.mem_retaint_addr = 0;
+	step_state.mem_retaint_taint = 0;
 }
 
 static bool step_state_needs_reprotect(void)
@@ -289,6 +310,28 @@ static bool prepare_patch_disabled_step(const struct insn_entry *entry, ucontext
 				step_state_add_restore(re_base->ucontext_index, valueb);
 		}
 
+		/*
+		 * NOTE: to be landed as a separate commit -- single-step base==source
+		 * store memory-retaint. When a pointer-width store's source register is
+		 * also the tainted base/index (mem->base_access / index_access set), the
+		 * single-step executes with that register untainted, so it writes the
+		 * *clean* pointer to memory. Remember the destination slot and the
+		 * original taint here so signal_trap() can retaint it after the step,
+		 * mirroring dw_reprotect_context()'s base==source WRITE case
+		 * (dw-disassembly.c:1944).
+		 */
+		if ((mem->length == sizeof(uintptr_t)) &&
+		    ((mem->access & (CS_AC_READ | CS_AC_WRITE)) == CS_AC_WRITE) &&
+		    ((mem->base_access && base_protected) ||
+		     (mem->index_access && index_protected))) {
+			uintptr_t clean_base = (uintptr_t)dw_unprotect((void *)valueb);
+			uintptr_t clean_index = (uintptr_t)dw_unprotect((void *)valuei);
+			step_state.mem_retaint = true;
+			step_state.mem_retaint_addr =
+				clean_base + clean_index * mem->scale + mem->displacement;
+			step_state.mem_retaint_taint = base_protected ? valueb : valuei;
+		}
+
 		if (base_protected || index_protected) {
 			uintptr_t addr = valueb + valuei * mem->scale + mem->displacement;
 			bool df = (uctx->uc_mcontext.gregs[REG_EFL] & DW_EFLAGS_DF) != 0;
@@ -314,7 +357,7 @@ static bool prepare_patch_disabled_step(const struct insn_entry *entry, ucontext
 	 * executing it with untainted operands is enough. The single-step trap would
 	 * only clear state and return without reprotecting anything.
 	 */
-	if (!step_state_needs_reprotect()) {
+	if (!step_state_needs_reprotect() && !step_state.mem_retaint) {
 		step_state_clear();
 		return true;
 	}
@@ -670,6 +713,16 @@ static void signal_trap(int sig, siginfo_t *info, void *context)
 				uintptr_t value_new = dw_get_register(uctx, r->ucontext_index);
 				dw_set_register(uctx, r->ucontext_index,
 								(uintptr_t)dw_reprotect((void *)value_new, (void *)r->taint));
+			}
+
+			/*
+			 * NOTE: to be landed as a separate commit -- single-step base==source
+			 * store memory-retaint. The step wrote the clean pointer to memory;
+			 * retaint that slot now (mirrors dw_reprotect_context 1944).
+			 */
+			if (step_state.mem_retaint) {
+				void **slot = (void **)step_state.mem_retaint_addr;
+				*slot = dw_reprotect(*slot, (void *)step_state.mem_retaint_taint);
 			}
 
 			step_state_clear();
