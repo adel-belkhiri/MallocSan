@@ -76,6 +76,22 @@ The following environment variables control pointer tainting and library's opera
 
 MallocSan uses the `JUMP` patching strategy and falls back to `TRAP` only when no jump-based patch is possible.
 
+### Guard-page mode (large allocations)
+
+As an alternative to pointer tainting, large allocations can be placed on a
+dedicated `mmap` region whose end abuts a `PROT_NONE` guard page, so an overflow
+past the object traps in hardware with no per-access instrumentation. The object
+is end-aligned to the page (returned pointer keeps 16-byte ABI alignment), so
+overflows that cross into the guard page are caught while underflows are not.
+This mode is opt-in; eligible allocations use it and the rest fall back to
+pointer tainting.
+
+| Variable               | Description                                                                                         |
+| ---------------------- | --------------------------------------------------------------------------------------------------- |
+| `DW_GUARD_MIN_SIZE`    | Use a guard-page allocation for allocations **≥** this size (bytes). `0` = guard mode off (default). |
+| `DW_GUARD_MAX_OBJECTS` | Maximum number of concurrently-live guarded allocations (default: `1024`).                           |
+| `DW_GUARD_ABORT`       | Abort after reporting a guard-page fault (`1` = on, default; `0` = report and continue).             |
+
 
 ## Usage
 A sample invocation of the test application "simple" can look like the following:

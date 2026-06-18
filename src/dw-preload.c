@@ -22,10 +22,19 @@
 #include "dw-log.h"
 #include "dw-patch.h"
 #include "dw-protect.h"
+#include "dw-protect-guard.h"
 #include "dw-registers.h"
 #include "dw-wrap-glibc.h"
 
 _Atomic int dw_fully_initialized = 0;
+
+/*
+ * Guard-page allocation mode (see dw-protect-guard.c). Disabled by default.
+ * guard_enabled mirrors the backend's state so the malloc/free/realloc/signal
+ * hooks gate on a local bool with no cross-TU call on the common path. Defined
+ * here (ahead of signal_protected) so the signal handler can read it.
+ */
+static bool guard_enabled = false;
 
 /* Number of instructions accessing tainted pointers that we can track. */
 static size_t nb_insn_olx_entries = 30000;
@@ -758,6 +767,18 @@ void signal_protected(int sig, siginfo_t *info, void *context)
 	dw_protect_active = false;
 
 	/*
+	 * Guard-page faults hit a canonical (untainted) pointer, so they would
+	 * otherwise flow all the way to handle_seg_fault's "no protected memory
+	 * arguments" forward path. Intercept here on si_addr to emit a precise
+	 * guard report (and abort, by default) before any wrapper/tainted logic.
+	 */
+	if (guard_enabled && info && dw_guard_handle_fault(info->si_addr, context)) {
+		dw_protect_active = save_active;
+		bt_signal_seed = NULL;
+		return;
+	}
+
+	/*
 	 * Check if we are within wrapped / inactive functions where this signal
 	 * should not happen
 	 */
@@ -883,6 +904,19 @@ dw_init()
 	if (arg != NULL && atoi(arg) == 1)
 		dump_memory_map = true;
 	dw_set_dump_memory_map(dump_memory_map);
+
+	/* Guard-page allocation mode for large objects (opt-in). */
+	size_t guard_min_size = 0;
+	size_t guard_max_objects = 1024;
+	bool guard_abort = true;
+	arg = getenv("DW_GUARD_MIN_SIZE");
+	if (arg != NULL) guard_min_size = atol(arg);
+	arg = getenv("DW_GUARD_MAX_OBJECTS");
+	if (arg != NULL) guard_max_objects = atol(arg);
+	arg = getenv("DW_GUARD_ABORT");
+	if (arg != NULL) guard_abort = (atoi(arg) != 0);
+	dw_guard_configure(guard_min_size, guard_max_objects, guard_abort);
+	guard_enabled = (guard_min_size > 0);
 
 	bool show_banner = false;
 	arg = getenv("DW_SHOW_BANNER");
@@ -1040,7 +1074,11 @@ static void *malloc2(size_t size, void *caller)
 
 	if (save_active) {
 		if (check_caller(caller)) {
-			if (check_candidate(size))
+			/* Prefer a guard-page allocation for large objects when enabled. */
+			if (guard_enabled && dw_guard_enabled_for_size(size))
+				ret = dw_guard_malloc(size, caller);
+			/* Fall back to OID tainting if guard mode declined the request. */
+			if (ret == NULL && check_candidate(size))
 				ret = dw_malloc_protect(size, caller);
 		} else
 			DW_LOG(TRACE, MAIN, "Not tainting malloc, caller from library\n");
@@ -1076,11 +1114,28 @@ void *realloc(void *ptr, size_t size)
 		return NULL;
 	}
 
+	/*
+	 * For guard allocations, check whether the new size fits within the
+	 * existing mapping's accessible region (user..guard_page). If so, just
+	 * update the recorded size and return the same pointer: no new mmap, no
+	 * copy, no munmap. This covers the common realloc-to-slightly-larger and
+	 * all realloc-to-smaller cases for guarded objects.
+	 */
+	if (guard_enabled && dw_guard_realloc_inplace(ptr, size))
+		return ptr;
+
 	void *ret = malloc2(size, __builtin_return_address(0));
 	if (ret == NULL)
 		return NULL;
 
-	size_t old_size = dw_get_size(ptr);
+	/*
+	 * Guard pointers are untainted, so dw_get_size() would mis-route them to
+	 * malloc_usable_size (invalid for an mmap region). Resolve the size from
+	 * the guard table first when guard mode is on.
+	 */
+	size_t old_size;
+	if (!(guard_enabled && dw_guard_get_size(ptr, &old_size)))
+		old_size = dw_get_size(ptr);
 	size_t copy_size = old_size < size ? old_size : size;
 
 	void *dst = dw_unprotect(ret);
@@ -1184,6 +1239,14 @@ void free(void *ptr)
 		__libc_free(ptr);
 		return;
 	}
+
+	/*
+	 * Guard pointers are untainted canonical pointers backed by mmap, so they
+	 * must be intercepted before dw_is_protected() (which would route them to
+	 * __libc_free). dw_guard_free O(1)-rejects non-guard pointers.
+	 */
+	if (guard_enabled && dw_guard_free(ptr))
+		return;
 
 	if (dw_is_protected(ptr))
 		dw_free_protect(ptr);

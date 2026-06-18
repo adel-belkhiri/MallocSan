@@ -9,6 +9,7 @@ libmallocsan_la_SOURCES = \
     dw-exec-policy.c \
     dw-log.c \
     dw-protect-oid.c \
+    dw-protect-guard.c \
     dw-registers.c \
     dw-disassembly.c \
     dw-patch.c \
