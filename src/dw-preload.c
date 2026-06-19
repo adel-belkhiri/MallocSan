@@ -376,6 +376,98 @@ static bool prepare_patch_disabled_step(const struct insn_entry *entry, ucontext
 	return true;
 }
 
+/*
+ * Stage 2 of the SIGSEGV emulate-and-skip plan. For an eligible fixed-field
+ * `mov` (entry->fast_kind == DW_FAST_MOV_FIXED_FIELD) that faulted on a tainted
+ * base register, emulate the access in place inside the SIGSEGV handler and
+ * advance RIP past the instruction. This takes a single signal instead of the
+ * SIGSEGV + TF single-step pair. The address-generation base is not
+ * pre-untainted in the ucontext; any register mutation below comes only from
+ * the emulated mov itself, so there is no old base taint to restore.
+ *
+ * Returns true when the instruction was emulated and RIP advanced (the caller
+ * must sigreturn immediately). Returns false when the base register is not
+ * actually tainted -- tainting did not cause this fault, so it is a genuine
+ * access violation and the caller falls back to the existing path.
+ *
+ * The caller restricts this to in-place patch-disabled sites (entry->patch_insn
+ * == 0); OLX overlapping-patch children stay on the proven single-step path.
+ */
+static bool emulate_fast_mov_and_skip(const struct insn_entry *entry, ucontext_t *uctx)
+{
+	uintptr_t base_raw = dw_get_register(uctx, entry->fast_base_uctx);
+
+	if (!dw_is_protected((void *)base_raw))
+		return false;
+
+	uintptr_t real = (uintptr_t)dw_unprotect((void *)base_raw);
+	uintptr_t addr = real + (uintptr_t)entry->fast_disp;
+
+	/*
+	 * Bounds check before touching memory. Pass the tainted pointer (taint bits
+	 * intact, displacement applied) so the helper recovers the object-id and
+	 * validates [addr, addr + width). A false result -- out-of-bounds or an
+	 * invalid/freed taint -- means real may be unmapped or protected; emulating
+	 * the access here would nested-fault inside the signal handler. Fall back to
+	 * the single-step path, which executes the instruction natively (so a
+	 * genuine fault is redelivered as a fresh signal) and emits the one
+	 * authoritative violation report. A true result guarantees addr is backed by
+	 * a live allocation, so the inline load/store below cannot fault.
+	 */
+	if (!dw_access_in_bounds((void *)(base_raw + (uintptr_t)entry->fast_disp),
+				 entry->fast_width))
+		return false;
+
+	if (entry->fast_is_load) {
+		uintptr_t dst = dw_get_register(uctx, entry->fast_dst_uctx);
+		/*
+		 * When a byte/word load writes the same canonical register used as the
+		 * tainted base (e.g. `mov al, [rax]`), the single-step fallback first
+		 * unprotects the base and then native x86 preserves the upper bytes of
+		 * that clean value. Start from `real` here to preserve that behavior.
+		 */
+		if (entry->fast_dst_uctx == entry->fast_base_uctx &&
+		    entry->fast_width < 4)
+			dst = real;
+		switch (entry->fast_width) {
+		case 1:
+			dst = (dst & ~(uintptr_t)0xFF) | *(volatile uint8_t *)addr;
+			break;
+		case 2:
+			dst = (dst & ~(uintptr_t)0xFFFF) | *(volatile uint16_t *)addr;
+			break;
+		case 4:
+			/* 32-bit mov zero-extends the full 64-bit destination greg. */
+			dst = *(volatile uint32_t *)addr;
+			break;
+		default: /* 8 */
+			dst = *(volatile uint64_t *)addr;
+			break;
+		}
+		dw_set_register(uctx, entry->fast_dst_uctx, dst);
+	} else {
+		uintptr_t src = dw_get_register(uctx, entry->fast_dst_uctx);
+		switch (entry->fast_width) {
+		case 1:
+			*(volatile uint8_t *)addr = (uint8_t)src;
+			break;
+		case 2:
+			*(volatile uint16_t *)addr = (uint16_t)src;
+			break;
+		case 4:
+			*(volatile uint32_t *)addr = (uint32_t)src;
+			break;
+		default: /* 8 */
+			*(volatile uint64_t *)addr = (uint64_t)src;
+			break;
+		}
+	}
+
+	/* Skip the original mov: single sigreturn, no TF/retaint bookkeeping. */
+	uctx->uc_mcontext.gregs[REG_RIP] += (greg_t)entry->insn_length;
+	return true;
+}
+
 static inline void dw_copy_fault_gregs(greg_t dst[NGREG], const greg_t src[NGREG])
 {
 	for (size_t i = 0; i < NGREG; i++)
@@ -516,10 +608,19 @@ static uintptr_t handle_seg_fault(struct trampoline_gpr_frame *frame)
 				 * and ultimately abort with no saved handler): mark it patch-disabled and
 				 * READY so the signal handler's single-step path takes over on every subsequent
 				 * fault on this instruction.
+				 *
+				 * Eligible fixed-field movs (strategy DW_PATCH_EMULATE) reach here by
+				 * design when JUMP could not be installed: TRAP is intentionally skipped
+				 * so the signal handler emulates and skips them in one signal instead of
+				 * single-stepping. This is the expected route, not a failure.
 				 */
 				entry->patch_disabled = true;
 				atomic_store_explicit(&entry->state, ENTRY_READY, memory_order_release);
-				if (entry->patch_insn)
+				if (entry->strategy == DW_PATCH_EMULATE)
+					DW_LOG(DEBUG, MAIN,
+						   "Instruction 0x%llx not JUMP-patchable; routing to SIGSEGV "
+						   "emulate-and-skip\n", entry->insn);
+				else if (entry->patch_insn)
 					DW_LOG(WARNING, MAIN,
 						   "Failed to install overlapping patch for OLX instruction 0x%llx "
 						   "(original 0x%llx, rc=%d); falling back to single-step\n",
@@ -798,6 +899,18 @@ void signal_protected(int sig, siginfo_t *info, void *context)
 	if (entry && (entry->patch_disabled || entry->patch_insn)) {
 		if (unlikely(dw_stats_enabled))
 			atomic_fetch_add_explicit(&entry->hit_count, 1, memory_order_relaxed);
+
+		/*
+		 * Emulate-and-skip fast path for eligible in-place fixed-field movs:
+		 * service the fault with one signal instead of the single-step pair.
+		 * OLX overlap children (patch_insn != 0) stay on the single-step path.
+		 */
+		if (entry->fast_kind == DW_FAST_MOV_FIXED_FIELD && !entry->patch_insn &&
+		    emulate_fast_mov_and_skip(entry, uctx)) {
+			dw_protect_active = save_active;
+			bt_signal_seed = NULL;
+			return;
+		}
 
 		if (prepare_patch_disabled_step(entry, uctx)) {
 			dw_protect_active = save_active;

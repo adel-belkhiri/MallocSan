@@ -95,126 +95,133 @@ static void patch_handler(struct patch_exec_context *ctx, uint8_t post)
 		dw_unprotect_context(ctx);
 }
 
+static inline uintptr_t entry_initial_addr(const struct insn_entry *entry)
+{
+	return entry->patch_insn ? entry->patch_insn : entry->insn;
+}
+
 /*
- * Patch one instruction using an explicit strategy
+ * Stage a single probe in the DISABLED state (made but not yet live). On
+ * success the handle is stored in *out and true is returned; the caller must
+ * later either enable_and_commit() it or drop_probes() it to cancel.
+ *
+ * trap_policy selects the patching class:
+ *   PATCH_TRAP_POLICY_ALLOW - jump-class. May plant int3 in neighbouring or
+ *       padding bytes, but normal control flow still enters through the jump,
+ *       so it is NOT the expensive primary-trap strategy.
+ *   PATCH_TRAP_POLICY_FORCE - primary int3 at the instruction; fires on every
+ *       execution. Only used when a jump cannot be installed.
+ *
+ * around selects the execution model: PROBE_AROUND installs both a pre- and a
+ * post-probe on the instruction; PROBE installs a single probe (a pre-probe at
+ * the instruction, or a deferred post-probe at a safe site).
  */
-static bool dw_instruction_entry_patch_strategy(struct insn_entry *entry,
-						enum dw_strategies strategy,
-						bool deferred)
+static bool make_probe(struct insn_entry *entry, uintptr_t address, bool around,
+		       enum patch_trap_policy trap_policy, patch_t *out)
 {
 	struct patch_location location = {
 		.type = PATCH_LOCATION_ADDRESS,
 		.direction = PATCH_LOCATION_FORWARD,
 		.algorithm = PATCH_LOCATION_FIRST,
-		.address = entry->patch_insn ? entry->patch_insn : entry->insn,
+		.address = address,
 	};
 
 	struct patch_exec_model exec_model = {
-		.type = PATCH_EXEC_MODEL_PROBE,
+		.type = around ? PATCH_EXEC_MODEL_PROBE_AROUND : PATCH_EXEC_MODEL_PROBE,
 		.probe.read_registers = 0,
 		.probe.write_registers = 0,
-		.probe.clobber_registers = (1ULL << PATCH_ARCH_GREGS_COUNT) - 1,
+		.probe.clobber_registers = entry->has_vsib ? PATCH_REGS_ALL
+							   : ((1ULL << PATCH_ARCH_GREGS_COUNT) - 1),
 		.probe.user_data = entry,
 		.probe.procedure = patch_handler,
 	};
 
-	patch_t patch;
 	patch_attr attr;
 	patch_status s;
-
-	if (entry->has_vsib)
-		exec_model.probe.clobber_registers = PATCH_REGS_ALL;
-
-	if (entry->post_handler && !entry->deferred_post_handler)
-		exec_model.type = PATCH_EXEC_MODEL_PROBE_AROUND;
-
-	if (deferred) {
-		location.address = entry->next_insn;
-		if (!entry->deferred_post_handler)
-			DW_LOG(ERROR, PATCH,
-				   "Instruction 0x%llx must be associated with a deferred post handler at this point!\n",
-				   entry->insn);
-	}
 
 	s = patch_attr_init(&attr, sizeof(attr));
 	check_patch(s, "attr init");
 
-	if (strategy == DW_PATCH_TRAP) {
-		s = patch_attr_set_trap_policy(&attr, PATCH_TRAP_POLICY_FORCE);
-		check_patch(s, "set policy FORCE");
-	} else if (strategy == DW_PATCH_JUMP) {
-		s = patch_attr_set_trap_policy(&attr, PATCH_TRAP_POLICY_ALLOW);
-		check_patch(s, "set policy ALLOW");
-	} else {
-		DW_LOG(ERROR, PATCH, "Unknown patching strategy\n");
-	}
+	s = patch_attr_set_trap_policy(&attr, trap_policy);
+	check_patch(s, "set trap policy");
 
-	s = patch_attr_set_initial_state(&attr, PATCH_ENABLED);
-	check_patch(s, "set enabled");
+	/* Staged disabled: the batch goes live atomically in patch_commit(). */
+	s = patch_attr_set_initial_state(&attr, PATCH_DISABLED);
+	check_patch(s, "set disabled");
 
-	s = patch_make(&location, &exec_model, &attr, &patch, NULL);
+	s = patch_make(&location, &exec_model, &attr, out, NULL);
 	check_patch(s, "make");
-	if (s != PATCH_OK)
-		return false;
-
-	s = patch_commit();
-	check_patch(s, "commit");
 	return s == PATCH_OK;
 }
 
 /*
- * Patch the initial or deferred site and return the strategy that eventually worked.
+ * Enable every staged probe and commit the batch atomically (single
+ * patch_commit). All transitions in a batch go live together, so a pre/post
+ * pair is never momentarily live with only one half installed.
  */
-static enum dw_strategies do_patch(struct insn_entry *entry, bool deferred)
+static bool enable_and_commit(const patch_t *patches, int n)
 {
-	const char *patch_type = deferred ? "deferred" : "initial";
-	uintptr_t patch_addr = deferred ? entry->next_insn :
-		(entry->patch_insn ? entry->patch_insn : entry->insn);
-	enum dw_strategies strategy = DW_PATCH_UNKNOWN;
+	patch_status s;
 
-	if (dw_instruction_entry_patch_strategy(entry, DW_PATCH_JUMP, deferred))
-		strategy = DW_PATCH_JUMP;
-	else if (dw_instruction_entry_patch_strategy(entry, DW_PATCH_TRAP, deferred))
-		strategy = DW_PATCH_TRAP;
-	else
+	for (int i = 0; i < n; i++) {
+		s = patch_enable(patches[i]);
 		/*
-		 * Neither JUMP nor TRAP could be installed (e.g. a libpatch
-		 * limitation at this site, or a failed overlapping patch for a
-		 * relocated OLX instruction). This is non-fatal: the caller
-		 * (handle_seg_fault) degrades the entry to single-stepping. Warn
-		 * instead of aborting via ERROR, which would kill the whole
-		 * application over a recoverable patching failure.
+		 * PATCH_NOP means the patch is already in the enabled state and
+		 * patch_enable still (re)queues it -- this is the idempotent
+		 * success case for an OLX overlapping patch whose make returned an
+		 * existing live handle. Treat it like PATCH_OK; only a real error
+		 * aborts the batch (and must not trigger a drop of a live patch).
 		 */
-		DW_LOG(WARNING, PATCH,
-			   "Patching %s location 0x%llx failed (origin 0x%llx); "
-			   "falling back to single-step.\n",
-			   patch_type, patch_addr, entry->insn);
+		if (s != PATCH_OK && s != PATCH_NOP) {
+			check_patch(s, "enable");
+			return false;
+		}
+	}
 
-	DW_LOG(DEBUG, PATCH, "Patched %s site 0x%llx with %s strategy.\n",
-		   patch_type, patch_addr, strategy_name(strategy));
-
-	return strategy;
+	s = patch_commit();
+	if (s != PATCH_OK && s != PATCH_NOP) {
+		check_patch(s, "commit");
+		return false;
+	}
+	return true;
 }
 
 /*
- * Try to patch one of the deferred safe sites with JUMP strategy.
+ * Cancel staged probes. Patches that were made (and possibly enable-queued) but
+ * never committed are still DISABLED, so patch_drop tears them down immediately
+ * with no commit required.
  */
-static bool patch_deferred_site(struct insn_entry *entry,
-				const struct post_safe_site_rb *safe_sites)
+static void drop_probes(const patch_t *patches, int n)
+{
+	for (int i = 0; i < n; i++) {
+		patch_status s = patch_drop(patches[i]);
+		check_patch(s, "drop");
+	}
+}
+
+/*
+ * Stage a deferred post-probe (DISABLED) at the newest viable safe site. On
+ * success records the chosen site in entry->next_insn, stores the handle in
+ * *out, and returns true.
+ */
+static bool make_deferred_post(struct insn_entry *entry,
+			       const struct post_safe_site_rb *safe_sites,
+			       enum patch_trap_policy trap_policy, patch_t *out)
 {
 	for (int i = (int)safe_sites->count - 1; i >= 0; i--) {
 		unsigned idx = (safe_sites->head + i) % MAX_SAFE_SITE_COUNT;
+		uintptr_t addr = safe_sites->entries[idx].addr;
 
-		entry->next_insn = safe_sites->entries[idx].addr;
-		if (dw_instruction_entry_patch_strategy(entry, DW_PATCH_JUMP, true)) {
-			DW_LOG(DEBUG, PATCH, "Successfully patched deferred site 0x%llx with %s strategy.\n",
-				   entry->next_insn, strategy_name(DW_PATCH_JUMP));
+		if (make_probe(entry, addr, false, trap_policy, out)) {
+			entry->next_insn = addr;
+			DW_LOG(DEBUG, PATCH, "Staged deferred post-probe at 0x%llx (origin 0x%llx).\n",
+				   addr, entry->insn);
 			return true;
 		}
 
 		DW_LOG(DEBUG, PATCH,
-			   "Deferred JUMP patch failed at 0x%llx (origin 0x%llx), trying next candidate.\n",
-			   entry->next_insn, entry->insn);
+			   "Deferred post-probe could not be staged at 0x%llx (origin 0x%llx), trying next.\n",
+			   addr, entry->insn);
 	}
 
 	return false;
@@ -222,39 +229,240 @@ static bool patch_deferred_site(struct insn_entry *entry,
 
 /*
  * Patches an instruction along with its corresponding deferred counterpart.
+ *
+ * Trap-policy convention: ALLOW for every jump-preferred plan (keeps punning /
+ * alias opportunities; not the costly trap fallback), FORCE only when a primary
+ * int3 is deliberately accepted because a jump cannot be installed.
+ *
+ * Every early return either commits a fully-assembled plan or drops everything
+ * it staged; no path leaves a made-but-uncommitted patch dangling.
  */
 static int patch_entry_sync(struct insn_entry *entry, const struct post_safe_site_rb *safe_sites)
 {
 	if (!entry || !safe_sites)
 		return -EINVAL;
 
-	if (!entry->post_handler || !entry->deferred_post_handler) {
-		entry->strategy = do_patch(entry, false);
-		return (entry->strategy == DW_PATCH_UNKNOWN) ? -1 : 0;
-	}
+	const uintptr_t initial = entry_initial_addr(entry);
+	const bool fast = (entry->fast_kind == DW_FAST_MOV_FIXED_FIELD && !entry->patch_insn);
+	const bool want_defer = entry->post_handler && entry->deferred_post_handler;
+	patch_t pre, post, single;
 
 	/*
-	 * Either we can patch one of the deferred sites with JUMP, or we cancel
-	 * deferring and patch the initial site (with JUMP->TRAP fallback).
+	 * OLX overlap child (relocated instruction, patch_insn != 0). patch_make
+	 * does NOT create a fresh patch here: it resolves to the shared parent
+	 * patch that owns the relocated region, registers this address as an
+	 * overlap child, and returns the parent's (already live) handle. Two
+	 * consequences drive the handling:
+	 *   - patch_enable on that handle returns PATCH_NOP (the parent is already
+	 *     enabled); enable_and_commit() treats PATCH_NOP as success.
+	 *   - patch_drop on that handle would tear down the PARENT and every
+	 *     sibling child, not just this probe. So an overlap child has no safe
+	 *     cancel path: we make + commit, or we degrade WITHOUT dropping.
+	 * Overlap children never defer (they need immediate reprotection), so this
+	 * is a single probe -- AROUND when a post is needed, else pre-only. We try
+	 * jump-class first, then a trap-policy make ONLY if the jump-class make
+	 * itself failed (if it succeeded the child slot is taken and a re-make would
+	 * be rejected as a duplicate).
 	 */
-	if (patch_deferred_site(entry, safe_sites)) {
-		enum dw_strategies initial_strategy = do_patch(entry, false);
-		if (initial_strategy == DW_PATCH_UNKNOWN) {
-			entry->strategy = DW_PATCH_UNKNOWN;
-			return -1;
+	if (entry->patch_insn) {
+		const bool around = entry->post_handler;
+
+		entry->deferred_post_handler = false;
+
+		if (make_probe(entry, initial, around, PATCH_TRAP_POLICY_ALLOW, &single)) {
+			if (enable_and_commit(&single, 1))
+				entry->strategy = DW_PATCH_JUMP;
+			else
+				/* Child is registered on the parent; do NOT drop. */
+				entry->strategy = DW_PATCH_UNKNOWN;
+			goto overlap_done;
 		}
 
-		entry->strategy = (initial_strategy != DW_PATCH_JUMP) ? DW_PATCH_MIXED : initial_strategy;
+		if (make_probe(entry, initial, around, PATCH_TRAP_POLICY_FORCE, &single)) {
+			if (enable_and_commit(&single, 1))
+				entry->strategy = DW_PATCH_TRAP;
+			else
+				entry->strategy = DW_PATCH_UNKNOWN;
+			goto overlap_done;
+		}
+
+		entry->strategy = DW_PATCH_UNKNOWN;
+
+overlap_done:
+		if (entry->strategy == DW_PATCH_UNKNOWN) {
+			DW_LOG(WARNING, PATCH,
+				   "Overlap-child patching 0x%llx failed (origin 0x%llx); "
+				   "falling back to single-step.\n",
+				   (unsigned long long)initial, (unsigned long long)entry->insn);
+			return -1;
+		}
 		return 0;
 	}
 
-	DW_LOG(DEBUG, PATCH,
-		   "Deferred JUMP patch failed for all candidates (origin 0x%llx), canceling deferring.\n",
-		   (unsigned long long)entry->insn);
+	/*
+	 * Fast in-place mov: jump-class (ALLOW) only -- never a primary TRAP.
+	 * An int3 at the instruction fires on every execution and does more work
+	 * per hit than the SIGSEGV emulate-and-skip path, which faults only when
+	 * the pointer is actually tainted. So when no jump can be installed we
+	 * degrade to DW_PATCH_EMULATE (patch_disabled) instead of forcing a trap.
+	 * OLX overlap children (patch_insn != 0) are excluded and take the
+	 * generic path below.
+	 */
+	if (fast) {
+		/*
+		 * Deferrable cluster: a pre-only jump at the instruction plus a
+		 * post jump at a safe site preserves the deferral skip across the
+		 * similar accesses (the base stays clean, so they do not re-fault).
+		 */
+		if (want_defer &&
+		    make_probe(entry, initial, false, PATCH_TRAP_POLICY_ALLOW, &pre)) {
+			if (make_deferred_post(entry, safe_sites, PATCH_TRAP_POLICY_ALLOW, &post)) {
+				if (enable_and_commit((patch_t[]){pre, post}, 2)) {
+					entry->deferred_post_handler = true;
+					entry->strategy = DW_PATCH_JUMP;
+					return 0;
+				}
+				drop_probes((patch_t[]){pre, post}, 2);
+				goto fast_emulate;
+			}
+			drop_probes(&pre, 1);
+		}
+
+		/*
+		 * Standalone (no deferral, or no safe site took the deferred
+		 * jump): a single jump-class probe on the instruction -- AROUND
+		 * when a post is needed, else pre-only.
+		 */
+		entry->deferred_post_handler = false;
+		if (make_probe(entry, initial, entry->post_handler, PATCH_TRAP_POLICY_ALLOW, &single)) {
+			if (enable_and_commit(&single, 1)) {
+				entry->strategy = DW_PATCH_JUMP;
+				return 0;
+			}
+			drop_probes(&single, 1);
+		}
+
+fast_emulate:
+		entry->deferred_post_handler = false;
+		entry->strategy = DW_PATCH_EMULATE;
+		return -1;
+	}
+
+	/*
+	 * Generic, no deferral: a single probe on the instruction. AROUND when a
+	 * post is needed, else pre-only. Jump first, primary trap as fallback.
+	 */
+	if (!want_defer) {
+		const bool around = entry->post_handler;
+
+		if (make_probe(entry, initial, around, PATCH_TRAP_POLICY_ALLOW, &single)) {
+			if (enable_and_commit(&single, 1)) {
+				entry->strategy = DW_PATCH_JUMP;
+				return 0;
+			}
+			drop_probes(&single, 1);
+		}
+
+		if (make_probe(entry, initial, around, PATCH_TRAP_POLICY_FORCE, &single)) {
+			if (enable_and_commit(&single, 1)) {
+				entry->strategy = DW_PATCH_TRAP;
+				return 0;
+			}
+			drop_probes(&single, 1);
+		}
+
+		goto degrade;
+	}
+
+	/*
+	 * Generic, deferral wanted (post_handler && deferred_post_handler).
+	 *
+	 * Path A: pre-only jump at the instruction + post jump at a safe site.
+	 */
+	if (make_probe(entry, initial, false, PATCH_TRAP_POLICY_ALLOW, &pre)) {
+		if (make_deferred_post(entry, safe_sites, PATCH_TRAP_POLICY_ALLOW, &post)) {
+			if (enable_and_commit((patch_t[]){pre, post}, 2)) {
+				entry->deferred_post_handler = true;
+				entry->strategy = DW_PATCH_JUMP;
+				return 0;
+			}
+			drop_probes((patch_t[]){pre, post}, 2);
+			goto degrade;
+		}
+
+		/*
+		 * No safe site accepted the post jump: drop the pre, cancel
+		 * deferral, and retry as a single AROUND probe (jump, then trap).
+		 */
+		drop_probes(&pre, 1);
+		entry->deferred_post_handler = false;
+
+		if (make_probe(entry, initial, true, PATCH_TRAP_POLICY_ALLOW, &single)) {
+			if (enable_and_commit(&single, 1)) {
+				entry->strategy = DW_PATCH_JUMP;
+				return 0;
+			}
+			drop_probes(&single, 1);
+		}
+
+		if (make_probe(entry, initial, true, PATCH_TRAP_POLICY_FORCE, &single)) {
+			if (enable_and_commit(&single, 1)) {
+				entry->strategy = DW_PATCH_TRAP;
+				return 0;
+			}
+			drop_probes(&single, 1);
+		}
+
+		goto degrade;
+	}
+
+	/*
+	 * Path B: the pre-only jump could not be installed at the instruction. A
+	 * jump-class AROUND needs the same 5-byte landing and would also fail, so
+	 * skip straight to trap-based plans.
+	 *
+	 * Prefer MIXED (pre trap at the instruction + post jump at a safe site):
+	 * the pre-trap untaints once and the base stays clean across the deferred
+	 * cluster, so the similar accesses do not re-fault and the deferral skip
+	 * is preserved. Only when no safe site accepts the post jump do we fall
+	 * back to a plain AROUND trap, which retaints immediately and loses that
+	 * skip.
+	 */
+	if (make_deferred_post(entry, safe_sites, PATCH_TRAP_POLICY_ALLOW, &post)) {
+		if (make_probe(entry, initial, false, PATCH_TRAP_POLICY_FORCE, &pre)) {
+			if (enable_and_commit((patch_t[]){pre, post}, 2)) {
+				entry->deferred_post_handler = true;
+				entry->strategy = DW_PATCH_MIXED;
+				return 0;
+			}
+			drop_probes((patch_t[]){pre, post}, 2);
+			goto degrade;
+		}
+		drop_probes(&post, 1);
+	}
 
 	entry->deferred_post_handler = false;
-	entry->strategy = do_patch(entry, false);
-	return (entry->strategy == DW_PATCH_UNKNOWN) ? -1 : 0;
+	if (make_probe(entry, initial, true, PATCH_TRAP_POLICY_FORCE, &single)) {
+		if (enable_and_commit(&single, 1)) {
+			entry->strategy = DW_PATCH_TRAP;
+			return 0;
+		}
+		drop_probes(&single, 1);
+	}
+
+degrade:
+	/*
+	 * No jump or trap plan could be installed (e.g. a libpatch limitation at
+	 * this site, or a failed overlapping patch for a relocated OLX
+	 * instruction). Non-fatal: handle_seg_fault degrades the entry to
+	 * single-stepping. Warn rather than abort over a recoverable failure.
+	 */
+	DW_LOG(WARNING, PATCH,
+		   "Patching 0x%llx failed (origin 0x%llx); falling back to single-step.\n",
+		   (unsigned long long)initial, (unsigned long long)entry->insn);
+	entry->deferred_post_handler = false;
+	entry->strategy = DW_PATCH_UNKNOWN;
+	return -1;
 }
 
 void dw_patch_runtime_init(void)

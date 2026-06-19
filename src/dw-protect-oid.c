@@ -291,6 +291,44 @@ DW_INTERNAL bool dw_check_access(const void *ptr, size_t size)
 	return dw_check_access_ctx(ptr, size, NULL);
 }
 
+/*
+ * Silent bounds predicate for the SIGSEGV emulate-and-skip fast path. Returns
+ * true iff [ptr, ptr + size) lies within the live object named by ptr's taint
+ * (or ptr carries no taint to check). Unlike dw_check_access_ctx() it emits no
+ * report and touches no cache: a false result -- invalid/freed taint or
+ * out-of-bounds -- tells the fast path to fall back to the single-step path,
+ * which performs the access natively and emits the single authoritative
+ * violation report. Restricting the inline emulation to the in-bounds case
+ * guarantees the address it dereferences is backed by a live allocation, so the
+ * load/store cannot nested-fault inside the signal handler.
+ */
+DW_INTERNAL bool dw_access_in_bounds(const void *ptr, size_t size)
+{
+	uintptr_t raw_addr = (uintptr_t)ptr;
+
+	/* Pointers with MSB set are not checked (mirrors dw_check_access_ctx). */
+	if (unlikely(raw_addr & (1ULL << 63)))
+		return true;
+
+	unsigned oid = raw_addr >> 48;
+	uintptr_t real_addr = raw_addr & untaint_mask;
+
+	if (oid == 0)
+		return true;
+
+	if (unlikely(oid >= oids_size))
+		return false;
+
+	void *base_addr = atomic_load_explicit(&oids[oid].base_addr, memory_order_acquire);
+	if (unlikely(base_addr == NULL))
+		return false;
+
+	uintptr_t base = (uintptr_t)base_addr;
+	size_t sz = atomic_load_explicit(&oids[oid].size, memory_order_relaxed);
+
+	return !(size > sz || real_addr < base || real_addr > base + sz - size);
+}
+
 size_t dw_get_size(void *ptr)
 {
 	unsigned oid = (uintptr_t) ptr >> 48;

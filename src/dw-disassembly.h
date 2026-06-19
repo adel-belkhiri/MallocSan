@@ -191,7 +191,18 @@ string_scan_extent(uintptr_t initial, uintptr_t final, size_t length,
 	return true;
 }
 
-enum dw_strategies {DW_PATCH_TRAP=0, DW_PATCH_JUMP, DW_PATCH_MIXED, DW_PATCH_UNKNOWN};
+enum dw_strategies {DW_PATCH_TRAP=0, DW_PATCH_JUMP, DW_PATCH_MIXED, DW_PATCH_EMULATE, DW_PATCH_UNKNOWN};
+
+/*
+ * Fast-path classification of an instruction site (Stage 1 of the
+ * SIGSEGV emulate-and-skip plan). DW_FAST_MOV_FIXED_FIELD marks a simple
+ * fixed-field `mov` (single memory operand, GPR base + constant displacement,
+ * no index/VSIB, no RIP-relative or segment override, scalar width 1/2/4/8)
+ * that the SIGSEGV handler can emulate and skip in a single signal instead of
+ * the two-signal single-step dance. The metadata below is precomputed here so
+ * the signal handler needs no register-table lookup on the hot path.
+ */
+enum dw_fast_kind {DW_FAST_NONE = 0, DW_FAST_MOV_FIXED_FIELD};
 
 enum entry_state {ENTRY_EMPTY = 0, ENTRY_INITIALIZING /* one thread is creating this entry */, ENTRY_READY /* fully initialized */, ENTRY_FAILED /* creation failed, don't retry */};
 
@@ -312,6 +323,7 @@ static inline const char *strategy_name(enum dw_strategies s)
 		case DW_PATCH_TRAP: return "TRAP";
 		case DW_PATCH_JUMP: return "JUMP";
 		case DW_PATCH_MIXED: return "MIXED";
+		case DW_PATCH_EMULATE: return "EMULATE";
 		default: return "UNKNOWN";
 	}
 }
@@ -355,6 +367,14 @@ struct insn_entry {
 	char disasm_insn[64];
 	unsigned strategy;
 	unsigned insn_length;
+	/* Fast-path (SIGSEGV emulate-and-skip) metadata; see enum dw_fast_kind.
+	 * Populated at decode time, consumed by the signal handler (later stages). */
+	uint8_t fast_kind;       /* enum dw_fast_kind */
+	uint8_t fast_base_uctx;  /* ucontext_index of base reg (dw_get/set_register) */
+	uint8_t fast_dst_uctx;   /* load: dest reg slot; store: src reg slot */
+	uint8_t fast_width;      /* access width in bytes: 1/2/4/8 */
+	bool fast_is_load;       /* true: mem->reg (load); false: reg->mem (store) */
+	int64_t fast_disp;       /* constant displacement */
 	uint8_t gregs_read_count;
 	uint8_t gregs_write_count;
 	uint16_t gregs_read[MAX_MOD_REG]; // test

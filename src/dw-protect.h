@@ -43,6 +43,13 @@ struct patch_exec_context;
 DW_INTERNAL bool dw_check_access_ctx(const void *ptr, size_t size,
 						 const struct patch_exec_context *ctx);
 
+/*
+ * Silent in-bounds predicate (no report, no cache side effects) used by the
+ * SIGSEGV emulate-and-skip fast path to decide whether an access is safe to
+ * perform inline. False means fall back to the single-step path.
+ */
+DW_INTERNAL bool dw_access_in_bounds(const void *ptr, size_t size);
+
 /* Get the allocated size of a protected object */
 size_t dw_get_size(void *ptr);
 

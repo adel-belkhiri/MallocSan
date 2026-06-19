@@ -911,6 +911,79 @@ static inline unsigned int get_avx512_mask_register(uint16_t gregs_reads[],
 	return X86_REG_INVALID;
 }
 
+/*
+ * Stage 1 of the SIGSEGV emulate-and-skip plan: tag a site as
+ * DW_FAST_MOV_FIXED_FIELD when it is a simple fixed-field `mov` that the signal
+ * handler can later emulate and skip in a single signal. All of the following
+ * must hold:
+ *   - mnemonic is `mov` (plain mov; movzx/movsx have distinct ids);
+ *   - exactly one memory operand and exactly one register operand;
+ *   - base is a GPR (this also rejects RIP-relative and absolute addressing);
+ *   - no index register / VSIB;
+ *   - no segment override beyond normal flat addressing;
+ *   - not REP/string;
+ *   - scalar access width in {1,2,4,8};
+ *   - register operand is not a high-byte sub-register (AH/BH/CH/DH), whose
+ *     offset/semantics are deferred to a later stage.
+ * The flat metadata (base/dst ucontext offsets, width, disp, load/store) is
+ * precomputed so the hot signal path needs no register-table lookup. This stage
+ * only records the metadata; no handler or routing yet consumes it.
+ */
+static void
+classify_fast_kind(struct insn_entry *entry, const cs_insn *insn, const cs_x86 *x86)
+{
+	entry->fast_kind = DW_FAST_NONE;
+
+	if (insn->id != X86_INS_MOV)
+		return;
+	if (entry->repeat)
+		return;
+	if (entry->nb_arg_m != 1 || entry->nb_arg_r != 1)
+		return;
+
+	const struct memory_arg *m = &entry->arg_m[0];
+
+	/* base must be a GPR: rejects RIP-relative and absolute addressing */
+	if (!reg_is_gpr(m->base))
+		return;
+	/* no index register / VSIB */
+	if (m->index != X86_REG_INVALID)
+		return;
+	/* scalar width must be one of the supported sizes */
+	if (m->length != 1 && m->length != 2 && m->length != 4 && m->length != 8)
+		return;
+
+	/* no segment override beyond normal flat addressing */
+	for (int i = 0; i < x86->op_count; i++) {
+		if (x86->operands[i].type == X86_OP_MEM &&
+		    x86->operands[i].mem.segment != X86_REG_INVALID)
+			return;
+	}
+
+	/* the single register operand: load => destination, store => source */
+	unsigned reg = entry->arg_r[0].reg;
+	if (reg == X86_REG_AH || reg == X86_REG_BH ||
+	    reg == X86_REG_CH || reg == X86_REG_DH)
+		return;
+
+	const struct reg_entry *base_re = m->base_re;
+	const struct reg_entry *dst_re = dw_get_reg_entry(reg);
+	if (!base_re || !dst_re)
+		return;
+
+	/* the ucontext offsets must fit the uint8_t hot-path fields */
+	if (base_re->ucontext_index < 0 || base_re->ucontext_index > UINT8_MAX ||
+	    dst_re->ucontext_index < 0 || dst_re->ucontext_index > UINT8_MAX)
+		return;
+
+	entry->fast_kind = DW_FAST_MOV_FIXED_FIELD;
+	entry->fast_base_uctx = (uint8_t)base_re->ucontext_index;
+	entry->fast_dst_uctx = (uint8_t)dst_re->ucontext_index;
+	entry->fast_width = (uint8_t)m->length;
+	entry->fast_is_load = (m->access & CS_AC_WRITE) == 0;
+	entry->fast_disp = m->displacement;
+}
+
 static unsigned
 fill_instruction_operands(struct insn_entry *entry, struct insn_entry_runtime* entry_rt, const csh handle, const cs_insn *insn,
 						  const cs_x86 *x86, const ucontext_t *uctx)
@@ -984,6 +1057,7 @@ fill_instruction_operands(struct insn_entry *entry, struct insn_entry_runtime* e
 	entry->nb_arg_r = arg_r;
 
 	assign_base_index_access(entry);
+	classify_fast_kind(entry, insn, x86);
 	return nb_protected;
 }
 
@@ -1892,9 +1966,9 @@ void dw_print_instruction_entries(instruction_table *table, int fd)
 	bool has_index;
 
 	/* Header */
-	dw_fprintf(fd, "%-5s %-18s %-*s %-10s %-10s %-8s %-9s %-6s %-6s %-10s %-6s %s\n",
+	dw_fprintf(fd, "%-5s %-18s %-*s %-10s %-10s %-8s %-9s %-6s %-6s %-10s %-6s %-6s %s\n",
 				   "#", "ip", func_col_width, "func", "off", "hits", "len", "m_args",
-				   "index", "post", "defer", "strat", "disasm");
+				   "index", "post", "defer", "fast", "strat", "disasm");
 
 	for (int i = 0; i < table->size; i++) {
 
@@ -1931,7 +2005,7 @@ void dw_print_instruction_entries(instruction_table *table, int fd)
 			}
 		}
 
-		dw_fprintf(fd, "%-5u 0x%-16lx %-*s 0x%-8lx %-10lu %-8u %-9u %-6u %-6u %-10u %-6u %s\n",
+		dw_fprintf(fd, "%-5u 0x%-16lx %-*s 0x%-8lx %-10lu %-8u %-9u %-6u %-6u %-10u %-6u %-6u %s\n",
 				   count,
 				   (unsigned long)fault,
 				   func_col_width,
@@ -1943,6 +2017,7 @@ void dw_print_instruction_entries(instruction_table *table, int fd)
 				   (unsigned)has_index,
 				   (unsigned)entry->post_handler,
 				   (unsigned)entry->deferred_post_handler,
+				   (unsigned)(entry->fast_kind == DW_FAST_MOV_FIXED_FIELD),
 				   entry->strategy,
 				   entry->disasm_insn);
 
