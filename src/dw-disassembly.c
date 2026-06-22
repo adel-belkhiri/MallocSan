@@ -415,9 +415,19 @@ static inline bool instruction_is_rep_conditional(unsigned id)
  * access is similar to the one in the entry. The base and index registers must
  * match, but the displacement, scale, and length can be different. In the latter
  * case, we check that the resulting address is within bounds.
+ *
+ * base_delta / index_delta carry the net constant adjustment applied to the
+ * base/index register since the fault, accumulated by the forward scan when it
+ * steps over `add/sub/inc/dec reg, imm` (improvement: constant pointer walk).
+ * The register's live value at this access is therefore m_rt->base_addr +
+ * base_delta (resp. index), so the deltas are folded into the effective-address
+ * computation below. A non-zero delta also disqualifies the fast path: even an
+ * identical addressing form now resolves to a different (shifted) address than
+ * the one validated at fault time, so it must take the bounds-checked slow path.
  */
 static bool similar_memory_access(unsigned int ins_id, const cs_x86_op *arg,
-		const struct memory_arg *m, const struct memory_arg_runtime *m_rt, ucontext_t *uctx, bool repeat)
+		const struct memory_arg *m, const struct memory_arg_runtime *m_rt, ucontext_t *uctx, bool repeat,
+		int64_t base_delta, int64_t index_delta)
 {
 	uintptr_t addr;
 
@@ -448,7 +458,8 @@ static bool similar_memory_access(unsigned int ins_id, const cs_x86_op *arg,
 	if (ins_id == X86_INS_LEA)
 		return false;
 
-	if (arg->mem.scale == m->scale &&
+	if (base_delta == 0 && index_delta == 0 &&
+	    arg->mem.scale == m->scale &&
 	    arg->mem.disp  == m->displacement &&
 	    arg->size      == m->length)
 		return true;
@@ -466,9 +477,11 @@ static bool similar_memory_access(unsigned int ins_id, const cs_x86_op *arg,
 	/*
 	 * SIB case: base + index * scale + disp.
 	 */
-	uintptr_t index_addr = (m->index != X86_REG_INVALID) ? m_rt->index_addr : 0;
+	uintptr_t index_addr = (m->index != X86_REG_INVALID)
+				       ? m_rt->index_addr + (uintptr_t)index_delta : 0;
 
-	addr = m_rt->base_addr + index_addr * arg->mem.scale + arg->mem.disp;
+	addr = m_rt->base_addr + (uintptr_t)base_delta +
+	       index_addr * arg->mem.scale + arg->mem.disp;
 
 	uint64_t count = 0;
 	bool df = false;
@@ -514,6 +527,140 @@ static bool get_function_bounds(uintptr_t ip, uintptr_t *start, uintptr_t *end)
 }
 
 /*
+ * Upper bound on the magnitude of an accumulated constant pointer-walk delta the
+ * forward scan will track. Real constant adjustments (`add p, 8`, page strides)
+ * are tiny; this cap exists only to keep base_addr + delta far from wrapping the
+ * object-id field in bits 48-63 of a tainted pointer. Well beyond any plausible
+ * in-window walk, nowhere near the 48-bit boundary. Exceeding it stops tracking
+ * (the instruction then takes the normal reg-modified stop), which is safe.
+ */
+#define DW_MAX_PTR_WALK_DELTA (1LL << 30)
+
+/*
+ * Return the accumulated constant delta tracked for `reg` (matched by canonical
+ * register index against the tainted-register set), or 0 when `reg` is not a
+ * tracked tainted register. `deltas` is parallel to `regs`.
+ */
+static inline int64_t reg_tracked_delta(uint32_t reg, const uint16_t *regs,
+					const int64_t *deltas, uint8_t count)
+{
+	const struct reg_entry *re = dw_get_reg_entry(reg);
+	if (!re)
+		return 0;
+
+	int canon = re->canonical_index;
+	for (uint8_t i = 0; i < count; i++)
+		if (dw_get_reg_entry(regs[i])->canonical_index == canon)
+			return deltas[i];
+
+	return 0;
+}
+
+/*
+ * Recognize a width-64 constant adjustment of a single tracked tainted register:
+ * `add reg, imm`, `sub reg, imm`, `inc reg`, `dec reg`. On a match, *reg_out is
+ * the adjusted register and *adj_out the signed constant added to it. Such an
+ * instruction creates no new alias and performs no memory access; the scan can
+ * step over it by folding `adj_out` into that register's running delta and
+ * validating subsequent same-object accesses against the shifted address.
+ *
+ * Strict gating keeps it sound:
+ *   - exactly the listed opcodes;
+ *   - destination operand is a 64-bit register (a 32-bit form would zero-extend
+ *     and truncate the high object-id bits, destroying the tag);
+ *   - that register is in the tainted set;
+ *   - for add/sub the source is an immediate (no register/memory term, so the
+ *     adjustment is a compile-time constant known here at scan time).
+ */
+static bool const_adjust_of_tainted_reg(const cs_insn *insn,
+					const uint16_t *tainted_regs,
+					uint8_t tainted_regs_count,
+					uint32_t *reg_out, int64_t *adj_out)
+{
+	const cs_x86 *x = &insn->detail->x86;
+	const cs_x86_op *dst = &x->operands[0];
+	int64_t adj;
+
+	switch (insn->id) {
+	case X86_INS_ADD:
+	case X86_INS_SUB:
+		if (x->op_count != 2 || x->operands[1].type != X86_OP_IMM)
+			return false;
+		adj = (insn->id == X86_INS_SUB) ? -x->operands[1].imm
+						: x->operands[1].imm;
+		break;
+	case X86_INS_INC:
+		if (x->op_count != 1)
+			return false;
+		adj = 1;
+		break;
+	case X86_INS_DEC:
+		if (x->op_count != 1)
+			return false;
+		adj = -1;
+		break;
+	default:
+		return false;
+	}
+
+	/* Destination must be a full 64-bit register, else the tag is truncated. */
+	if (dst->type != X86_OP_REG || dst->size != 8)
+		return false;
+
+	if (!reg_check_access(dst->reg, tainted_regs, tainted_regs_count))
+		return false;
+
+	*reg_out = dst->reg;
+	*adj_out = adj;
+	return true;
+}
+
+/*
+ * A memory operand is provably non-heap when its effective address cannot carry
+ * a tainted (OID-tagged) heap pointer. MallocSan taints only heap pointers, so
+ * such an access can never raise a guard fault:
+ *   - FS/GS segment override: thread-local / segment storage.
+ *   - RIP-relative: a fixed link-time global/static address.
+ *   - RSP-relative with no index: the stack.
+ * %rbp is deliberately NOT accepted as a stack base: under -fomit-frame-pointer
+ * it is a general-purpose register that may hold a tainted pointer. Any operand
+ * carrying an index register is rejected conservatively (the index itself could
+ * hold a tainted pointer).
+ */
+static bool mem_operand_is_non_heap(const cs_x86_op *op)
+{
+	if (op->mem.segment == X86_REG_FS || op->mem.segment == X86_REG_GS)
+		return true;
+	if (op->mem.base == X86_REG_RIP)
+		return true;
+	if (op->mem.base == X86_REG_RSP && op->mem.index == X86_REG_INVALID)
+		return true;
+	return false;
+}
+
+/*
+ * True if executing this instruction could raise a heap guard fault, i.e. it
+ * dereferences memory through an address that may hold a tainted heap pointer.
+ * Used to decide whether the instruction is a valid post-handler (retaint)
+ * site: a fault-free instruction can host a probe even though it touches memory.
+ * LEA and the multi-byte NOP decode with a memory operand but never dereference
+ * it; an instruction whose every memory operand is provably non-heap (see
+ * mem_operand_is_non_heap) is likewise fault-free.
+ */
+static bool insn_can_heap_fault(const cs_insn *insn, const cs_x86 *x86)
+{
+	if (insn->id == X86_INS_LEA || insn->id == X86_INS_NOP)
+		return false;
+
+	for (int i = 0; i < x86->op_count; i++) {
+		const cs_x86_op *op = &x86->operands[i];
+		if (op->type == X86_OP_MEM && !mem_operand_is_non_heap(op))
+			return true;
+	}
+	return false;
+}
+
+/*
  * Defer post-handler installation by scanning forward for safe instruction sites.
  *
  * This function scans instructions starting from the next instruction after a fault,
@@ -544,6 +691,10 @@ static uintptr_t dw_defer_post_handler(struct insn_entry *entry,
 	unsigned n = 0;
 	int error_code;
 	uint16_t tainted_regs[MAX_MEM_ARG * 2] = {0};
+	/* Parallel to tainted_regs: net constant adjustment applied to each tainted
+	 * register since the fault, accumulated when the scan steps over a constant
+	 * pointer walk (add/sub/inc/dec reg, imm). */
+	int64_t tainted_delta[MAX_MEM_ARG * 2] = {0};
 	uint8_t tainted_regs_count = 0;
 	struct memory_arg *mem;
 	struct memory_arg_runtime *mem_rt;
@@ -603,7 +754,6 @@ static uintptr_t dw_defer_post_handler(struct insn_entry *entry,
 		uint8_t read_count = 0, write_count = 0;
 		uint16_t reg_ops[16], mem_ops[16];
 		uint8_t reg_ops_count = 0, mem_ops_count = 0;
-		bool is_memory_access_instruction = false;
 
 		error_code = cs_regs_access(cs->handle, insn, regs_read, &read_count,
 								   regs_write, &write_count);
@@ -616,11 +766,18 @@ static uintptr_t dw_defer_post_handler(struct insn_entry *entry,
 			if (op->type == X86_OP_REG) {
 				reg_set_add(reg_ops, &reg_ops_count, sizeof(reg_ops) / sizeof(reg_ops[0]), op->reg);
 			} else if (op->type == X86_OP_MEM) {
-				is_memory_access_instruction = true;
 				reg_set_add(mem_ops, &mem_ops_count, sizeof(mem_ops) / sizeof(mem_ops[0]), op->mem.base);
 				reg_set_add(mem_ops, &mem_ops_count, sizeof(mem_ops) / sizeof(mem_ops[0]), op->mem.index);
 			}
 		}
+
+		/*
+		 * Whether a post-handler may be installed on this instruction. A
+		 * fault-free instruction is a valid retaint site even if it touches
+		 * memory, as long as the access cannot reach a tainted heap pointer
+		 * (stack/global/segment addressing, or LEA/NOP that never dereference).
+		 */
+		bool can_heap_fault = insn_can_heap_fault(insn, x86);
 
 		// 1) Stop scanning on control-flow change
 		for (int i = 0; i < detail->groups_count; i++) {
@@ -659,7 +816,7 @@ static uintptr_t dw_defer_post_handler(struct insn_entry *entry,
 			 * When a safe site is found, we record a few "tail" safe sites as fallback
 			 * in case the preferred site is not patchable with a JUMP.
 			 */
-			if (!is_memory_access_instruction) {
+			if (!can_heap_fault) {
 				if (last_safe_addr <= last_same_access_addr) {
 					last_safe_addr = insn->address;
 					count_same_access += pending_same_access;
@@ -676,6 +833,54 @@ static uintptr_t dw_defer_post_handler(struct insn_entry *entry,
 				   insn->address, insn->mnemonic, insn->op_str, insn->size);
 			++n;
 			continue;
+		}
+
+		/*
+		 * 2b) Constant pointer walk. A `add/sub/inc/dec reg, imm` on a tracked
+		 * tainted register adjusts the pointer by a compile-time constant without
+		 * aliasing or accessing memory. Instead of stopping here (it would
+		 * otherwise be a reg read+modify => REG_MODIFIED stop below), fold the
+		 * adjustment into that register's running delta and keep scanning;
+		 * subsequent same-object accesses are validated against the shifted
+		 * address via similar_memory_access(). Bail to the normal stop only if
+		 * the accumulated delta would approach the tag field.
+		 */
+		uint32_t adj_reg;
+		int64_t adj;
+		if (const_adjust_of_tainted_reg(insn, tainted_regs, tainted_regs_count,
+						&adj_reg, &adj)) {
+			const struct reg_entry *adj_re = dw_get_reg_entry(adj_reg);
+			int adj_canon = adj_re ? adj_re->canonical_index : X86_REG_INVALID;
+			bool tracked = false;
+			for (unsigned i = 0; i < tainted_regs_count; i++) {
+				const struct reg_entry *re = dw_get_reg_entry(tainted_regs[i]);
+				if (!re || re->canonical_index != adj_canon)
+					continue;
+				int64_t nd = tainted_delta[i] + adj;
+				if (nd <= DW_MAX_PTR_WALK_DELTA && nd >= -DW_MAX_PTR_WALK_DELTA) {
+					tainted_delta[i] = nd;
+					tracked = true;
+				}
+				break;
+			}
+
+			if (tracked) {
+				DW_LOG(DEBUG, DISASSEMBLY,
+					   "Tracking constant pointer walk at 0x%llx -> %s %s (delta %+lld)\n",
+					   insn->address, insn->mnemonic, insn->op_str, (long long)adj);
+				++n;
+				continue;
+			}
+
+			/* Accumulated delta would approach the tag field: fall back to the
+			 * register-modified stop (this insn is reg,imm, never a memory
+			 * access, so record it as a candidate safe site first). */
+			if (last_safe_addr <= last_same_access_addr) {
+				last_safe_addr = insn->address;
+				count_same_access += pending_same_access;
+				add_post_safe_site(rb, last_safe_addr, insn->size, count_same_access);
+			}
+			goto stop_return;
 		}
 
 		// 3) Check memory addresses divergence
@@ -698,7 +903,17 @@ static uintptr_t dw_defer_post_handler(struct insn_entry *entry,
 					mem = &entry->arg_m[j];
 					mem_rt = &entry_rt->arg_m[j];
 
-					if (!similar_memory_access(insn->id, op, mem, mem_rt, uctx, repeat))
+					/* Fold each register's tracked constant walk into the
+					 * effective-address check. The deltas key on the entry's
+					 * base/index registers (which match this access's, since
+					 * uses_taint required a tainted base/index here). */
+					int64_t bdelta = reg_tracked_delta(mem->base, tainted_regs,
+									   tainted_delta, tainted_regs_count);
+					int64_t idelta = reg_tracked_delta(mem->index, tainted_regs,
+									   tainted_delta, tainted_regs_count);
+
+					if (!similar_memory_access(insn->id, op, mem, mem_rt, uctx, repeat,
+								   bdelta, idelta))
 						goto stop_return;
 					}
 					last_same_access_addr = insn->address;
@@ -724,7 +939,7 @@ static uintptr_t dw_defer_post_handler(struct insn_entry *entry,
 					entry->post_handler = false;
 				}
 
-				if (!is_memory_access_instruction && (last_safe_addr <= last_same_access_addr)) {
+				if (!can_heap_fault && (last_safe_addr <= last_same_access_addr)) {
 					last_safe_addr = insn->address;
 					count_same_access += pending_same_access;
 					add_post_safe_site(rb, last_safe_addr, insn->size, count_same_access);
@@ -734,7 +949,7 @@ static uintptr_t dw_defer_post_handler(struct insn_entry *entry,
 
 			// The tainted base or index register is read
 			if (read) {
-				if (!is_memory_access_instruction && (last_safe_addr <= last_same_access_addr)) {
+				if (!can_heap_fault && (last_safe_addr <= last_same_access_addr)) {
 					last_safe_addr = insn->address;
 					count_same_access += pending_same_access;
 					add_post_safe_site(rb, last_safe_addr, insn->size, count_same_access);
@@ -748,7 +963,7 @@ static uintptr_t dw_defer_post_handler(struct insn_entry *entry,
 
 		// All tainted registers are overwritten, so we can skip the post-handler
 		if (every_tainted_reg_written) {
-			if (!is_memory_access_instruction && (last_safe_addr <= last_same_access_addr)) {
+			if (!can_heap_fault && (last_safe_addr <= last_same_access_addr)) {
 				last_safe_addr = insn->address;
 				count_same_access += pending_same_access;
 				add_post_safe_site(rb, last_safe_addr, insn->size, count_same_access);
