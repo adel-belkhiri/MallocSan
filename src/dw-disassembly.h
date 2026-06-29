@@ -345,11 +345,9 @@ extern __thread struct insn_entry_runtime insn_rt_slots[MAX_SCAN_INST_COUNT];
 /*
  * Compact, per-thread ownership map for the runtime slots above. slot_owner[i]
  * is the insn_entry that currently owns insn_rt_slots[i], or NULL when the slot
- * is free. It is the single source of truth for slot occupancy. Keeping it as a
- * separate, densely-packed array (one pointer per slot) means the acquire/find
- * scans touch ~2 KiB of contiguous, prefetchable memory instead of striding the
- * first/last cache line of every 304-byte insn_entry_runtime, which matters on
- * the hot probe pre-handler path.
+ * is free. The hot-path entry -> slot lookup lives in a private TLS side map in
+ * `dw-disassembly.c`; slot_owner remains the reverse mapping used by release and
+ * by any diagnostics that need to inspect live slot ownership.
  */
 extern __thread struct insn_entry *slot_owner[MAX_SCAN_INST_COUNT];
 

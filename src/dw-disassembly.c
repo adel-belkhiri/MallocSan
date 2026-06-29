@@ -36,6 +36,32 @@ __thread struct insn_entry_runtime insn_rt_slots[MAX_SCAN_INST_COUNT]
 __thread struct insn_entry *slot_owner[MAX_SCAN_INST_COUNT]
 	__attribute__((tls_model("initial-exec")));
 
+#define DW_RT_SLOT_BUCKETS (MAX_SCAN_INST_COUNT * 2)
+
+/*
+ * Per-thread entry -> slot index side map for the runtime slots above.
+ *
+ * The hot pre-handler path must answer two questions:
+ *   1. does this entry already own a slot on this thread?
+ *   2. if not, allocate one free slot.
+ *
+ * A full 256-entry scan answers both but is far too expensive on hot faults.
+ * Instead we keep a tiny fixed-size hash chain keyed by insn_entry*. Each live
+ * slot index is the node in one bucket chain, so lookup is O(1) expected and
+ * release can unlink via the slot index it already has. No malloc, no locks,
+ * and all state stays thread-local and signal-safe.
+ */
+static __thread int16_t rt_slot_bucket_head[DW_RT_SLOT_BUCKETS]
+	__attribute__((tls_model("initial-exec")));
+static __thread int16_t rt_slot_next[MAX_SCAN_INST_COUNT]
+	__attribute__((tls_model("initial-exec")));
+static __thread uint16_t rt_slot_free_stack[MAX_SCAN_INST_COUNT]
+	__attribute__((tls_model("initial-exec")));
+static __thread uint16_t rt_slot_free_top
+	__attribute__((tls_model("initial-exec")));
+static __thread bool rt_slot_state_ready
+	__attribute__((tls_model("initial-exec")));
+
 /*
  * Shared loop-exit plan registry (#5 coalescing). A fixed-size linear,
  * append-only table of committed #5 exit posts, keyed on the fall-through exit
@@ -265,6 +291,30 @@ static inline size_t get_pow2(size_t x)
 	return 1ULL << (64 - __builtin_clzl(x - 1));
 }
 
+static inline void dw_init_runtime_slot_state(void)
+{
+	if (rt_slot_state_ready)
+		return;
+
+	for (int i = 0; i < DW_RT_SLOT_BUCKETS; ++i)
+		rt_slot_bucket_head[i] = -1;
+
+	for (int i = 0; i < MAX_SCAN_INST_COUNT; ++i) {
+		rt_slot_next[i] = -1;
+		rt_slot_free_stack[i] = (uint16_t)(MAX_SCAN_INST_COUNT - 1 - i);
+	}
+
+	rt_slot_free_top = MAX_SCAN_INST_COUNT;
+	rt_slot_state_ready = true;
+}
+
+static inline size_t dw_runtime_slot_bucket(const struct insn_entry *entry)
+{
+	return hash_addr((uintptr_t)entry) % DW_RT_SLOT_BUCKETS;
+}
+
+static inline bool dw_find_runtime_slot(struct insn_entry *entry, int *idx_out);
+
 /*
  * Allocate the instruction hash table and initialize libcapstone.
  */
@@ -324,22 +374,19 @@ struct insn_entry *dw_get_instruction_entry(instruction_table *table, uintptr_t 
 
 static inline bool dw_acquire_runtime_slot(struct insn_entry *entry, int *idx_out)
 {
-	int first_free = -1;
+	dw_init_runtime_slot_state();
 
-	for (int i = 0; i < MAX_SCAN_INST_COUNT; ++i) {
-		struct insn_entry *owner = slot_owner[i];
+	if (dw_find_runtime_slot(entry, idx_out))
+		return true;
 
-		if (owner == entry) {
-			*idx_out = i;
-			return true;
-		}
-		if (owner == NULL && first_free < 0)
-			first_free = i;
-	}
+	if (rt_slot_free_top > 0) {
+		int idx = rt_slot_free_stack[--rt_slot_free_top];
+		size_t bucket = dw_runtime_slot_bucket(entry);
 
-	if (first_free >= 0) {
-		slot_owner[first_free] = entry;
-		*idx_out = first_free;
+		slot_owner[idx] = entry;
+		rt_slot_next[idx] = rt_slot_bucket_head[bucket];
+		rt_slot_bucket_head[bucket] = (int16_t)idx;
+		*idx_out = idx;
 		return true;
 	}
 
@@ -350,10 +397,14 @@ static inline bool dw_acquire_runtime_slot(struct insn_entry *entry, int *idx_ou
 
 static inline bool dw_find_runtime_slot(struct insn_entry *entry, int *idx_out)
 {
-	for (int i = 0; i < MAX_SCAN_INST_COUNT; i++) {
-		if (slot_owner[i] == entry) {
+	if (!rt_slot_state_ready || !entry)
+		return false;
+
+	size_t bucket = dw_runtime_slot_bucket(entry);
+	for (int idx = rt_slot_bucket_head[bucket]; idx >= 0; idx = rt_slot_next[idx]) {
+		if (slot_owner[idx] == entry) {
 			if (idx_out)
-				*idx_out = i;
+				*idx_out = idx;
 			return true;
 		}
 	}
@@ -366,7 +417,30 @@ static inline void dw_release_rt_slot(int idx)
 	if (idx < 0 || idx >= MAX_SCAN_INST_COUNT)
 		return;
 
+	dw_init_runtime_slot_state();
+
+	struct insn_entry *entry = slot_owner[idx];
+	if (!entry)
+		return;
+
+	size_t bucket = dw_runtime_slot_bucket(entry);
+	int16_t *link = &rt_slot_bucket_head[bucket];
+
+	while (*link >= 0) {
+		if (*link == idx) {
+			*link = rt_slot_next[idx];
+			rt_slot_next[idx] = -1;
+			slot_owner[idx] = NULL;
+			rt_slot_free_stack[rt_slot_free_top++] = (uint16_t)idx;
+			return;
+		}
+		link = &rt_slot_next[*link];
+	}
+
+	DW_LOG(ERROR, DISASSEMBLY, "Runtime slot %d missing from side map\n", idx);
+	rt_slot_next[idx] = -1;
 	slot_owner[idx] = NULL;
+	rt_slot_free_stack[rt_slot_free_top++] = (uint16_t)idx;
 }
 
 /*
