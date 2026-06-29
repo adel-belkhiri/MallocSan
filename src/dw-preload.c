@@ -631,6 +631,17 @@ static uintptr_t handle_seg_fault(struct trampoline_gpr_frame *frame)
 						   entry->insn, patch_rc);
 			}
 		}
+
+		/*
+		 * Variant A loop-exit: this fault is the loop entry. There is no
+		 * pre-probe, so strip the invariant base here and resume native
+		 * execution; the loop body runs clean and the deferred post at the
+		 * fall-through exit re-applies the taint. Reflect the stripped base
+		 * back into the trampoline frame so the resume lands on a clean EA.
+		 */
+		if (created_out && entry->loop_exit_activate &&
+		    dw_loop_exit_activate_context(entry, &fault_uctx))
+			dw_uctx_to_trampoline_frame(&fault_uctx, frame);
 	}
 
 out:
@@ -899,6 +910,20 @@ void signal_protected(int sig, siginfo_t *info, void *context)
 	if (entry && (entry->patch_disabled || entry->patch_insn)) {
 		if (unlikely(dw_stats_enabled))
 			atomic_fetch_add_explicit(&entry->hit_count, 1, memory_order_relaxed);
+
+		/*
+		 * Variant A loop-exit: each subsequent loop entry re-faults here.
+		 * Re-strip the invariant base in the signal ucontext and resume
+		 * native execution; the deferred loop-exit post re-applies the taint.
+		 * Must precede emulate/single-step: a loop-exit entry is serviced by
+		 * re-strip activation, never by emulate-and-skip or TF single-step.
+		 */
+		if (entry->loop_exit_activate &&
+		    dw_loop_exit_activate_context(entry, uctx)) {
+			dw_protect_active = save_active;
+			bt_signal_seed = NULL;
+			return;
+		}
 
 		/*
 		 * Emulate-and-skip fast path for eligible in-place fixed-field movs:

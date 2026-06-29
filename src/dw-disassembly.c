@@ -36,6 +36,104 @@ __thread struct insn_entry_runtime insn_rt_slots[MAX_SCAN_INST_COUNT]
 __thread struct insn_entry *slot_owner[MAX_SCAN_INST_COUNT]
 	__attribute__((tls_model("initial-exec")));
 
+/*
+ * Shared loop-exit plan registry (#5 coalescing). A fixed-size linear,
+ * append-only table of committed #5 exit posts, keyed on the fall-through exit
+ * address. members[0] of each plan is the OWNER (it installed the physical
+ * post); siblings appended later share that one post.
+ *
+ * WRITERS (lookup-for-election, create_owner, attach) run from patch_entry_sync.
+ * That is USUALLY the single patch worker thread, but it also runs synchronously
+ * on arbitrary faulting threads (worker not started, queue stopped, or a request
+ * issued from the worker itself), so the table is NOT implicitly single-writer.
+ * All writers therefore hold dw_le_plan_mu, and the owner/sibling election
+ * (lookup -> emptiness re-check -> install -> create_owner/attach) runs as one
+ * critical section under that lock, so two entries can never both own one exit.
+ *
+ * The READER is the owner's exit post (dw_reprotect_plan_context), which fires
+ * from async-signal/trap context on arbitrary threads and MUST stay lock-free:
+ * it never takes dw_le_plan_mu. It reads owner->loop_exit_plan plus nb_members
+ * with acquire, paired with the writers' release stores on nb_members and
+ * dw_le_plan_count, so it always observes a coherent {plan, members[]} snapshot.
+ */
+#define DW_LE_PLAN_MAX 512
+static struct le_plan dw_le_plans[DW_LE_PLAN_MAX];
+static atomic_uint dw_le_plan_count;
+
+/*
+ * Serializes the registry WRITERS only (the commit/election path). It is never
+ * taken from the async-signal post-handler reader, so it cannot deadlock or
+ * stall signal context. Held across a whole lookup->create/attach sequence so
+ * the read-modify-write is atomic with respect to other writers.
+ */
+static pthread_mutex_t dw_le_plan_mu = PTHREAD_MUTEX_INITIALIZER;
+
+DW_INTERNAL void dw_le_plan_lock(void)
+{
+	(void) pthread_mutex_lock(&dw_le_plan_mu);
+}
+
+DW_INTERNAL void dw_le_plan_unlock(void)
+{
+	(void) pthread_mutex_unlock(&dw_le_plan_mu);
+}
+
+DW_INTERNAL struct le_plan *dw_le_plan_lookup(uintptr_t exit_target)
+{
+	if (!exit_target)
+		return NULL;
+
+	unsigned n = atomic_load_explicit(&dw_le_plan_count, memory_order_acquire);
+	for (unsigned i = 0; i < n; i++)
+		if (dw_le_plans[i].exit_target == exit_target)
+			return &dw_le_plans[i];
+	return NULL;
+}
+
+/* Caller must hold dw_le_plan_mu (the lookup-then-append must be atomic). */
+DW_INTERNAL struct le_plan *dw_le_plan_create_owner(struct insn_entry *owner,
+		uintptr_t exit_target)
+{
+	if (!exit_target || !owner)
+		return NULL;
+
+	struct le_plan *existing = dw_le_plan_lookup(exit_target);
+	if (existing)
+		return existing; /* idempotent: owner already registered */
+
+	unsigned n = atomic_load_explicit(&dw_le_plan_count, memory_order_acquire);
+	if (n >= DW_LE_PLAN_MAX)
+		return NULL; /* registry full: caller keeps its own per-iteration post */
+
+	struct le_plan *plan = &dw_le_plans[n];
+	plan->exit_target = exit_target;
+	plan->members[0] = owner;
+	/* Publish the owner (members[0]) before the post becomes reachable. */
+	atomic_store_explicit(&plan->nb_members, 1, memory_order_release);
+	owner->loop_exit_plan = plan;
+	/* Publish the plan slot last so a reader that sees the new count also sees
+	 * a fully-initialized exit_target/members[0]. */
+	atomic_store_explicit(&dw_le_plan_count, n + 1, memory_order_release);
+	return plan;
+}
+
+/* Caller must hold dw_le_plan_mu. */
+DW_INTERNAL bool dw_le_plan_attach(struct le_plan *plan, struct insn_entry *sibling)
+{
+	if (!plan || !sibling)
+		return false;
+
+	unsigned m = atomic_load_explicit(&plan->nb_members, memory_order_acquire);
+	if (m >= DW_LE_PLAN_MAX_MEMBERS)
+		return false; /* plan full: caller falls back to its own post */
+
+	plan->members[m] = sibling;
+	/* Publish the new member after its slot is written so the owner's post,
+	 * reading nb_members with acquire, never sees a half-written members[]. */
+	atomic_store_explicit(&plan->nb_members, m + 1, memory_order_release);
+	return true;
+}
+
 struct capstone_context {
 	csh handle;
 	cs_insn *insn;
@@ -82,9 +180,37 @@ static inline struct capstone_context *capstone_get_context(void)
 	return &cs_ctx;
 }
 
-static inline void add_post_safe_site(struct post_safe_site_rb *rb, uintptr_t addr, uint16_t size, unsigned skipped_same_access)
+/*
+ * True if the instruction at `addr` is already an INT3/JMP fill (a live patch
+ * post) or is undecodable -- i.e. the exit is NOT a safe, empty owner-install
+ * site. Decodes a single instruction with the thread's capstone context. Called
+ * by the commit-time election (under dw_le_plan_mu) to refuse installing an
+ * owner post on top of an occupied exit, which removes all dependence on
+ * libpatch's same-address patch_make semantics.
+ */
+DW_INTERNAL bool dw_exit_is_filled(uintptr_t addr)
 {
-	if (!rb || size < DW_MIN_SAFE_CANDIDATE_SIZE)
+	if (!addr)
+		return true;
+
+	struct capstone_context *cs = capstone_get_context();
+	const uint8_t *code = (const uint8_t *) addr;
+	uint64_t iaddr = addr;
+	size_t buf = 15; /* max x86 instruction length */
+
+	if (!cs_disasm_iter(cs->handle, &code, &buf, &iaddr, cs->insn))
+		return true;
+
+	return cs->insn->id == X86_INS_INT3 || cs->insn->id == X86_INS_JMP;
+}
+
+static inline void add_post_safe_site(struct post_safe_site_rb *rb, uintptr_t addr, uint16_t size, unsigned skipped_same_access, bool trap_ok)
+{
+	/*
+	 * A trap_ok site is patched with a 1-byte int3 (TRAP) post and therefore
+	 * does not need the jump-class minimum size; bypass the size filter for it.
+	 */
+	if (!rb || (!trap_ok && size < DW_MIN_SAFE_CANDIDATE_SIZE))
 		return;
 
 	unsigned idx;
@@ -98,6 +224,32 @@ static inline void add_post_safe_site(struct post_safe_site_rb *rb, uintptr_t ad
 
 	rb->entries[idx].addr = addr;
 	rb->entries[idx].skipped_same_access = skipped_same_access;
+	rb->entries[idx].trap_ok = trap_ok;
+}
+
+/*
+ * Drop every recorded safe site whose address is at or beyond `header`.
+ *
+ * The forward scan records candidate addresses monotonically, so in-loop sites
+ * (addr >= header) are exactly the most-recently-added entries and form a
+ * contiguous run at the tail of the ring buffer. Trimming the tail (decrement
+ * `count` while the newest entry is in-loop) is therefore sufficient and also
+ * removes the loop latch itself if Section 1 happened to record it. Used by the
+ * loop-header clamp so make_deferred_post falls back to the newest pre-header
+ * site (or the caller's no-site AROUND fallback) instead of a per-iteration
+ * in-loop post.
+ */
+static inline void prune_post_safe_sites_from(struct post_safe_site_rb *rb, uintptr_t header)
+{
+	if (!rb)
+		return;
+
+	while (rb->count > 0) {
+		unsigned idx = (rb->head + rb->count - 1) % MAX_SAFE_SITE_COUNT;
+		if (rb->entries[idx].addr < header)
+			break;
+		rb->count--;
+	}
 }
 
 static inline size_t hash_addr(uintptr_t x)
@@ -174,21 +326,6 @@ static inline bool dw_acquire_runtime_slot(struct insn_entry *entry, int *idx_ou
 {
 	int first_free = -1;
 
-	/*
-	 * Scan the whole ownership map before allocating: if the entry already
-	 * owns a slot we must reuse it, even when a free slot sits at a lower
-	 * index. Bailing out at the first free slot would leak a second slot for
-	 * the same entry.
-	 *
-	 * An entry owns a slot when a previous pre-handler (dw_unprotect_context)
-	 * acquired it but the matching post-handler (dw_reprotect_context) never
-	 * ran to release it. This happens when libpatch installs only the pre
-	 * probe of a PROBE_AROUND patch (e.g. for some VEX/AVX instructions, where
-	 * the post probe is silently dropped), or when control left the
-	 * out-of-line copy before reaching the post site. Reusing the existing
-	 * slot keeps each entry to at most one slot, so a hot instruction can no
-	 * longer exhaust the table or spam a fatal "shouldn't be used" error.
-	 */
 	for (int i = 0; i < MAX_SCAN_INST_COUNT; ++i) {
 		struct insn_entry *owner = slot_owner[i];
 
@@ -661,6 +798,226 @@ static bool insn_can_heap_fault(const cs_insn *insn, const cs_x86 *x86)
 }
 
 /*
+ * Variant A loop-exit defer site (#5). The caller has established gates (1)-(3):
+ * `latch` is a conditional Jcc (not JMP/CALL/RET/INT3) with an immediate target,
+ * and the backward target `header` lies inside the function with
+ * header <= fault < latch (the header ENCLOSES the fault).
+ *
+ * Applies the remaining gates and, on success, returns the loop's fall-through
+ * exit address (latch + latch_size) with its instruction size in *exit_size_out.
+ * Returns 0 on any gate failure (the caller then leaves today's per-iteration
+ * behavior in place).
+ *
+ * cs->insn is clobbered (prefix and exit re-decode); the caller goes to
+ * stop_return and never reads the latch insn again.
+ */
+static uintptr_t loop_exit_defer_site(struct insn_entry *entry,
+				      struct capstone_context *cs,
+				      cs_insn *latch,
+				      cs_regs latch_read, uint8_t latch_read_count,
+				      cs_regs latch_write, uint8_t latch_write_count,
+				      uint16_t *tainted_regs, int64_t *tainted_delta,
+				      uint8_t tainted_regs_count,
+				      uintptr_t func_end,
+				      uintptr_t fault, uintptr_t header,
+				      bool loop_exit_eligible, bool ea_has_index,
+				      uint16_t *exit_size_out, bool *exit_filled_out)
+{
+	uintptr_t latch_end = latch->address + latch->size;
+
+	*exit_filled_out = false;
+
+	/*
+	 * (4) Exact-EA footprint: a single non-indexed memory operand that is not a
+	 * base-as-value case and not REP/string, and every accepted body access an
+	 * exact replay of the fault EA. This reduces activation to a plain base
+	 * strip + dw_check_access, matching the normal pre-handler's side effects,
+	 * and guarantees the one per-entry bounds check covers the whole body.
+	 *
+	 * NOTE(indexed-EA, MEASURED 2026-06-26 on x264 625.x264_s @128x72/100f):
+	 * ea_has_index rejects ALL indexed EAs. A read-only classifier (DW_LXIDX_DEBUG,
+	 * since removed) bucketed every loop-exit candidate that passes the other gate-4
+	 * subconditions and is blocked ONLY by ea_has_index, weighting each bucket by
+	 * dynamic hit_count (108.1M total faults; indexed EAs = 73.7M = 68%):
+	 *   - tagged pointer in the INDEX slot (the shape worth a base-style strip):
+	 *     0 sites / 0 hits. It simply does not occur here.
+	 *   - tagged INVARIANT base + a CLEAN index that is loop-invariant (fixed EA,
+	 *     genuinely recoverable by the single per-entry check): 9 sites / 14,181
+	 *     hits = 0.013% of faults -- three orders below the noise floor.
+	 *   - tagged INVARIANT base + a CLEAN index that is an induction variable
+	 *     (walking EA): 103 sites / 18.07M hits = 16.7% of faults. This is the bulk,
+	 *     and it is RANGE-HOIST territory (a per-element range), NOT loop-exit
+	 *     single-check territory -- it must stay rejected here.
+	 * VERDICT: do NOT extend loop-exit deferral to indexed EAs. The recoverable
+	 * subset is ~0.013%; the only sizeable indexed population is walking-index pixel
+	 * gathers already owned by the range-hoist substrate. If ever revisited, the
+	 * admissible predicate must be EXACT (lax => false-negative OOB): tag in
+	 * tainted_regs, delta==0, scale==1 (scale!=1 corrupts the high-bit OID tag), and
+	 * EVERY other addressing reg (incl. a CLEAN base/index, which is NOT delta-
+	 * tracked today) proven loop-invariant. Touch points: this gate, the exact-EA
+	 * test (relax index==INVALID), the activation strip + full-EA dw_check_access,
+	 * and the deferred post's retaint (index_taint).
+	 */
+	if (entry->nb_arg_m != 1 || ea_has_index || entry->repeat ||
+	    entry->arg_m[0].base_access || !loop_exit_eligible)
+		return 0;
+
+	/* (5) The latch must not itself read or write the tainted base. */
+	for (unsigned i = 0; i < tainted_regs_count; i++)
+		if (reg_check_access(tainted_regs[i], latch_read, latch_read_count) ||
+		    reg_check_access(tainted_regs[i], latch_write, latch_write_count))
+			return 0;
+
+	/* (6) Base must be loop-invariant (no tracked constant pointer walk). */
+	for (unsigned i = 0; i < tainted_regs_count; i++)
+		if (tainted_delta[i] != 0)
+			return 0;
+
+	/*
+	 * (6b) No in-body call can precede the latch: the forward scan's Section 1
+	 * stop fires on any call/branch/ret, so reaching the latch already proves
+	 * the scanned body [fault, latch) is single-exit straight-line code. No
+	 * explicit call gate is needed (review 4).
+	 */
+
+	/* (7) The fall-through exit must lie inside the function. */
+	if (latch_end >= func_end)
+		return 0;
+
+	/*
+	 * (8) The prefix [header, fault) is never covered by the forward scan.
+	 * Re-decode it and reject anything that could transfer control, read or
+	 * write a tainted register, or dereference memory through a tainted
+	 * base/index. cs_regs_access' regs_read/write include addressing base+index
+	 * registers, so a tainted reg used as a prefix index is covered by the
+	 * tainted-reg check; the explicit mem-operand scan is belt-and-braces.
+	 */
+	if (header < fault) {
+		const uint8_t *pcode = (const uint8_t *) header;
+		uint64_t paddr = header;
+		size_t pbuf = (size_t)(fault - header);
+
+		while (paddr < fault && pbuf > 0) {
+			if (!cs_disasm_iter(cs->handle, &pcode, &pbuf, &paddr, cs->insn))
+				return 0;
+
+			cs_insn *pin = cs->insn;
+			cs_detail *pdet = pin->detail;
+			cs_x86 *px86 = &pdet->x86;
+
+			for (int g = 0; g < pdet->groups_count; g++)
+				if (pdet->groups[g] < X86_GRP_VM)
+					return 0;
+
+			cs_regs pr, pw;
+			uint8_t prc = 0, pwc = 0;
+			if (cs_regs_access(cs->handle, pin, pr, &prc, pw, &pwc) != CS_ERR_OK)
+				return 0;
+			for (unsigned i = 0; i < tainted_regs_count; i++)
+				if (reg_check_access(tainted_regs[i], pr, prc) ||
+				    reg_check_access(tainted_regs[i], pw, pwc))
+					return 0;
+
+			for (int i = 0; i < px86->op_count; i++) {
+				const cs_x86_op *op = &px86->operands[i];
+				if (op->type != X86_OP_MEM)
+					continue;
+				if (reg_check_access(op->mem.base, tainted_regs, tainted_regs_count) ||
+				    reg_check_access(op->mem.index, tainted_regs, tainted_regs_count))
+					return 0;
+			}
+		}
+	}
+
+	/*
+	 * (9) Locate the retaint site on the fall-through path. It must NOT itself
+	 * dereference a heap pointer: a post-only probe relocates its host into the
+	 * OLX buffer, and if that host later faults on any tainted pointer we cannot
+	 * add the pre-strip as an overlap child -- libpatch rejects a child on the
+	 * patch head (region_idx == 0), forcing a per-iteration single-step. So we
+	 * apply the SAME safe-site predicate as the regular forward scan
+	 * (insn_can_heap_fault): only an instruction whose every memory operand is
+	 * provably non-heap (stack/global/segment, or LEA/NOP) can host the post.
+	 *
+	 * Mirroring the regular scan, a heap-faulting instruction that does not
+	 * touch this deferral's tainted base is SKIPPED (it faults and is patched on
+	 * its own) and we keep scanning to the first provably-non-heap instruction.
+	 * The scan stops at:
+	 *   - a control transfer (no safe site reachable on the fall-through);
+	 *   - a patch fill (INT3/JMP) -- reported as a filled site so the commit
+	 *     path can coalesce onto an existing post or decline under the lock;
+	 *   - a read or write of the tainted base (the strip must outlive the loop,
+	 *     so the retaint cannot be deferred past a use of the base).
+	 *
+	 * The chosen site is the first non-heap instruction reachable by skipping
+	 * heap-faulting ones; both conditions are base-independent, so every member
+	 * of one loop converges on the same address and the shared-exit coalescing
+	 * key (loop_exit_target) is preserved. The base-use check only decides
+	 * whether THIS member may join -- it never shifts the site.
+	 *
+	 * We do NOT decide owner-vs-sibling here: that election is made at commit
+	 * time under dw_le_plan_mu on a serialized writer (deciding it on a faulting
+	 * thread was the old double-owner soundness hole). *exit_filled_out is
+	 * advisory; commit re-checks exit emptiness under the lock.
+	 */
+	const uint8_t *ecode = (const uint8_t *) latch_end;
+	uint64_t eaddr = latch_end;
+	size_t ebuf = (size_t)(func_end - latch_end);
+
+	for (unsigned escan = 0; escan < DW_LE_EXIT_SCAN_MAX && ebuf > 0; escan++) {
+		if (!cs_disasm_iter(cs->handle, &ecode, &ebuf, &eaddr, cs->insn))
+			return 0; /* undecodable on the fall-through path */
+
+		cs_insn *ein = cs->insn;
+		cs_detail *edet = ein->detail;
+		cs_x86 *ex86 = &edet->x86;
+
+		/*
+		 * A patch fill (INT3/JMP, or a zero-size decode) is a live post. Report
+		 * it as a filled site at its address: if a loop-exit plan already owns
+		 * this exit the commit path attaches this base as a sibling; otherwise
+		 * dw_exit_is_filled refuses the owner install and the caller falls back.
+		 */
+		if (ein->id == X86_INS_INT3 || ein->id == X86_INS_JMP || ein->size == 0) {
+			*exit_size_out = ein->size;
+			*exit_filled_out = true;
+			return ein->address;
+		}
+
+		/* A real control transfer: no safe site on the fall-through. */
+		for (int g = 0; g < edet->groups_count; g++)
+			if (edet->groups[g] < X86_GRP_VM)
+				return 0;
+
+		/*
+		 * The tainted base must stay stripped and unused until the retaint. A
+		 * read or write of it before we have found a site means the post cannot
+		 * be deferred this far; decline (member-specific, never shifts the site).
+		 */
+		cs_regs er, ew;
+		uint8_t erc = 0, ewc = 0;
+		if (cs_regs_access(cs->handle, ein, er, &erc, ew, &ewc) != CS_ERR_OK)
+			return 0;
+		for (unsigned i = 0; i < tainted_regs_count; i++)
+			if (reg_check_access(tainted_regs[i], er, erc) ||
+			    reg_check_access(tainted_regs[i], ew, ewc))
+				return 0;
+
+		/* Heap-faulting but base-independent: skip, it patches on its own. */
+		if (insn_can_heap_fault(ein, ex86))
+			continue;
+
+		/* First provably-non-heap instruction: this is the retaint site. */
+		*exit_size_out = ein->size;
+		*exit_filled_out = false;
+		return ein->address;
+	}
+
+	/* Scan budget exhausted without a clean site: decline deferral. */
+	return 0;
+}
+
+/*
  * Defer post-handler installation by scanning forward for safe instruction sites.
  *
  * This function scans instructions starting from the next instruction after a fault,
@@ -700,6 +1057,19 @@ static uintptr_t dw_defer_post_handler(struct insn_entry *entry,
 	struct memory_arg_runtime *mem_rt;
 	unsigned tail_budget = 0;
 
+	/*
+	 * Loop-exit deferral (#5) bookkeeping. loop_exit_eligible stays true only
+	 * while every accepted same-object body access is an EXACT replay of the
+	 * fault EA (same disp/size/scale, no index, zero tracked delta). The slow
+	 * path of similar_memory_access() bounds a *differing* access against the
+	 * discovery object only, and that verdict is cached in the reused entry, so
+	 * a smaller object on a later loop entry could run such an access unchecked.
+	 * ea_has_index records whether the fault EA itself uses an index register
+	 * (an induction-index walk is likewise never re-bounded per entry).
+	 */
+	bool loop_exit_eligible = true;
+	bool ea_has_index = false;
+
 	uintptr_t func_start = 0, func_end = 0;
 	size_t max_bytes = (size_t)MAX_SCAN_INST_COUNT * 15;
 
@@ -728,12 +1098,23 @@ static uintptr_t dw_defer_post_handler(struct insn_entry *entry,
 		if (mem_rt->base_taint)
 			taint_reg = mem->base;
 
+		if (mem->index != X86_REG_INVALID)
+			ea_has_index = true;
+
 		if ((reg_is_gpr(mem->index) && mem_rt->index_taint) ||
 			(reg_is_avx(mem->index) && mem_rt->index_is_tainted))
 			taint_reg = mem->index;
 
 		if (taint_reg != X86_REG_INVALID)
 			reg_set_add(tainted_regs, &tainted_regs_count, sizeof(tainted_regs)/sizeof(tainted_regs[0]), taint_reg);
+	}
+
+	/* Footprint accumulators for #5. Seeded from the fault arg only when
+	 * nb_arg_m == 1 (the gate in loop_exit_defer_site rejects anything else). */
+	int64_t fp_disp_lo = 0, fp_disp_hi = 0;
+	if (entry->nb_arg_m == 1) {
+		fp_disp_lo = entry->arg_m[0].displacement;
+		fp_disp_hi = entry->arg_m[0].displacement + (int64_t)entry->arg_m[0].length;
 	}
 
 	while (n < MAX_SCAN_INST_COUNT && buff_size > 0) {
@@ -792,7 +1173,154 @@ static uintptr_t dw_defer_post_handler(struct insn_entry *entry,
 					last_safe_addr = insn->address;
 					count_same_access += pending_same_access;
 					pending_same_access = 0;
-					add_post_safe_site(rb, last_safe_addr, insn->size, count_same_access);
+					add_post_safe_site(rb, last_safe_addr, insn->size, count_same_access, false);
+				}
+
+				/*
+				 * Loop-header clamp. If the first control-flow instruction the
+				 * scan meets is a backward conditional branch, this insn is a
+				 * single-latch loop's latch and `target` is its header. Deferring
+				 * a retaint into the loop body would fire the post once per
+				 * iteration; clamp it to the pre-header (or the fault) instead.
+				 *
+				 * Fires only for a genuine single-latch loop: a conditional Jcc
+				 * (jump group, immediate target, not an unconditional JMP) whose
+				 * target lies inside the function and strictly between the scan
+				 * start and this latch (a backward edge). Loops with an internal
+				 * branch before the latch stop on that branch and fall through to
+				 * today's behavior, so they are left untouched.
+				 */
+				if (insn->id != X86_INS_JMP && insn->id != X86_INS_INT3 &&
+					cs_insn_group(cs->handle, insn, X86_GRP_JUMP) &&
+					x86->op_count >= 1 && x86->operands[0].type == X86_OP_IMM) {
+					uintptr_t target = (uintptr_t) x86->operands[0].imm;
+
+					/* Backward edge inside this function => `insn` is a loop latch. */
+					if (target >= func_start && target < func_end &&
+						target >= start_addr && target < insn->address) {
+						uintptr_t header = target;
+
+						/*
+						 * Similar-access addresses are recorded monotonically, so
+						 * the most recent one is the maximum: if it lies at or past
+						 * the header, the faulting object is re-dereferenced inside
+						 * the loop body.
+						 */
+						bool in_loop_access = (last_same_access_addr >= header);
+
+						if (!in_loop_access) {
+							/*
+							 * The loop body never re-touches the object, so deferring
+							 * into it buys nothing and costs one probe-fire per
+							 * iteration. Drop every in-loop candidate; the newest
+							 * pre-header site (or the caller's no-site AROUND
+							 * fallback at the fault) is then selected.
+							 */
+							prune_post_safe_sites_from(rb, header);
+						} else {
+							/*
+							 * Variant B loop-exit deferral (#5). The fault is BEFORE
+							 * the loop (header > start_addr) and a similar access
+							 * lives inside the loop body. The normal pre-probe already
+							 * strips the invariant base once in the prologue; relocate
+							 * the retaint to the loop's fall-through exit instead of
+							 * paying a per-iteration in-loop post. This is standard
+							 * deferral with the post moved past the latch -- the
+							 * pre-probe is unchanged, so loop_exit_activate stays false
+							 * (Variant B keeps its pre-probe).
+							 *
+							 * Identical gate set to Variant A, so route through the
+							 * same loop_exit_defer_site helper. Because the header
+							 * (target) lies past the fault here, the helper's prefix
+							 * re-scan (gate 8) is a no-op and soundness rests on the
+							 * unchanged pre-probe plus the exact-EA footprint invariant.
+							 */
+							uint16_t exit_size = 0;
+							bool exit_filled = false;
+							uintptr_t exit_addr = loop_exit_defer_site(
+								entry, cs, insn,
+								regs_read, read_count, regs_write, write_count,
+								tainted_regs, tainted_delta, tainted_regs_count,
+								func_end, entry->insn, target,
+								loop_exit_eligible, ea_has_index, &exit_size, &exit_filled);
+							/*
+							 * Variant B does not coalesce: it keeps its pre-probe and
+							 * installs a plain (single-entry) post at the exit, so it
+							 * never joins the shared-exit plan. Stage that post only when
+							 * the exit is still empty; if it is already filled (a Variant A
+							 * owner's post or any other patch holds it), fall back to
+							 * per-iteration deferral rather than colliding on the exit.
+							 */
+							if (exit_addr && !exit_filled) {
+								count_same_access += pending_same_access;
+								pending_same_access = 0;
+								last_safe_addr = exit_addr;
+								add_post_safe_site(rb, exit_addr, exit_size,
+										   count_same_access, /*trap_ok=*/true);
+								entry->loop_exit_defer = true;
+								entry->loop_exit_footprint = (fp_disp_lo != entry->arg_m[0].displacement ||
+								                              fp_disp_hi != entry->arg_m[0].displacement + (int64_t)entry->arg_m[0].length);
+								entry->loop_exit_disp_lo = fp_disp_lo;
+								entry->loop_exit_disp_hi = fp_disp_hi;
+								entry->loop_exit_target = exit_addr;
+								DW_LOG(DEBUG, DISASSEMBLY,
+									   "Loop-exit deferral (Variant B): post staged at fall-through 0x%llx (latch 0x%llx, origin 0x%llx).\n",
+									   (unsigned long long)exit_addr,
+									   (unsigned long long)insn->address,
+									   (unsigned long long)start_addr);
+							}
+						}
+					}
+
+					/*
+					 * Variant A loop-exit deferral (#5): backward edge whose header
+					 * ENCLOSES the fault (target < start_addr). The faulting insn
+					 * re-executes every iteration, so there is no prologue strip;
+					 * the SIGSEGV handler strips the invariant base once per loop
+					 * entry (loop_exit_activate) and only the loop-exit post is
+					 * installed. loop_exit_defer_site applies the full gate set and
+					 * returns the fall-through exit address (0 on failure).
+					 */
+					else if (target >= func_start && target <= entry->insn) {
+						uint16_t exit_size = 0;
+						bool exit_filled = false;
+						uintptr_t exit_addr = loop_exit_defer_site(
+							entry, cs, insn,
+							regs_read, read_count, regs_write, write_count,
+							tainted_regs, tainted_delta, tainted_regs_count,
+							func_end, entry->insn, target,
+							loop_exit_eligible, ea_has_index, &exit_size, &exit_filled);
+						(void) exit_size;
+						if (exit_addr) {
+							count_same_access += pending_same_access;
+							pending_same_access = 0;
+							last_safe_addr = exit_addr;
+							/*
+							 * Record the candidate only. The owner/sibling election
+							 * and the physical post install both happen at commit
+							 * time (patch_entry_sync), serialized under dw_le_plan_mu,
+							 * so we stage NO post here and pre-decide nothing -- the
+							 * commit path installs an owner post directly at
+							 * loop_exit_target (a single fall-through exit post) or
+							 * attaches this base to a committed owner's plan.
+							 * (exit_filled is advisory only; commit re-checks the
+							 * exit emptiness under the lock.)
+							 */
+							entry->loop_exit_defer = true;
+							entry->loop_exit_footprint = (fp_disp_lo != entry->arg_m[0].displacement ||
+							                              fp_disp_hi != entry->arg_m[0].displacement + (int64_t)entry->arg_m[0].length);
+							entry->loop_exit_disp_lo = fp_disp_lo;
+							entry->loop_exit_disp_hi = fp_disp_hi;
+							entry->loop_exit_target = exit_addr;
+							entry->loop_exit_activate = true;
+							DW_LOG(DEBUG, DISASSEMBLY,
+								   "Loop-exit deferral (Variant A): candidate at fall-through 0x%llx (latch 0x%llx, header 0x%llx, origin 0x%llx).\n",
+								   (unsigned long long)exit_addr,
+								   (unsigned long long)insn->address,
+								   (unsigned long long)target,
+								   (unsigned long long)start_addr);
+						}
+					}
 				}
 
 				goto stop_return;
@@ -822,9 +1350,9 @@ static uintptr_t dw_defer_post_handler(struct insn_entry *entry,
 					count_same_access += pending_same_access;
 					pending_same_access = 0;
 					tail_budget = DW_TAIL_CANDIDATE_BUDGET;
-					add_post_safe_site(rb, last_safe_addr, insn->size, count_same_access);
+					add_post_safe_site(rb, last_safe_addr, insn->size, count_same_access, false);
 				} else if (count_same_access > 0 && tail_budget > 0) {
-					add_post_safe_site(rb, insn->address, insn->size, count_same_access);
+					add_post_safe_site(rb, insn->address, insn->size, count_same_access, false);
 					tail_budget--;
 				}
 			}
@@ -878,7 +1406,7 @@ static uintptr_t dw_defer_post_handler(struct insn_entry *entry,
 			if (last_safe_addr <= last_same_access_addr) {
 				last_safe_addr = insn->address;
 				count_same_access += pending_same_access;
-				add_post_safe_site(rb, last_safe_addr, insn->size, count_same_access);
+				add_post_safe_site(rb, last_safe_addr, insn->size, count_same_access, false);
 			}
 			goto stop_return;
 		}
@@ -915,6 +1443,30 @@ static uintptr_t dw_defer_post_handler(struct insn_entry *entry,
 					if (!similar_memory_access(insn->id, op, mem, mem_rt, uctx, repeat,
 								   bdelta, idelta))
 						goto stop_return;
+
+					/*
+					 * Loop-exit eligibility: the surviving signal (Variant B's
+					 * pre-probe / Variant A's activation) bounds-checks only the
+					 * fault EA. It covers this body access on EVERY loop entry
+					 * only if the access is an exact replay of the fault EA.
+					 * Anything admitted via the slow path (differing
+					 * disp/size/scale, an index, or a nonzero tracked delta) was
+					 * bounds-checked against the discovery object alone -> clear
+					 * eligibility (safe direction; never under-rejects).
+					 */
+					if (bdelta == 0 && idelta == 0 &&
+					    op->mem.index == X86_REG_INVALID &&
+					    op->mem.scale == mem->scale) {
+						/* Fixed-field access on the same invariant base: widen footprint.
+						 * Overflow-safe: op->size <= 64 (max AVX-512) and op->mem.disp
+						 * is a signed 32-bit Capstone value, so the sum fits in int64_t. */
+						int64_t lo = (int64_t)op->mem.disp;
+						int64_t hi = (int64_t)op->mem.disp + (int64_t)op->size;
+						if (lo < fp_disp_lo) fp_disp_lo = lo;
+						if (hi > fp_disp_hi) fp_disp_hi = hi;
+					} else {
+						loop_exit_eligible = false;
+					}
 					}
 					last_same_access_addr = insn->address;
 					pending_same_access++;
@@ -942,7 +1494,7 @@ static uintptr_t dw_defer_post_handler(struct insn_entry *entry,
 				if (!can_heap_fault && (last_safe_addr <= last_same_access_addr)) {
 					last_safe_addr = insn->address;
 					count_same_access += pending_same_access;
-					add_post_safe_site(rb, last_safe_addr, insn->size, count_same_access);
+					add_post_safe_site(rb, last_safe_addr, insn->size, count_same_access, false);
 				}
 				goto stop_return;
 			}
@@ -952,7 +1504,7 @@ static uintptr_t dw_defer_post_handler(struct insn_entry *entry,
 				if (!can_heap_fault && (last_safe_addr <= last_same_access_addr)) {
 					last_safe_addr = insn->address;
 					count_same_access += pending_same_access;
-					add_post_safe_site(rb, last_safe_addr, insn->size, count_same_access);
+					add_post_safe_site(rb, last_safe_addr, insn->size, count_same_access, false);
 				}
 				goto stop_return;
 			}
@@ -966,7 +1518,7 @@ static uintptr_t dw_defer_post_handler(struct insn_entry *entry,
 			if (!can_heap_fault && (last_safe_addr <= last_same_access_addr)) {
 				last_safe_addr = insn->address;
 				count_same_access += pending_same_access;
-				add_post_safe_site(rb, last_safe_addr, insn->size, count_same_access);
+				add_post_safe_site(rb, last_safe_addr, insn->size, count_same_access, false);
 			}
 
 			DW_LOG(DEBUG, DISASSEMBLY, "Post-handler has been DISABLED because all tainted registers are overwritten!\n");
@@ -1494,12 +2046,13 @@ static bool dw_populate_instruction_entry(instruction_table *table, struct insn_
 			   "Forward scan has stopped at 0x%llx (%s %s), after (%u) instructions.\n",
 			   cs->insn->address, cs->insn->mnemonic, cs->insn->op_str, insn_scan_count);
 
-		if (entry->post_handler && similar_access_count > 0) {
+		if (entry->post_handler && (similar_access_count > 0 || entry->loop_exit_defer)) {
 			entry->deferred_post_handler = true;
 			entry->next_insn = last_safe_addr;
 			DW_LOG(DEBUG, DISASSEMBLY,
-				   "Post-handler DEFERRED to 0x%llx - skipped (%u) similar memory accesses!\n",
-				   last_safe_addr, similar_access_count);
+				   "Post-handler DEFERRED to 0x%llx - skipped (%u) similar memory accesses%s!\n",
+				   last_safe_addr, similar_access_count,
+				   entry->loop_exit_activate ? " (loop-exit Variant A)" : "");
 		}
 	}
 	return true;
@@ -1929,6 +2482,15 @@ DW_INTERNAL void dw_unprotect_context(struct patch_exec_context *ctx)
 
 			if (dw_is_protected((void *) valueb)) {
 				mem_rt->base_taint = valueb;
+				/* For #5 footprint entries, bounds-check the full fixed-field range
+				 * before stripping.  Use the tainted valueb: dw_check_access_ctx
+				 * extracts the OID from bits 48-63 and skips the check when oid==0
+				 * (a clean pointer would silently pass). */
+				if (entry->loop_exit_footprint) {
+					size_t footprint_size = (size_t)(entry->loop_exit_disp_hi - entry->loop_exit_disp_lo);
+					dw_check_access_ctx((void *)(valueb + entry->loop_exit_disp_lo),
+					                    footprint_size, ctx);
+				}
 				dw_set_register(ctx, reb->libpatch_index, (uintptr_t) dw_unprotect((void *) valueb));
 			} else {
 				mem_rt->base_taint = 0;
@@ -1957,6 +2519,80 @@ DW_INTERNAL void dw_unprotect_context(struct patch_exec_context *ctx)
 				DW_LOG(DEBUG, DISASSEMBLY, "%s, %llx\n", re->name, ctx->general_purpose_registers[i]);
 			}
 	}
+}
+
+/*
+ * Variant A loop-exit activation (fault-driven, no pre-probe). Invoked once per
+ * loop entry directly from the SIGSEGV handler on a ucontext_t. It strips the
+ * invariant tainted base in-place, bounds-checks the fault EA against the live
+ * object, and stashes the taint into the entry's runtime slot so the loop-exit
+ * post probe (dw_reprotect_context) re-applies it after the loop falls through.
+ *
+ * Gates in loop_exit_defer_site guarantee a single non-indexed mem arg with no
+ * base_access and no REP, so this reduces to the plain base strip + check that
+ * the normal pre-handler performs - it must never touch SIB/VSIB/compound state.
+ *
+ * Returns true iff a protected base was found and stripped (a slot is then held
+ * for the post handler); false leaves the context untouched and releases nothing.
+ */
+DW_INTERNAL bool dw_loop_exit_activate_context(struct insn_entry *entry, ucontext_t *uctx)
+{
+	int rt_idx = 0;
+	bool stripped = false;
+
+	if (unlikely(!dw_acquire_runtime_slot(entry, &rt_idx))) {
+		DW_LOG(ERROR, DISASSEMBLY, "Problem getting a runtime slot for loop-exit instruction 0x%llx\n",
+			entry->insn);
+		return false;
+	}
+
+	struct insn_entry_runtime *rt_slot_p = &insn_rt_slots[rt_idx];
+
+	for (int i = 0; i < entry->nb_arg_m; i++) {
+		struct memory_arg *mem = &entry->arg_m[i];
+		struct memory_arg_runtime *mem_rt = &rt_slot_p->arg_m[i];
+
+		mem_rt->base_taint = 0;
+		mem_rt->base_addr = 0;
+
+		/* Base-as-value args are rejected by the gates; never strip one. */
+		if (mem->base_access)
+			continue;
+
+		const struct reg_entry *reb = mem->base_re;
+		if (mem->base == X86_REG_INVALID || reb == NULL || reb->ucontext_index < 0)
+			continue;
+
+		uintptr_t valueb = dw_get_register(uctx, reb->ucontext_index);
+		mem_rt->base_addr = valueb;
+
+		if (!dw_is_protected((void *) valueb))
+			continue;
+
+		/* Bounds-check the fault EA (or the full footprint when wider) against
+		 * the live object.  Use the tainted valueb: dw_check_access extracts the
+		 * OID from bits 48-63 and returns early with oid==0 for a clean pointer. */
+		if (entry->loop_exit_footprint) {
+			size_t footprint_size = (size_t)(entry->loop_exit_disp_hi - entry->loop_exit_disp_lo);
+			dw_check_access((void *)(valueb + entry->loop_exit_disp_lo), footprint_size);
+		} else {
+			dw_check_access((void *)(valueb + mem->displacement), mem->length);
+		}
+
+		mem_rt->base_taint = valueb;
+		dw_set_register(uctx, reb->ucontext_index, (uintptr_t) dw_unprotect((void *) valueb));
+		stripped = true;
+	}
+
+	if (!stripped) {
+		dw_release_rt_slot(rt_idx);
+		return false;
+	}
+
+	if (unlikely(dw_stats_enabled))
+		atomic_fetch_add_explicit(&entry->hit_count, 1, memory_order_relaxed);
+
+	return true;
 }
 
 static void check_updated_regs (struct insn_entry *entry, struct insn_entry_runtime *entry_rt, struct patch_exec_context *ctx) {
@@ -2018,23 +2654,19 @@ static void check_updated_regs (struct insn_entry *entry, struct insn_entry_runt
 }
 
 /*
+ * Retaint one entry's tainted registers using an already-resolved runtime slot.
  * In the post handler, we normally retaint all registers which were untainted
  * in the pre handler. There are a few special cases when the same register is
- * used as a base or index to access the memory and as argument.
+ * used as a base or index to access the memory and as argument. The slot is
+ * released before returning. Shared by the single-entry and plan-owner posts.
  */
-DW_INTERNAL void dw_reprotect_context(struct patch_exec_context *ctx)
+static void dw_reprotect_one_entry(struct insn_entry *entry, int slot_idx,
+				   struct patch_exec_context *ctx)
 {
-	struct insn_entry *entry = ctx->user_data;
 	struct memory_arg *mem;
 	struct memory_arg_runtime *mem_rt;
 	const struct reg_entry *re;
 	unsigned reg;
-	int slot_idx;
-
-	/* If the runtime slot was not found, it means we jumped into an address between the
-	   pre- and post-handler. Therefore, we simply ignore the post-handler invocation */
-	if (unlikely(!dw_find_runtime_slot(entry, &slot_idx)))
-		return;
 
 	struct insn_entry_runtime *runtime_slot = &insn_rt_slots[slot_idx];
 
@@ -2167,6 +2799,59 @@ DW_INTERNAL void dw_reprotect_context(struct patch_exec_context *ctx)
 }
 
 /*
+ * In the post handler, we normally retaint all registers which were untainted
+ * in the pre handler. There are a few special cases when the same register is
+ * used as a base or index to access the memory and as argument.
+ */
+DW_INTERNAL void dw_reprotect_context(struct patch_exec_context *ctx)
+{
+	struct insn_entry *entry = ctx->user_data;
+	int slot_idx;
+
+	/* If the runtime slot was not found, it means we jumped into an address
+	   between the pre- and post-handler. Therefore, we simply ignore the
+	   post-handler invocation */
+	if (unlikely(!dw_find_runtime_slot(entry, &slot_idx)))
+		return;
+
+	dw_reprotect_one_entry(entry, slot_idx, ctx);
+}
+
+/*
+ * Shared loop-exit post (#5 coalescing): the firing entry is the OWNER of a
+ * shared-exit plan, so one physical post at the loop's fall-through exit must
+ * retaint every coalesced member (the owner plus all siblings). Each member's
+ * invariant base was stripped independently at its own activation, so each
+ * holds its own runtime slot in the CURRENT thread. Resolve and retaint the
+ * members that hold a slot; skip the ones that do not (a member may not have
+ * faulted/activated this loop entry on this thread). Crucially, unlike
+ * dw_reprotect_context this must NOT bail on the first missing slot -- the
+ * owner itself may hold no slot this entry while a sibling does.
+ */
+DW_INTERNAL void dw_reprotect_plan_context(struct patch_exec_context *ctx)
+{
+	struct insn_entry *owner = ctx->user_data;
+	struct le_plan *plan = owner->loop_exit_plan;
+
+	if (unlikely(!plan)) {
+		/* Not actually a plan owner: fall back to the single-entry path. */
+		dw_reprotect_context(ctx);
+		return;
+	}
+
+	unsigned n = atomic_load_explicit(&plan->nb_members, memory_order_acquire);
+	for (unsigned i = 0; i < n; i++) {
+		struct insn_entry *member = plan->members[i];
+		int slot_idx;
+
+		if (!dw_find_runtime_slot(member, &slot_idx))
+			continue; /* member didn't activate this entry on this thread */
+
+		dw_reprotect_one_entry(member, slot_idx, ctx);
+	}
+}
+
+/*
  * Print the content of the instruction table. Dump one row per instruction entry,
  * including symbol information, hit count, and other patching metadata.
  */
@@ -2238,4 +2923,38 @@ void dw_print_instruction_entries(instruction_table *table, int fd)
 
 		count++;
 	}
+
+#ifdef DW_LEBUSY_DEBUG
+	/*
+	 * Shared loop-exit coalescing (#5) summary. Walk the committed plan registry
+	 * and report, per shared exit, the owner plus the number of attached sibling
+	 * bases and their summed hit_count -- the dynamic faults that now collapse
+	 * onto the owner's single exit post instead of paying their own per-iteration
+	 * retaint. A plan with nb_members == 1 is a lone owner (no coalescing yet).
+	 */
+	unsigned nb_plans = atomic_load_explicit(&dw_le_plan_count, memory_order_acquire);
+	unsigned nb_shared = 0, nb_siblings_total = 0;
+
+	dw_fprintf(fd, "\n#5 shared loop-exit coalescing (committed plans: %u):\n", nb_plans);
+	dw_fprintf(fd, "  %-18s %-8s %-12s\n", "exit_target", "members", "sibling_hits");
+	for (unsigned p = 0; p < nb_plans; p++) {
+		struct le_plan *plan = &dw_le_plans[p];
+		unsigned m = atomic_load_explicit(&plan->nb_members, memory_order_acquire);
+		unsigned long sib_hits = 0;
+
+		/* members[0] is the owner; the rest are coalesced siblings. */
+		for (unsigned k = 1; k < m; k++)
+			sib_hits += atomic_load(&plan->members[k]->hit_count);
+
+		if (m > 1) {
+			nb_shared++;
+			nb_siblings_total += (m - 1);
+		}
+		dw_fprintf(fd, "  0x%-16lx %-8u %-12lu\n",
+			   (unsigned long)plan->exit_target, m, sib_hits);
+	}
+	dw_fprintf(fd,
+		   "  shared exits (>=1 sibling): %u | coalesced siblings total: %u\n",
+		   nb_shared, nb_siblings_total);
+#endif /* DW_LEBUSY_DEBUG */
 }

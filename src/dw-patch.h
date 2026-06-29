@@ -9,6 +9,7 @@
 struct post_safe_site {
 	uintptr_t addr;
 	unsigned skipped_same_access;
+	bool trap_ok;
 };
 
 struct post_safe_site_rb {

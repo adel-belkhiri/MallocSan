@@ -373,7 +373,7 @@ static void *dw_protect(void *ptr, size_t size, void* caller)
 {
 	unsigned oid = dw_oid_alloc();
 	if (unlikely(oid == 0)) {
-		DW_LOG(WARNING, PROTECT, "OID table exhausted, cannot taint pointer %p\n", ptr);
+		//DW_LOG(WARNING, PROTECT, "OID table //exhausted, cannot taint pointer %p\n", ptr);
 		return ptr;
 	}
 

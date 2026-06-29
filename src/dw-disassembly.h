@@ -17,8 +17,20 @@
 #define MAX_MOD_REG 6
 #define MAX_SCAN_INST_COUNT 256
 #define MAX_SAFE_SITE_COUNT (MAX_SCAN_INST_COUNT/8)
-#define DW_MIN_SAFE_CANDIDATE_SIZE 4
+#define DW_MIN_SAFE_CANDIDATE_SIZE 0
 #define DW_TAIL_CANDIDATE_BUDGET 2
+/* Loop-exit deferral (#5) installs exactly ONE post at the loop's fall-through
+ * exit. The mechanism is single-exit-only by construction: loop_exit_defer_site
+ * returns a single fall-through address and the patch path stages one post.
+ * Deferring more than one exit would need atomic multi-post staging and per-exit
+ * slot release, neither of which exists -- do not add multi-exit support without
+ * building both. */
+/* Loop-exit deferral: how far past the latch's fall-through we scan for a
+ * provably-non-heap retaint site, skipping heap-faulting instructions (each of
+ * those faults and is patched on its own). Bounded so a long run of pointer
+ * dereferences after the loop simply declines deferral rather than scanning the
+ * whole function. */
+#define DW_LE_EXIT_SCAN_MAX 32
 #define MAX_VSIB_INDEX_WIDTH 8  // 64 bits index
 #define MIN_VSIB_INDEX_WIDTH 4  // 32 bits index
 
@@ -347,6 +359,26 @@ struct reg_arg {
 	unsigned access;
 };
 
+/* Maximum number of invariant bases that can coalesce onto a single shared
+ * loop-exit post (#5). members[0] is the owner (it installed the physical
+ * post); the rest are siblings whose retaint was relocated onto the owner's
+ * exit. If a loop has more distinct invariant bases than this, the overflow
+ * bases fall back to their own per-iteration posts (graceful, no correctness
+ * impact). */
+#define DW_LE_PLAN_MAX_MEMBERS 8
+
+/* Shared loop-exit plan (#5 coalescing). One plan per distinct fall-through
+ * exit address. All mutation (create-owner, append-sibling, lookup) happens on
+ * the single patch worker thread, so it is unlocked; the only cross-context
+ * access is the owner's exit post, which fires from signal/trap context on
+ * arbitrary threads and reads members[]/nb_members lock-free via acquire,
+ * paired with the worker's release store on append. */
+struct le_plan {
+	uintptr_t exit_target;
+	_Atomic unsigned nb_members;
+	struct insn_entry *members[DW_LE_PLAN_MAX_MEMBERS];
+};
+
 struct insn_entry {
 	_Atomic int state;
 	struct memory_arg arg_m[MAX_MEM_ARG];
@@ -359,6 +391,34 @@ struct insn_entry {
 	bool deferred_post_handler;
 	bool patch_disabled;
 	bool has_vsib;
+	/* Loop-exit post-handler deferral (#5). loop_exit_defer marks an entry whose
+	 * retaint was relocated to the loop's fall-through exit (set by both variants,
+	 * used for logging/stats/site-priority). loop_exit_activate is set ONLY for
+	 * Variant A (fault inside the loop, no pre-probe): the SIGSEGV handler strips
+	 * the invariant base once per loop entry and only the loop-exit post is armed. */
+	bool loop_exit_defer;
+	bool loop_exit_activate;
+	/* Footprint of all fixed-field body accesses admitted for #5 (fault-to-latch
+	 * range only). When loop_exit_footprint is true, activation must bounds-check
+	 * [base + loop_exit_disp_lo, base + loop_exit_disp_hi) — using the tainted
+	 * base pointer so dw_check_access(_ctx) actually inspects the OID — instead
+	 * of only the single fault-EA displacement. disp_hi is exclusive. */
+	bool    loop_exit_footprint;
+	int64_t loop_exit_disp_lo;
+	int64_t loop_exit_disp_hi;
+	/* Fall-through exit address (latch + latch_size) where this entry's #5
+	 * retaint post is/was staged. Keys the shared-exit plan registry that lets
+	 * sibling invariant bases in one loop coalesce onto a single exit post.
+	 * 0 when not a #5 entry. */
+	uintptr_t loop_exit_target;
+	/* Shared-exit coalescing (#5). loop_exit_plan is set ONLY on the owner
+	 * (members[0]) at commit time; its exit post walks the plan and retaints
+	 * every active member. A sibling that joined a committed owner's exit
+	 * installs no post and keeps loop_exit_plan NULL (it is identified at
+	 * runtime by holding its own activation slot, not by a flag). NULL for
+	 * non-coalesced #5 entries. The owner/sibling election is decided at commit
+	 * time under dw_le_plan_mu, never during analysis. */
+	struct le_plan *loop_exit_plan;
 	uintptr_t insn;
 	uintptr_t patch_insn;
 	uintptr_t next_insn;
@@ -404,6 +464,43 @@ DW_INTERNAL void dw_unprotect_context(struct patch_exec_context *ctx);
 
 /* A potentially tainted pointer was accessed, reprotect it after the access */
 DW_INTERNAL void dw_reprotect_context(struct patch_exec_context *ctx);
+
+/* Shared loop-exit post (#5 coalescing): reprotect every active member of the
+ * firing owner's plan. Resolves each member's runtime slot in the CURRENT
+ * thread, retaints the ones that hold a slot, and skips the rest (a member may
+ * not have faulted this loop entry on this thread). Unlike dw_reprotect_context
+ * it must NOT bail on the first missing slot. */
+DW_INTERNAL void dw_reprotect_plan_context(struct patch_exec_context *ctx);
+
+/* Variant A loop-exit activation: strip the invariant base once per loop entry
+ * from the SIGSEGV context, bounds-checking the access. Returns true if at least
+ * one protected base was stripped (the context was modified and a runtime slot
+ * acquired for the loop-exit post). */
+DW_INTERNAL bool dw_loop_exit_activate_context(struct insn_entry *entry, ucontext_t *uctx);
+
+/* Shared loop-exit plan registry (#5 coalescing). These are the WRITER side of
+ * the registry, called from the commit path (patch_entry_sync). That path is
+ * usually the patch worker but can also run on arbitrary faulting threads, so
+ * the caller MUST hold the registry lock (dw_le_plan_lock/unlock) across a whole
+ * lookup -> create/attach election so it is atomic w.r.t. other writers. The
+ * async-signal post-handler reader (dw_reprotect_plan_context) never takes the
+ * lock; it reads members[]/nb_members lock-free via acquire.
+ *  - lock/unlock: serialize the writers.
+ *  - exit_is_filled: true if the insn at `addr` is an INT3/JMP fill or
+ *    undecodable, i.e. NOT a safe empty owner-install site.
+ *  - lookup: return the committed plan keyed on exit_target, or NULL.
+ *  - create_owner: register `owner` as members[0] of a new plan for exit_target
+ *    and return it (NULL if the table is full).
+ *  - attach: append `sibling` to an existing plan via a release store on
+ *    nb_members; return false if members[] is full (caller falls back to its own
+ *    per-iteration post). */
+DW_INTERNAL void dw_le_plan_lock(void);
+DW_INTERNAL void dw_le_plan_unlock(void);
+DW_INTERNAL bool dw_exit_is_filled(uintptr_t addr);
+DW_INTERNAL struct le_plan *dw_le_plan_lookup(uintptr_t exit_target);
+DW_INTERNAL struct le_plan *dw_le_plan_create_owner(struct insn_entry *owner,
+		uintptr_t exit_target);
+DW_INTERNAL bool dw_le_plan_attach(struct le_plan *plan, struct insn_entry *sibling);
 
 /* List all the instructions in the table along with their statistics */
 void dw_print_instruction_entries(instruction_table *table, int fd);

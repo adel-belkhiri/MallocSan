@@ -89,9 +89,17 @@ static void patch_handler(struct patch_exec_context *ctx, uint8_t post)
 {
 	struct insn_entry *entry = ctx->user_data;
 	uintptr_t patch_insn = entry->patch_insn ? entry->patch_insn : entry->insn;
-	if (post || ctx->program_counter != patch_insn)
-		dw_reprotect_context(ctx);
-	else
+	if (post || ctx->program_counter != patch_insn) {
+		/*
+		 * Shared loop-exit post (#5 coalescing): when this entry owns a plan,
+		 * its single exit post must retaint every coalesced member, not just
+		 * itself. Otherwise the ordinary single-entry retaint applies.
+		 */
+		if (entry->loop_exit_plan)
+			dw_reprotect_plan_context(ctx);
+		else
+			dw_reprotect_context(ctx);
+	} else
 		dw_unprotect_context(ctx);
 }
 
@@ -149,8 +157,64 @@ static bool make_probe(struct insn_entry *entry, uintptr_t address, bool around,
 	s = patch_attr_set_initial_state(&attr, PATCH_DISABLED);
 	check_patch(s, "set disabled");
 
-	s = patch_make(&location, &exec_model, &attr, out, NULL);
+	/*
+	 * Overlap children (patch_insn != 0) only ever take the entry->patch_insn
+	 * branch of patch_entry_sync, so within make_probe a non-zero patch_insn
+	 * reliably identifies an overlap-child make. For those, capture the
+	 * per-candidate results so a failed make exposes the real libpatch reason
+	 * (e.g. an OLX rebuild landing-pad miss or a region admission reject).
+	 * Without this, find_solution() reset_error()s the specific error and
+	 * returns the generic "could not find solution", so even check_patch at
+	 * DEBUG cannot show why an overlap child was rejected. The common
+	 * (non-overlap) path keeps passing NULL and is left untouched.
+	 */
+	const bool diag = entry->patch_insn != 0;
+	struct patch_location_results results = {0};
+
+	s = patch_make(&location, &exec_model, &attr, out, diag ? &results : NULL);
 	check_patch(s, "make");
+
+	if (s != PATCH_OK && diag) {
+		bool logged = false;
+
+		for (size_t i = 0; i < results.count; i++) {
+			const struct patch_error *pe = results.results[i].error;
+
+			DW_LOG(WARNING, PATCH,
+				   "Overlap make candidate 0x%llx rejected: %s [origin %s, irritant %s]\n",
+				   (unsigned long long)results.results[i].candidate,
+				   pe ? pe->message : "(none)",
+				   pe ? pe->origin : "(none)",
+				   pe ? pe->irritant : "(none)");
+			logged = true;
+		}
+
+		if (!logged) {
+			/* Failure before find_solution (resolve/candidates): the
+			 * thread-local last error is still intact here. */
+			struct patch_error e;
+
+			patch_last_error(&e);
+			DW_LOG(WARNING, PATCH,
+				   "Overlap make failed with no per-candidate detail: %s [origin %s, irritant %s]\n",
+				   e.message, e.origin, e.irritant);
+		} else if (results.count > 0 && !results.results[0].error) {
+			/*
+			 * libpatch returned a bare PATCH_ERR_FAIL with no pushed error.
+			 * On the overlap path that is the silent region_idx == 0 guard in
+			 * add_overlap_child(): the OLX instruction's original PC is itself
+			 * a patch HEAD, and libpatch only accepts overlap children on the
+			 * displaced non-head region instructions (idx >= 1).
+			 */
+			DW_LOG(WARNING, PATCH,
+				   "  (no libpatch error string: original PC is a patch head / not an "
+				   "overlap-child slot)\n");
+		}
+	}
+
+	if (results.results)
+		(void)patch_drop_location_results(&results);
+
 	return s == PATCH_OK;
 }
 
@@ -219,11 +283,46 @@ static bool make_deferred_post(struct insn_entry *entry,
 			return true;
 		}
 
+		/*
+		 * Loop-exit sites fire at most once per loop entry, so a primary int3
+		 * (TRAP) post is acceptable there even when the exit insn is too short
+		 * for a jump-class patch. Only sites explicitly flagged trap_ok opt in,
+		 * and only when the caller has not already forced TRAP.
+		 */
+		if (safe_sites->entries[idx].trap_ok &&
+		    trap_policy != PATCH_TRAP_POLICY_FORCE &&
+		    make_probe(entry, addr, false, PATCH_TRAP_POLICY_FORCE, out)) {
+			entry->next_insn = addr;
+			DW_LOG(DEBUG, PATCH, "Staged deferred post-probe (TRAP) at 0x%llx (origin 0x%llx).\n",
+				   addr, entry->insn);
+			return true;
+		}
+
 		DW_LOG(DEBUG, PATCH,
 			   "Deferred post-probe could not be staged at 0x%llx (origin 0x%llx), trying next.\n",
 			   addr, entry->insn);
 	}
 
+	return false;
+}
+
+/*
+ * Stage the Variant-A owner post at the single loop fall-through exit address
+ * directly (no ring-buffer scan). On success the handle is in *out and
+ * entry->next_insn records the exit. Jump-class first (ALLOW), then a primary
+ * int3 (FORCE) -- a loop-exit post fires at most once per loop entry, so a trap
+ * there is acceptable when the exit insn is too short for a jump-class patch.
+ */
+static bool make_loop_exit_post(struct insn_entry *entry, uintptr_t addr, patch_t *out)
+{
+	if (make_probe(entry, addr, false, PATCH_TRAP_POLICY_ALLOW, out)) {
+		entry->next_insn = addr;
+		return true;
+	}
+	if (make_probe(entry, addr, false, PATCH_TRAP_POLICY_FORCE, out)) {
+		entry->next_insn = addr;
+		return true;
+	}
 	return false;
 }
 
@@ -297,6 +396,74 @@ overlap_done:
 			return -1;
 		}
 		return 0;
+	}
+
+	/*
+	 * Variant A loop-exit: fault-driven activation strips the invariant base
+	 * once per loop entry from the SIGSEGV handler, so there is NO pre-probe.
+	 * Install ONLY the deferred post (retaint) at the loop fall-through exit.
+	 * Must precede the fast (emulate) path: a fixed-field mov that is also a
+	 * loop-exit candidate has to take this path, not emulate-and-skip.
+	 */
+	if (want_defer && entry->loop_exit_activate) {
+		/*
+		 * Shared loop-exit coalescing (#5). Owner/sibling election is decided
+		 * HERE, at commit, under dw_le_plan_mu -- never trusting an analysis-time
+		 * verdict (analysis runs on faulting threads and races other commits).
+		 * The whole lookup -> emptiness re-check -> install -> create_owner/attach
+		 * sequence is one critical section, so two entries can never both become
+		 * owner of the same exit: the first registers the plan before unlocking,
+		 * the second sees it and attaches.
+		 */
+		bool committed = false;
+
+		dw_le_plan_lock();
+		struct le_plan *plan = dw_le_plan_lookup(entry->loop_exit_target);
+		if (plan) {
+			/*
+			 * A committed owner already holds this exit -> SIBLING. Install NO
+			 * physical post: join the owner's plan; the owner's single exit post
+			 * retaints us.
+			 */
+			committed = dw_le_plan_attach(plan, entry);
+			dw_le_plan_unlock();
+		} else if (!dw_exit_is_filled(entry->loop_exit_target) &&
+			   make_loop_exit_post(entry, entry->loop_exit_target, &post)) {
+			/*
+			 * No owner yet and the exit decodes to a real (unfilled) instruction
+			 * -> try to BECOME the owner. The emptiness re-check under the lock
+			 * removes all dependence on libpatch's occupied-make semantics: we
+			 * only ever install on a verifiably-empty exit.
+			 */
+			if (enable_and_commit(&post, 1)) {
+				dw_le_plan_create_owner(entry, entry->loop_exit_target);
+				dw_le_plan_unlock();
+				committed = true;
+			} else {
+				drop_probes(&post, 1);
+				dw_le_plan_unlock();
+			}
+		} else {
+			dw_le_plan_unlock();
+		}
+
+		if (committed) {
+			entry->deferred_post_handler = true;
+			entry->patch_disabled = true;
+			entry->strategy = DW_PATCH_JUMP;
+			return 0;
+		}
+
+		/*
+		 * Could neither own nor join the exit. Abandon Variant A and fall
+		 * through to the generic pre+post deferral path below (the entry keeps
+		 * its normal pre-probe). Reset deferred_post_handler too so a later
+		 * size-floor revert does not see a stale flag; want_defer was captured
+		 * const at function entry, so the generic path still runs.
+		 */
+		entry->loop_exit_activate = false;
+		entry->loop_exit_defer = false;
+		entry->deferred_post_handler = false;
 	}
 
 	/*
