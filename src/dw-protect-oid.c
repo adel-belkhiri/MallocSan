@@ -95,6 +95,17 @@ static inline uint64_t oids_head_pack(unsigned idx, uint64_t counter)
 	return (counter << 16) | ((uint64_t)idx & OIDS_HEAD_IDX_MASK);
 }
 
+static inline bool oids_head_is_current(uint64_t *head)
+{
+	uint64_t cur = atomic_load_explicit(&oids_head, memory_order_acquire);
+
+	if (cur == *head)
+		return true;
+
+	*head = cur;
+	return false;
+}
+
 static inline unsigned dw_oid_alloc(void)
 {
 	uint64_t head = atomic_load_explicit(&oids_head, memory_order_acquire);
@@ -110,6 +121,14 @@ static inline unsigned dw_oid_alloc(void)
 
 		unsigned next = (unsigned)atomic_load_explicit(&oids[idx].size, memory_order_relaxed);
 		if (next >= oids_size) {
+			/*
+			 * Another allocator may have popped this slot after our head
+			 * load and replaced size with the allocation size. Confirm that
+			 * the same tagged head is still published before diagnosing the
+			 * free-list link; otherwise retry from the newly observed head.
+			 */
+			if (!oids_head_is_current(&head))
+				continue;
 			DW_LOG(ERROR, PROTECT, "OID free list corrupted (next=%u)\n", next);
 			return 0;
 		}
