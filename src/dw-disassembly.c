@@ -63,6 +63,23 @@ static __thread bool rt_slot_state_ready
 	__attribute__((tls_model("initial-exec")));
 
 /*
+ * One-entry memo for the hot pre/post pair. A hit is valid only while
+ * slot_owner[idx] still matches, so stale or signal-interrupted updates fall
+ * back to the hash chain. Publish the key last so it identifies the stored idx.
+ */
+static __thread struct insn_entry *rt_slot_memo_entry
+	__attribute__((tls_model("initial-exec")));
+static __thread int rt_slot_memo_idx
+	__attribute__((tls_model("initial-exec")));
+
+static inline void dw_rt_slot_memo_set(struct insn_entry *entry, int idx)
+{
+	rt_slot_memo_idx = idx;
+	atomic_signal_fence(memory_order_release);
+	rt_slot_memo_entry = entry;
+}
+
+/*
  * Shared loop-exit plan registry (#5 coalescing). A fixed-size linear,
  * append-only table of committed #5 exit posts, keyed on the fall-through exit
  * address. members[0] of each plan is the OWNER (it installed the physical
@@ -386,6 +403,7 @@ static inline bool dw_acquire_runtime_slot(struct insn_entry *entry, int *idx_ou
 		slot_owner[idx] = entry;
 		rt_slot_next[idx] = rt_slot_bucket_head[bucket];
 		rt_slot_bucket_head[bucket] = (int16_t)idx;
+		dw_rt_slot_memo_set(entry, idx);
 		*idx_out = idx;
 		return true;
 	}
@@ -400,11 +418,24 @@ static inline bool dw_find_runtime_slot(struct insn_entry *entry, int *idx_out)
 	if (!rt_slot_state_ready || !entry)
 		return false;
 
+	/* Read the published key first, then validate its index against the owner. */
+	struct insn_entry *memo = rt_slot_memo_entry;
+	atomic_signal_fence(memory_order_acquire);
+	if (memo == entry) {
+		int idx = rt_slot_memo_idx;
+		if (idx >= 0 && idx < MAX_SCAN_INST_COUNT && slot_owner[idx] == entry) {
+			if (idx_out)
+				*idx_out = idx;
+			return true;
+		}
+	}
+
 	size_t bucket = dw_runtime_slot_bucket(entry);
 	for (int idx = rt_slot_bucket_head[bucket]; idx >= 0; idx = rt_slot_next[idx]) {
 		if (slot_owner[idx] == entry) {
 			if (idx_out)
 				*idx_out = idx;
+			dw_rt_slot_memo_set(entry, idx);
 			return true;
 		}
 	}
@@ -422,6 +453,10 @@ static inline void dw_release_rt_slot(int idx)
 	struct insn_entry *entry = slot_owner[idx];
 	if (!entry)
 		return;
+
+	/* Drop the memo if it named this slot, so no later hit trusts a freed idx. */
+	if (rt_slot_memo_idx == idx)
+		rt_slot_memo_entry = NULL;
 
 	size_t bucket = dw_runtime_slot_bucket(entry);
 	int16_t *link = &rt_slot_bucket_head[bucket];
