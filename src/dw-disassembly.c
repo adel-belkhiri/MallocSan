@@ -1860,6 +1860,44 @@ classify_fast_kind(struct insn_entry *entry, const cs_insn *insn, const cs_x86 *
 	entry->fast_disp = m->displacement;
 }
 
+/*
+ * Select the specialized handler for one base+displacement memory operand.
+ * Exclude shapes that need index, value-operand, REP/VSIB, loop-exit, or OLX
+ * handling. This runs at patch time, keeping dispatch off the probe hot path.
+ */
+DW_INTERNAL bool dw_entry_base_only_fast(const struct insn_entry *entry)
+{
+	if (!entry)
+		return false;
+
+	/* Overlap children use patch_insn and require the generic handler. */
+	if (entry->patch_insn)
+		return false;
+
+	if (entry->nb_arg_m != 1)
+		return false;
+	if (entry->has_vsib || entry->repeat || entry->repeat_conditional)
+		return false;
+
+	/* Loop-exit variants require generic footprint and plan handling. */
+	if (entry->loop_exit_footprint || entry->loop_exit_defer ||
+	    entry->loop_exit_activate || entry->loop_exit_plan)
+		return false;
+
+	const struct memory_arg *m = &entry->arg_m[0];
+
+	if (m->base == X86_REG_INVALID || m->base_re == NULL ||
+	    !reg_is_gpr(m->base) || m->base_re->libpatch_index < 0)
+		return false;
+	if (m->index != X86_REG_INVALID)
+		return false;
+	/* A base used as a value operand requires the generic special cases. */
+	if (m->base_access != 0)
+		return false;
+
+	return true;
+}
+
 static unsigned
 fill_instruction_operands(struct insn_entry *entry, struct insn_entry_runtime* entry_rt, const csh handle, const cs_insn *insn,
 						  const cs_x86 *x86, const ucontext_t *uctx)
@@ -2924,6 +2962,86 @@ DW_INTERNAL void dw_reprotect_context(struct patch_exec_context *ctx)
 		return;
 
 	dw_reprotect_one_entry(entry, slot_idx, ctx);
+}
+
+/*
+ * Specialized pre-probe for base-only entries. Check base+disp, strip a
+ * protected base, and save its taint when a post will restore it. Coherency
+ * checking uses the generic handler.
+ */
+DW_INTERNAL void dw_unprotect_base_only(struct patch_exec_context *ctx)
+{
+	struct insn_entry *entry = ctx->user_data;
+
+	if (unlikely(dw_check_handling)) {
+		dw_unprotect_context(ctx);
+		return;
+	}
+
+	struct memory_arg *mem = &entry->arg_m[0];
+	const struct reg_entry *reb = mem->base_re;
+	uintptr_t valueb = dw_get_register(ctx, reb->libpatch_index);
+
+	/*
+	 * Only a post needs saved state. On slot exhaustion, proceed untracked so
+	 * the post skips retainting instead of corrupting another entry's slot.
+	 */
+	struct memory_arg_runtime *mem_rt = NULL;
+	if (entry->post_handler) {
+		int rt_idx;
+		if (likely(dw_acquire_runtime_slot(entry, &rt_idx))) {
+			mem_rt = &insn_rt_slots[rt_idx].arg_m[0];
+			/* Fields the post reads unconditionally for this shape. */
+			mem_rt->base_taint = 0;
+			mem_rt->index_taint = 0;
+			mem_rt->restore_base = false;
+			mem_rt->base_addr = valueb;
+		} else {
+			DW_LOG(ERROR, DISASSEMBLY,
+			       "Problem getting a runtime slot for instruction 0x%llx\n", entry->insn);
+		}
+	}
+
+	if (dw_is_protected((void *) valueb)) {
+		if (mem_rt)
+			mem_rt->base_taint = valueb;
+		dw_check_access_ctx((void *) (valueb + mem->displacement), mem->length, ctx);
+		dw_set_register(ctx, reb->libpatch_index, (uintptr_t) dw_unprotect((void *) valueb));
+	}
+
+	if (unlikely(dw_stats_enabled))
+		atomic_fetch_add_explicit(&entry->hit_count, 1, memory_order_relaxed);
+}
+
+/*
+ * Specialized post-probe for base-only entries. Restore the saved taint to the
+ * current base value and release the slot. As in the generic path, no slot
+ * means execution entered after the pre-probe, so there is nothing to restore.
+ */
+DW_INTERNAL void dw_reprotect_base_only(struct patch_exec_context *ctx)
+{
+	struct insn_entry *entry = ctx->user_data;
+
+	if (unlikely(dw_check_handling)) {
+		dw_reprotect_context(ctx);
+		return;
+	}
+
+	int slot_idx;
+	if (unlikely(!dw_find_runtime_slot(entry, &slot_idx)))
+		return;
+
+	struct memory_arg *mem = &entry->arg_m[0];
+	struct memory_arg_runtime *mem_rt = &insn_rt_slots[slot_idx].arg_m[0];
+
+	if (mem_rt->base_taint) {
+		const struct reg_entry *re = mem->base_re;
+		const void *valueb_new = (const void *) dw_get_register(ctx, re->libpatch_index);
+		dw_set_register(ctx, re->libpatch_index,
+				(uint64_t) dw_reprotect(valueb_new, (void *) mem_rt->base_taint));
+	}
+
+	dw_release_rt_slot(slot_idx);
 }
 
 /*

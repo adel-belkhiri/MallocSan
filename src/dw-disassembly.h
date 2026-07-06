@@ -463,6 +463,14 @@ DW_INTERNAL void dw_unprotect_context(struct patch_exec_context *ctx);
 /* A potentially tainted pointer was accessed, reprotect it after the access */
 DW_INTERNAL void dw_reprotect_context(struct patch_exec_context *ctx);
 
+/*
+ * Specialized handlers for one GPR base+displacement memory operand. Eligibility
+ * is decided at patch time; coherency checking delegates to the generic path.
+ */
+DW_INTERNAL void dw_unprotect_base_only(struct patch_exec_context *ctx);
+DW_INTERNAL void dw_reprotect_base_only(struct patch_exec_context *ctx);
+DW_INTERNAL bool dw_entry_base_only_fast(const struct insn_entry *entry);
+
 /* Shared loop-exit post (#5 coalescing): reprotect every active member of the
  * firing owner's plan. Resolves each member's runtime slot in the CURRENT
  * thread, retaints the ones that hold a slot, and skips the rest (a member may

@@ -103,6 +103,17 @@ static void patch_handler(struct patch_exec_context *ctx, uint8_t post)
 		dw_unprotect_context(ctx);
 }
 
+/* Route non-relocated base-only entries directly to their specialized probes. */
+static void patch_handler_base_only(struct patch_exec_context *ctx, uint8_t post)
+{
+	struct insn_entry *entry = ctx->user_data;
+
+	if (post || ctx->program_counter != entry->insn)
+		dw_reprotect_base_only(ctx);
+	else
+		dw_unprotect_base_only(ctx);
+}
+
 static inline uintptr_t entry_initial_addr(const struct insn_entry *entry)
 {
 	return entry->patch_insn ? entry->patch_insn : entry->insn;
@@ -141,7 +152,7 @@ static bool make_probe(struct insn_entry *entry, uintptr_t address, bool around,
 		.probe.clobber_registers = entry->has_vsib ? PATCH_REGS_ALL
 							   : ((1ULL << PATCH_ARCH_GREGS_COUNT) - 1),
 		.probe.user_data = entry,
-		.probe.procedure = patch_handler,
+		.probe.procedure = dw_entry_base_only_fast(entry) ? patch_handler_base_only : patch_handler,
 	};
 
 	patch_attr attr;
