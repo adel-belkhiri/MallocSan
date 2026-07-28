@@ -61,11 +61,17 @@ bool dw_guard_realloc_inplace(void *ptr, size_t new_size);
 
 /*
  * Signal-handler entry. If fault_addr lies in a known guard page, report the
- * out-of-bounds access and (if configured) abort; returns true to indicate the
- * fault was handled. Returns false if fault_addr is not a guard page (caller
- * continues its normal fault handling). Lock-free: safe to call from the
- * signal handler.
+ * out-of-bounds access and (if configured) abort. In non-abort mode, temporarily
+ * permit the page and arm a single-step trap so the faulting instruction can
+ * complete. Returns true if the fault was handled, or false if the address is
+ * not a stable guard-page snapshot and normal fault handling should continue.
  */
 bool dw_guard_handle_fault(void *fault_addr, void *context);
+
+/*
+ * Complete a non-aborting guard single-step. Restores PROT_NONE after RIP
+ * advances; returns true only for a trace trap armed by dw_guard_handle_fault().
+ */
+bool dw_guard_handle_trap(void *context);
 
 #endif /* DW_PROTECT_GUARD_H */

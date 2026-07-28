@@ -1473,48 +1473,27 @@ static uintptr_t dw_defer_post_handler(struct insn_entry *entry,
 		}
 
 		/*
-		 * 2b) Constant pointer walk. A `add/sub/inc/dec reg, imm` on a tracked
-		 * tainted register adjusts the pointer by a compile-time constant without
-		 * aliasing or accessing memory. Instead of stopping here (it would
-		 * otherwise be a reg read+modify => REG_MODIFIED stop below), fold the
-		 * adjustment into that register's running delta and keep scanning;
-		 * subsequent same-object accesses are validated against the shifted
-		 * address via similar_memory_access(). Bail to the normal stop only if
-		 * the accumulated delta would approach the tag field.
+		 * A constant adjustment changes the live effective address. The forward
+		 * scan can validate accesses after it against the object present while the
+		 * entry is discovered, but that result is not valid when the same site is
+		 * later reached with a smaller allocation. Reprotect at the adjustment so
+		 * every shifted access faults (and is checked) on every execution.
 		 */
 		uint32_t adj_reg;
 		int64_t adj;
 		if (const_adjust_of_tainted_reg(insn, tainted_regs, tainted_regs_count,
 						&adj_reg, &adj)) {
-			const struct reg_entry *adj_re = dw_get_reg_entry(adj_reg);
-			int adj_canon = adj_re ? adj_re->canonical_index : X86_REG_INVALID;
-			bool tracked = false;
-			for (unsigned i = 0; i < tainted_regs_count; i++) {
-				const struct reg_entry *re = dw_get_reg_entry(tainted_regs[i]);
-				if (!re || re->canonical_index != adj_canon)
-					continue;
-				int64_t nd = tainted_delta[i] + adj;
-				if (nd <= DW_MAX_PTR_WALK_DELTA && nd >= -DW_MAX_PTR_WALK_DELTA) {
-					tainted_delta[i] = nd;
-					tracked = true;
-				}
-				break;
-			}
+			(void)adj_reg;
+			DW_LOG(DEBUG, DISASSEMBLY,
+				   "Stopping deferral at constant pointer adjustment 0x%llx -> %s %s (delta %+lld)\n",
+				   insn->address, insn->mnemonic, insn->op_str, (long long)adj);
 
-			if (tracked) {
-				DW_LOG(DEBUG, DISASSEMBLY,
-					   "Tracking constant pointer walk at 0x%llx -> %s %s (delta %+lld)\n",
-					   insn->address, insn->mnemonic, insn->op_str, (long long)adj);
-				++n;
-				continue;
-			}
-
-			/* Accumulated delta would approach the tag field: fall back to the
-			 * register-modified stop (this insn is reg,imm, never a memory
-			 * access, so record it as a candidate safe site first). */
+			/* The adjustment has no memory operand, so it is a safe place to run
+			 * the deferred post before the modified pointer is dereferenced. */
 			if (last_safe_addr <= last_same_access_addr) {
 				last_safe_addr = insn->address;
 				count_same_access += pending_same_access;
+				pending_same_access = 0;
 				add_post_safe_site(rb, last_safe_addr, insn->size, count_same_access, false);
 			}
 			goto stop_return;

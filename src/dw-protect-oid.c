@@ -1,4 +1,5 @@
 #include <malloc.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdint.h>
 
@@ -76,6 +77,15 @@ struct dw_oid_cache {
 };
 
 static __thread struct dw_oid_cache dw_tls_oid_cache
+	__attribute__((tls_model("initial-exec")));
+
+/*
+ * A signal handler may re-enter dw_check_access_ctx() on the interrupted
+ * thread. Keep nested calls away from the cache while an outer call is reading
+ * or publishing its multi-field entry. Each call restores the value it saw,
+ * so arbitrarily nested handlers cannot clear an outer call's guard.
+ */
+static __thread volatile sig_atomic_t dw_tls_oid_cache_active
 	__attribute__((tls_model("initial-exec")));
 
 #define OIDS_HEAD_IDX_MASK UINT64_C(0xFFFF)
@@ -252,6 +262,10 @@ DW_INTERNAL bool dw_check_access_ctx(const void *ptr, size_t size,
 
 	uintptr_t base;
 	size_t sz;
+	sig_atomic_t cache_was_active = dw_tls_oid_cache_active;
+	dw_tls_oid_cache_active = 1;
+	atomic_signal_fence(memory_order_seq_cst);
+	bool cache_available = (cache_was_active == 0);
 
 	/*
 	 * Fast path: one-entry per-thread cache (see dw_tls_oid_cache). Trust it
@@ -262,7 +276,7 @@ DW_INTERNAL bool dw_check_access_ctx(const void *ptr, size_t size,
 	struct dw_oid_cache *cache = &dw_tls_oid_cache;
 	uint64_t epoch = atomic_load_explicit(&dw_oid_epoch, memory_order_acquire);
 
-	if (likely(cache->oid == oid && cache->epoch == epoch)) {
+	if (cache_available && likely(cache->oid == oid && cache->epoch == epoch)) {
 		base = cache->base;
 		sz   = cache->size;
 	} else {
@@ -272,6 +286,8 @@ DW_INTERNAL bool dw_check_access_ctx(const void *ptr, size_t size,
 		void *base_addr = atomic_load_explicit(&oids[oid].base_addr, memory_order_acquire);
 		if (unlikely(base_addr == NULL)) {
 invalid:
+			atomic_signal_fence(memory_order_seq_cst);
+			dw_tls_oid_cache_active = cache_was_active;
 			DW_LOG(WARNING, PROTECT,
 				   "Invalid taint value %u for %p\n", oid, ptr);
 			return false;
@@ -280,20 +296,18 @@ invalid:
 		base = (uintptr_t)base_addr;
 		sz   = atomic_load_explicit(&oids[oid].size, memory_order_relaxed);
 
-		/*
-		 * Refill. Publish base/size before the {oid,epoch} key so that an
-		 * async signal re-entering this function on the same thread can only
-		 * see a stale-but-consistent entry or a clean miss -- never a fresh
-		 * key paired with another object's base/size. The fence is
-		 * compiler-only: the cache is thread-private TLS, so no CPU barrier
-		 * is needed, only prevention of store reordering across a signal.
-		 */
-		cache->base = base;
-		cache->size = sz;
-		atomic_signal_fence(memory_order_release);
-		cache->oid   = oid;
-		cache->epoch = epoch;
+		/* Nested signal checks use the table directly and do not publish. The
+		 * outermost call owns the TLS cache until the complete tuple is stored. */
+		if (cache_available) {
+			cache->base = base;
+			cache->size = sz;
+			cache->oid   = oid;
+			cache->epoch = epoch;
+		}
 	}
+
+	atomic_signal_fence(memory_order_seq_cst);
+	dw_tls_oid_cache_active = cache_was_active;
 
 	/* Check [real_addr, real_addr + size) ⊆ [base, base + sz). */
 	if (unlikely(size > sz || real_addr < base || real_addr > base + sz - size)) {
