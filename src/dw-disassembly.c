@@ -1146,6 +1146,9 @@ static uintptr_t dw_defer_post_handler(struct insn_entry *entry,
 				   struct capstone_context *cs,
 				   unsigned *scanned_count,
 				   unsigned *similar_access_count,
+				   int64_t *footprint_lo_out,
+				   int64_t *footprint_hi_out,
+				   bool *footprint_exact_out,
 				   struct post_safe_site_rb *rb)
 {
 	const uint8_t *code            = (const uint8_t *) start_addr;
@@ -1367,10 +1370,10 @@ static uintptr_t dw_defer_post_handler(struct insn_entry *entry,
 								add_post_safe_site(rb, exit_addr, exit_size,
 										   count_same_access, /*trap_ok=*/true);
 								entry->loop_exit_defer = true;
-								entry->loop_exit_footprint = (fp_disp_lo != entry->arg_m[0].displacement ||
+								entry->footprint_check = (fp_disp_lo != entry->arg_m[0].displacement ||
 								                              fp_disp_hi != entry->arg_m[0].displacement + (int64_t)entry->arg_m[0].length);
-								entry->loop_exit_disp_lo = fp_disp_lo;
-								entry->loop_exit_disp_hi = fp_disp_hi;
+								entry->footprint_disp_lo = fp_disp_lo;
+								entry->footprint_disp_hi = fp_disp_hi;
 								entry->loop_exit_target = exit_addr;
 								DW_LOG(DEBUG, DISASSEMBLY,
 									   "Loop-exit deferral (Variant B): post staged at fall-through 0x%llx (latch 0x%llx, origin 0x%llx).\n",
@@ -1416,10 +1419,10 @@ static uintptr_t dw_defer_post_handler(struct insn_entry *entry,
 							 * exit emptiness under the lock.)
 							 */
 							entry->loop_exit_defer = true;
-							entry->loop_exit_footprint = (fp_disp_lo != entry->arg_m[0].displacement ||
+							entry->footprint_check = (fp_disp_lo != entry->arg_m[0].displacement ||
 							                              fp_disp_hi != entry->arg_m[0].displacement + (int64_t)entry->arg_m[0].length);
-							entry->loop_exit_disp_lo = fp_disp_lo;
-							entry->loop_exit_disp_hi = fp_disp_hi;
+							entry->footprint_disp_lo = fp_disp_lo;
+							entry->footprint_disp_hi = fp_disp_hi;
 							entry->loop_exit_target = exit_addr;
 							entry->loop_exit_activate = true;
 							DW_LOG(DEBUG, DISASSEMBLY,
@@ -1633,6 +1636,23 @@ stop_return:
 
 	if (similar_access_count)
 		*similar_access_count = count_same_access;
+
+	/*
+	 * Footprint of the fixed-field accesses admitted into the window. Reported
+	 * so a PLAIN forward deferral can also install the widened bounds check (the
+	 * loop-exit variants set the entry fields themselves above). footprint_exact
+	 * mirrors loop_exit_eligible: true only while every admitted same-object
+	 * access was an exact fixed-field access (no index, no tracked delta, same
+	 * scale) and so is fully covered by [fp_disp_lo, fp_disp_hi). When it is
+	 * false some access took the discovery-only slow path and the footprint does
+	 * NOT cover it, so the caller must not claim footprint coverage.
+	 */
+	if (footprint_lo_out)
+		*footprint_lo_out = fp_disp_lo;
+	if (footprint_hi_out)
+		*footprint_hi_out = fp_disp_hi;
+	if (footprint_exact_out)
+		*footprint_exact_out = loop_exit_eligible;
 
 	return last_safe_addr;
 }
@@ -1858,9 +1878,14 @@ DW_INTERNAL bool dw_entry_base_only_fast(const struct insn_entry *entry)
 	if (entry->has_vsib || entry->repeat || entry->repeat_conditional)
 		return false;
 
-	/* Loop-exit variants require generic footprint and plan handling. */
-	if (entry->loop_exit_footprint || entry->loop_exit_defer ||
-	    entry->loop_exit_activate || entry->loop_exit_plan)
+	/*
+	 * Loop-exit variants need the generic activation / shared-plan handling.
+	 * A plain deferred footprint entry does NOT: dw_unprotect_base_only performs
+	 * the widened footprint check itself (gated on deferred_post_handler), so it
+	 * stays on the fast path whether deferral committed or fell back to AROUND --
+	 * footprint_check alone must not disqualify it.
+	 */
+	if (entry->loop_exit_defer || entry->loop_exit_activate || entry->loop_exit_plan)
 		return false;
 
 	const struct memory_arg *m = &entry->arg_m[0];
@@ -2164,9 +2189,13 @@ static bool dw_populate_instruction_entry(instruction_table *table, struct insn_
 	if (entry->post_handler && !need_immediate_reprotection && !entry->patch_disabled) {
 		unsigned int insn_scan_count, similar_access_count;
 		uintptr_t last_safe_addr;
+		int64_t footprint_lo = 0, footprint_hi = 0;
+		bool footprint_exact = false;
 
 		last_safe_addr = dw_defer_post_handler(entry, &entry_rt, insn_addr, uctx, cs,
-							   &insn_scan_count, &similar_access_count, safe_sites);
+							   &insn_scan_count, &similar_access_count,
+							   &footprint_lo, &footprint_hi, &footprint_exact,
+							   safe_sites);
 
 		DW_LOG(DEBUG, DISASSEMBLY,
 			   "Forward scan has stopped at 0x%llx (%s %s), after (%u) instructions.\n",
@@ -2175,6 +2204,40 @@ static bool dw_populate_instruction_entry(instruction_table *table, struct insn_
 		if (entry->post_handler && (similar_access_count > 0 || entry->loop_exit_defer)) {
 			entry->deferred_post_handler = true;
 			entry->next_insn = last_safe_addr;
+
+			/*
+			 * 2a: widen the pre-handler bounds check to the full window footprint
+			 * for a PLAIN forward deferral (the loop-exit variants set their own
+			 * footprint inside dw_defer_post_handler). Without this, a same-base
+			 * access at a DIFFERENT displacement admitted into the window is
+			 * validated only once, at discovery, against the discovery object;
+			 * once the base is stripped it runs unchecked on every later
+			 * execution, so a later, smaller object would miss the violation.
+			 *
+			 * Only sound for a base-only fixed-field shape whose window is fully
+			 * covered by [footprint_lo, footprint_hi): single mem arg, no index,
+			 * base not a value operand, and footprint_exact (every admitted
+			 * access was an exact fixed-field access). Set only when the window
+			 * actually widened beyond the fault EA; otherwise the plain fault-EA
+			 * check already suffices.
+			 */
+			if (!entry->loop_exit_defer && footprint_exact &&
+			    entry->nb_arg_m == 1 &&
+			    entry->arg_m[0].index == X86_REG_INVALID &&
+			    entry->arg_m[0].base_access == 0) {
+				int64_t flt_lo = entry->arg_m[0].displacement;
+				int64_t flt_hi = flt_lo + (int64_t)entry->arg_m[0].length;
+
+				if (footprint_lo != flt_lo || footprint_hi != flt_hi) {
+					entry->footprint_check = true;
+					entry->footprint_disp_lo = footprint_lo;
+					entry->footprint_disp_hi = footprint_hi;
+					DW_LOG(DEBUG, DISASSEMBLY,
+						   "Deferred footprint widened to [base%+lld, base%+lld) for 0x%llx\n",
+						   (long long)footprint_lo, (long long)footprint_hi, entry->insn);
+				}
+			}
+
 			DW_LOG(DEBUG, DISASSEMBLY,
 				   "Post-handler DEFERRED to 0x%llx - skipped (%u) similar memory accesses%s!\n",
 				   last_safe_addr, similar_access_count,
@@ -2608,13 +2671,17 @@ DW_INTERNAL void dw_unprotect_context(struct patch_exec_context *ctx)
 
 			if (dw_is_protected((void *) valueb)) {
 				mem_rt->base_taint = valueb;
-				/* For #5 footprint entries, bounds-check the full fixed-field range
-				 * before stripping.  Use the tainted valueb: dw_check_access_ctx
-				 * extracts the OID from bits 48-63 and skips the check when oid==0
-				 * (a clean pointer would silently pass). */
-				if (entry->loop_exit_footprint) {
-					size_t footprint_size = (size_t)(entry->loop_exit_disp_hi - entry->loop_exit_disp_lo);
-					dw_check_access_ctx((void *)(valueb + entry->loop_exit_disp_lo),
+				/* Footprint entries bounds-check the full fixed-field range before
+				 * stripping.  Use the tainted valueb: dw_check_access_ctx extracts
+				 * the OID from bits 48-63 and skips the check when oid==0 (a clean
+				 * pointer would silently pass). Gated on deferred_post_handler: the
+				 * widened footprint is only reachable straight-line when the base is
+				 * actually stripped for the window; if the patch path abandoned
+				 * deferral (AROUND), each in-window access faults and is checked at
+				 * its own site, so here only the fault EA (check_sib_access) applies. */
+				if (entry->footprint_check && entry->deferred_post_handler) {
+					size_t footprint_size = (size_t)(entry->footprint_disp_hi - entry->footprint_disp_lo);
+					dw_check_access_ctx((void *)(valueb + entry->footprint_disp_lo),
 					                    footprint_size, ctx);
 				}
 				dw_set_register(ctx, reb->libpatch_index, (uintptr_t) dw_unprotect((void *) valueb));
@@ -2698,9 +2765,9 @@ DW_INTERNAL bool dw_loop_exit_activate_context(struct insn_entry *entry, ucontex
 		/* Bounds-check the fault EA (or the full footprint when wider) against
 		 * the live object.  Use the tainted valueb: dw_check_access extracts the
 		 * OID from bits 48-63 and returns early with oid==0 for a clean pointer. */
-		if (entry->loop_exit_footprint) {
-			size_t footprint_size = (size_t)(entry->loop_exit_disp_hi - entry->loop_exit_disp_lo);
-			dw_check_access((void *)(valueb + entry->loop_exit_disp_lo), footprint_size);
+		if (entry->footprint_check) {
+			size_t footprint_size = (size_t)(entry->footprint_disp_hi - entry->footprint_disp_lo);
+			dw_check_access((void *)(valueb + entry->footprint_disp_lo), footprint_size);
 		} else {
 			dw_check_access((void *)(valueb + mem->displacement), mem->length);
 		}
@@ -2984,7 +3051,20 @@ DW_INTERNAL void dw_unprotect_base_only(struct patch_exec_context *ctx)
 	if (dw_is_protected((void *) valueb)) {
 		if (mem_rt)
 			mem_rt->base_taint = valueb;
-		dw_check_access_ctx((void *) (valueb + mem->displacement), mem->length, ctx);
+		/*
+		 * A deferred entry that widened its footprint checks the whole
+		 * [base+lo, base+hi) window here -- the in-window accesses run unchecked
+		 * once the base is stripped, so this is their only validation against the
+		 * object present at THIS execution. The footprint always covers the fault
+		 * EA, so it replaces (not adds to) the single-EA check. Gated on
+		 * deferred_post_handler: if the patch path fell back to an immediate
+		 * AROUND probe, each in-window access faults and is checked at its own
+		 * site, so only the fault EA applies here. */
+		if (unlikely(entry->footprint_check && entry->deferred_post_handler))
+			dw_check_access_ctx((void *) (valueb + entry->footprint_disp_lo),
+					    (size_t) (entry->footprint_disp_hi - entry->footprint_disp_lo), ctx);
+		else
+			dw_check_access_ctx((void *) (valueb + mem->displacement), mem->length, ctx);
 		dw_set_register(ctx, reb->libpatch_index, (uintptr_t) dw_unprotect((void *) valueb));
 	}
 

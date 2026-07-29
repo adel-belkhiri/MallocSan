@@ -396,14 +396,22 @@ struct insn_entry {
 	 * the invariant base once per loop entry and only the loop-exit post is armed. */
 	bool loop_exit_defer;
 	bool loop_exit_activate;
-	/* Footprint of all fixed-field body accesses admitted for #5 (fault-to-latch
-	 * range only). When loop_exit_footprint is true, activation must bounds-check
-	 * [base + loop_exit_disp_lo, base + loop_exit_disp_hi) — using the tainted
-	 * base pointer so dw_check_access(_ctx) actually inspects the OID — instead
-	 * of only the single fault-EA displacement. disp_hi is exclusive. */
-	bool    loop_exit_footprint;
-	int64_t loop_exit_disp_lo;
-	int64_t loop_exit_disp_hi;
+	/* Widened bounds-check footprint for a DEFERRED entry: the union of every
+	 * fixed-field (base + constant-disp, no index) access admitted into the
+	 * straight-line deferral window, expressed as [base + footprint_disp_lo,
+	 * base + footprint_disp_hi) relative to the (tainted) base. When
+	 * footprint_check is set, the pre-handler bounds-checks that whole range
+	 * instead of only the single fault-EA displacement — so an in-window access
+	 * at a different displacement, which runs unchecked once the base is
+	 * stripped, is still validated against the object present at THIS execution
+	 * (not only the discovery-time object). disp_hi is exclusive. Set by both
+	 * the loop-exit (#5) variants and by plain forward deferral. Soundness rests
+	 * on the window being straight-line (the scan stops at the first control
+	 * flow) and on lo/hi being the min/max of actual access extents, so a range
+	 * violation always corresponds to a real access violation. */
+	bool    footprint_check;
+	int64_t footprint_disp_lo;
+	int64_t footprint_disp_hi;
 	/* Fall-through exit address (latch + latch_size) where this entry's #5
 	 * retaint post is/was staged. Keys the shared-exit plan registry that lets
 	 * sibling invariant bases in one loop coalesce onto a single exit post.
