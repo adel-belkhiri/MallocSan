@@ -1060,6 +1060,15 @@ static void print_floating_point(output_gadget_t* output, floating_point_t value
     return;
   }
 
+  // Set default precision, if not set explicitly. This MUST happen before the
+  // notation fallback below: that path also consumes `precision', and leaving it
+  // at the uninitialised 0 made a bare %f above the threshold print a single
+  // significant digit ("5e+20" instead of "4.906660e+20"), silently dropping six
+  // digits of the application's output.
+  if (!(flags & FLAGS_PRECISION)) {
+    precision = PRINTF_DEFAULT_FLOAT_PRECISION;
+  }
+
   if (!prefer_exponential &&
       ((value > PRINTF_FLOAT_NOTATION_THRESHOLD) || (value < -PRINTF_FLOAT_NOTATION_THRESHOLD))) {
     // The required behavior of standard printf is to print _every_ integral-part digit -- which could mean
@@ -1069,11 +1078,6 @@ static void print_floating_point(output_gadget_t* output, floating_point_t value
     print_exponential_number(output, value, precision, width, flags, buf, len);
 #endif
     return;
-  }
-
-  // set default precision, if not set explicitly
-  if (!(flags & FLAGS_PRECISION)) {
-    precision = PRINTF_DEFAULT_FLOAT_PRECISION;
   }
 
   // limit precision so that our integer holding the fractional part does not overflow
