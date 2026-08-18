@@ -3,6 +3,7 @@
 
 #include <fcntl.h>
 #include <pthread.h>
+#include <sched.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -355,6 +356,47 @@ void dw_fini_instruction_table(instruction_table *table)
 }
 
 /*
+ * Wait for the thread that owns an ENTRY_INITIALIZING slot to publish it.
+ *
+ * The creator holds ENTRY_INITIALIZING across the whole of handle_seg_fault(),
+ * which includes the blocking round-trip to the patch worker in
+ * dw_patch_entry(). A plain `while (state == ENTRY_INITIALIZING);` therefore
+ * burns a full core per waiting thread for the entire duration of a patch --
+ * and on an oversubscribed machine those spinners actively starve the worker
+ * they are waiting for, turning a slow patch into a livelock.
+ *
+ * Spin briefly (the common case: the creator is running on another core and
+ * publishes within a few hundred cycles), then yield. We do not bound the wait
+ * and give up: returning NULL means "no entry for this instruction", which
+ * forwards the fault to the saved handler and usually kills the process. Making
+ * the wait cooperative is what keeps a stalled creator survivable; making it
+ * *terminate* is dw-patch.c's job (see the fork handlers there).
+ *
+ * Both callers run in signal context. __builtin_ia32_pause() is a bare PAUSE
+ * instruction and sched_yield() is async-signal-safe, so this is too.
+ */
+#define DW_ENTRY_SPIN_BEFORE_YIELD 256
+
+static int dw_await_entry_ready(struct insn_entry *e)
+{
+	unsigned spins = 0;
+	int state;
+
+	for (;;) {
+		state = atomic_load_explicit(&e->state, memory_order_acquire);
+		if (state != ENTRY_INITIALIZING)
+			return state;
+
+		if (spins < DW_ENTRY_SPIN_BEFORE_YIELD) {
+			spins++;
+			__builtin_ia32_pause();
+		} else {
+			(void) sched_yield();
+		}
+	}
+}
+
+/*
  * Get the entry for this instruction address.
  */
 struct insn_entry *dw_get_instruction_entry(instruction_table *table, uintptr_t fault)
@@ -371,9 +413,7 @@ struct insn_entry *dw_get_instruction_entry(instruction_table *table, uintptr_t 
 			return NULL;
 
 		if (state == ENTRY_INITIALIZING) {
-			do {
-				state = atomic_load_explicit(&e->state, memory_order_acquire);
-			} while (state == ENTRY_INITIALIZING);
+			state = dw_await_entry_ready(e);
 
 			if (state == ENTRY_EMPTY)
 				return NULL;
@@ -2325,9 +2365,7 @@ struct insn_entry *dw_create_instruction_entry(instruction_table *table, uintptr
 
 		if (entry_state == ENTRY_INITIALIZING) {
 			/* Another thread is creating this slot; wait until it finishes. */
-			do {
-				entry_state = atomic_load_explicit(&e->state, memory_order_acquire);
-			} while (entry_state == ENTRY_INITIALIZING);
+			entry_state = dw_await_entry_ready(e);
 
 			if (e->insn == fault)
 				return (entry_state == ENTRY_READY) ? e : NULL;
