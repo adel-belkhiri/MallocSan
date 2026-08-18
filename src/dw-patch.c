@@ -181,8 +181,18 @@ static bool make_probe(struct insn_entry *entry, uintptr_t address, bool around,
 		.type = around ? PATCH_EXEC_MODEL_PROBE_AROUND : PATCH_EXEC_MODEL_PROBE,
 		.probe.read_registers = 0,
 		.probe.write_registers = 0,
-		.probe.clobber_registers = entry->has_vsib ? PATCH_REGS_ALL
-							   : ((1ULL << PATCH_ARCH_GREGS_COUNT) - 1),
+		/*
+		 * Declare every register clobbered so libpatch performs a full
+		 * xsave/xrstor around the probe. A GP-only mask leaves bit
+		 * PATCH_REGS_X86_64_SSE clear, which makes libpatch set
+		 * TRAMPOLINE_SKIP_XMM and skip the xmm save entirely -- and then any
+		 * SSE the compiler emits anywhere in the probe callback chain silently
+		 * destroys the application's live vector registers. Paying the full
+		 * save is ~6% on a probe-bound loop and removes that whole class of
+		 * bug, including xmm8-15 and AVX which the narrower xmm0-7 save does
+		 * not cover.
+		 */
+		.probe.clobber_registers = PATCH_REGS_ALL,
 		.probe.user_data = entry,
 		.probe.procedure = dw_entry_base_only_fast(entry) ? patch_handler_base_only : patch_handler,
 	};
