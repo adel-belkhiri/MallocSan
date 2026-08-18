@@ -260,6 +260,7 @@ static int (*libc_pthread_mutex_lock)(pthread_mutex_t *);
 static int (*libc_pthread_mutex_unlock)(pthread_mutex_t *);
 static int (*libc_pthread_join)(pthread_t, void **);
 static int (*libc_pthread_cond_broadcast)(pthread_cond_t *);
+static int (*libc_pthread_cond_signal)(pthread_cond_t *);
 static int (*libc_pthread_cond_wait)(pthread_cond_t *, pthread_mutex_t *);
 
 struct dw_saved_sigaction {
@@ -402,6 +403,7 @@ void dw_init_syscall_stubs()
 	libc_pthread_mutex_init = dlsym_check(RTLD_NEXT, "pthread_mutex_init");
 	libc_pthread_cond_wait = dlsym_check(RTLD_NEXT, "pthread_cond_wait");
 	libc_pthread_cond_broadcast = dlsym_check(RTLD_NEXT, "pthread_cond_broadcast");
+	libc_pthread_cond_signal = dlsym_check(RTLD_NEXT, "pthread_cond_signal");
 	libc_pthread_join = dlsym_check(RTLD_NEXT, "pthread_join");
 	libc_pthread_mutex_lock = dlsym_check(RTLD_NEXT, "pthread_mutex_lock");
 	libc_pthread_mutex_unlock = dlsym_check(RTLD_NEXT, "pthread_mutex_unlock");
@@ -1309,9 +1311,61 @@ int pthread_create(pthread_t *t, const pthread_attr_t *attr, void *(*fn)(void *)
 }
 
 int pthread_mutex_init(pthread_mutex_t *mutex, const pthread_mutexattr_t *attr) { sin(); pthread_mutex_t *nmutex = (pthread_mutex_t *)dw_unprotect(mutex); const pthread_mutexattr_t *nattr = attr ? (const pthread_mutexattr_t *)dw_unprotect((void *)attr) : NULL; dw_check_access(nmutex, sizeof(pthread_mutex_t)); if (nattr) dw_check_access((void *)nattr, sizeof(pthread_mutexattr_t)); int ret = libc_pthread_mutex_init(nmutex, nattr); sout(); return ret; }
-int pthread_cond_init(pthread_cond_t *cond, const pthread_condattr_t *attr) { sin(); pthread_cond_t *ncond = (pthread_cond_t *)dw_unprotect(cond); const pthread_condattr_t *nattr = attr ? (const pthread_condattr_t *)dw_unprotect((void *)attr) : NULL; dw_check_access(ncond, sizeof(pthread_cond_t)); if (nattr) dw_check_access((void *)nattr, sizeof(pthread_condattr_t)); int ret = libc_pthread_cond_init(ncond, nattr); sout(); return ret; }
+/*
+ * Re-resolve the condition-variable entry points to their *default* symbol
+ * version, once, on first use.
+ *
+ * dlsym(RTLD_NEXT, name) asks for no particular version of a versioned symbol,
+ * and glibc may hand back a compatibility version instead of the current
+ * default -- which one depends on the order symbols happen to occupy in that
+ * build's dynamic table, so identical source silently behaves differently on
+ * two machines running the same distribution.
+ *
+ * For pthread_cond_* that is an ABI change, not a detail. The GLIBC_2.2.5 entry
+ * points implement the pre-2.3.2 layout in which a pthread_cond_t is merely a
+ * pointer to a separately allocated condvar: __pthread_cond_wait_2_0() reads
+ * the first word, heap-allocates a real condvar if it is NULL, and waits on
+ * *that*. Since we interpose pthread_cond_wait but not pthread_cond_signal,
+ * every condition variable in the process gets split in two -- waiters block on
+ * the hidden heap object while signallers post to the original -- and the
+ * wakeup is lost for good.
+ *
+ * That deadlocks MallocSan's own patch queue (the worker sleeps forever on
+ * patch_q_cv with a request sitting in the queue, and every faulting thread
+ * then piles up behind it on req.done_cv), and it equally breaks any
+ * application condition variable, which is the worse half.
+ *
+ * This has to happen lazily rather than in dw_init_wrappers(): dlvsym() taken
+ * from our constructor deadlocks against a dynamic-linker lock, because we
+ * interpose the allocator it reaches for while the loader still holds it. By
+ * first use the loader is idle and the call is safe. Racing threads may each do
+ * the work once; they all compute the same pointers, so that is harmless.
+ */
+static _Atomic int dw_cond_symver_fixed;
+
+static void dw_fix_cond_symvers(void)
+{
+	void *p;
+
+	if (atomic_load_explicit(&dw_cond_symver_fixed, memory_order_acquire))
+		return;
+
+	if ((p = dlvsym(RTLD_NEXT, "pthread_cond_wait", "GLIBC_2.3.2")) != NULL)
+		libc_pthread_cond_wait = p;
+	if ((p = dlvsym(RTLD_NEXT, "pthread_cond_broadcast", "GLIBC_2.3.2")) != NULL)
+		libc_pthread_cond_broadcast = p;
+	if ((p = dlvsym(RTLD_NEXT, "pthread_cond_signal", "GLIBC_2.3.2")) != NULL)
+		libc_pthread_cond_signal = p;
+	if ((p = dlvsym(RTLD_NEXT, "pthread_cond_init", "GLIBC_2.3.2")) != NULL)
+		libc_pthread_cond_init = p;
+
+	atomic_store_explicit(&dw_cond_symver_fixed, 1, memory_order_release);
+}
+
+int pthread_cond_init(pthread_cond_t *cond, const pthread_condattr_t *attr) { sin(); dw_fix_cond_symvers(); pthread_cond_t *ncond = (pthread_cond_t *)dw_unprotect(cond); const pthread_condattr_t *nattr = attr ? (const pthread_condattr_t *)dw_unprotect((void *)attr) : NULL; dw_check_access(ncond, sizeof(pthread_cond_t)); if (nattr) dw_check_access((void *)nattr, sizeof(pthread_condattr_t)); int ret = libc_pthread_cond_init(ncond, nattr); sout(); return ret; }
 int pthread_mutex_lock(pthread_mutex_t *mutex) { sin(); pthread_mutex_t *nmutex = (pthread_mutex_t *)dw_unprotect(mutex); dw_check_access(nmutex, sizeof(pthread_mutex_t)); int ret = libc_pthread_mutex_lock(nmutex); sout(); return ret; }
 int pthread_mutex_unlock(pthread_mutex_t *mutex) { sin(); pthread_mutex_t *nmutex = (pthread_mutex_t *)dw_unprotect(mutex); dw_check_access(nmutex, sizeof(pthread_mutex_t)); int ret = libc_pthread_mutex_unlock(nmutex); sout(); return ret; }
 int pthread_join(pthread_t thread, void **retval) { sin(); pthread_t nthread = (pthread_t)dw_unprotect((void *)thread); void **nret = retval ? (void **)dw_unprotect(retval) : NULL; if (retval) dw_check_access(retval, sizeof(void *)); int ret = libc_pthread_join(nthread, nret); sout(); return ret; }
-int pthread_cond_broadcast(pthread_cond_t *cond) { sin(); pthread_cond_t *ncond = (pthread_cond_t *)dw_unprotect(cond); dw_check_access(ncond, sizeof(pthread_cond_t)); int ret = libc_pthread_cond_broadcast(ncond); sout(); return ret; }
-int pthread_cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex) { sin(); pthread_cond_t *ncond = (pthread_cond_t *)dw_unprotect(cond); pthread_mutex_t *nmutex = (pthread_mutex_t *)dw_unprotect(mutex); dw_check_access(ncond, sizeof(pthread_cond_t)); dw_check_access(nmutex, sizeof(pthread_mutex_t)); int ret = libc_pthread_cond_wait(ncond, nmutex); sout(); return ret; }
+int pthread_cond_broadcast(pthread_cond_t *cond) { sin(); dw_fix_cond_symvers(); pthread_cond_t *ncond = (pthread_cond_t *)dw_unprotect(cond); dw_check_access(ncond, sizeof(pthread_cond_t)); int ret = libc_pthread_cond_broadcast(ncond); sout(); return ret; }
+int pthread_cond_signal(pthread_cond_t *cond) { sin(); dw_fix_cond_symvers(); pthread_cond_t *ncond = (pthread_cond_t *)dw_unprotect(cond); dw_check_access(ncond, sizeof(pthread_cond_t)); int ret = libc_pthread_cond_signal(ncond); sout(); return ret; }
+int pthread_cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex) { sin(); dw_fix_cond_symvers(); pthread_cond_t *ncond = (pthread_cond_t *)dw_unprotect(cond); pthread_mutex_t *nmutex = (pthread_mutex_t *)dw_unprotect(mutex); dw_check_access(ncond, sizeof(pthread_cond_t)); dw_check_access(nmutex, sizeof(pthread_mutex_t)); int ret = libc_pthread_cond_wait(ncond, nmutex); sout(); return ret; }
