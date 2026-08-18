@@ -84,6 +84,43 @@ static size_t arglen(char *const argv[])
 }
 
 /*
+ * Deep-unprotect an argv/envp vector for exec*().
+ *
+ * These vectors go straight to the kernel, which cannot dereference a tainted
+ * pointer: a non-canonical address is simply rejected with EFAULT. Unprotecting
+ * the vector pointer is not sufficient -- every *element* is itself a pointer
+ * into (typically) the heap and may carry its own taint, so exec fails with
+ * "Bad address" even though the vector itself is clean. Build a clean
+ * NULL-terminated copy with each element unprotected.
+ *
+ * `argv` must already be the unprotected vector pointer so the walk is valid.
+ * On success exec replaces the image and the copy goes with it; the caller frees
+ * it on failure via *owned. If the allocation fails we hand back the original
+ * vector, which is exactly the previous behaviour.
+ */
+static char *const *dw_unprotect_argv(char *const argv[], char ***owned)
+{
+	*owned = NULL;
+	if (argv == NULL)
+		return NULL;
+
+	size_t n = 0;
+	while (argv[n] != NULL)
+		n++;
+
+	char **copy = malloc((n + 1) * sizeof(char *));
+	if (copy == NULL)
+		return argv;
+
+	for (size_t i = 0; i < n; i++)
+		copy[i] = (char *) dw_unprotect((void *) argv[i]);
+	copy[n] = NULL;
+
+	*owned = copy;
+	return (char *const *) copy;
+}
+
+/*
  * Have our own strlen, not called with tainted pointers, that will
  * not be instrumented by libpatch.
  */
@@ -214,6 +251,8 @@ static int (*libc_execvp)(const char *file, char *const argv[]);
 static int (*libc_execvpe)(const char *file, char *const argv[], char *const envp[]);
 static ssize_t (*libc_readlink)(const char *pathname, char *buf, size_t bufsiz);
 static ssize_t (*libc_readlinkat)(int dirfd, const char *pathname, char *buf, size_t bufsiz);
+static int (*libc_sigprocmask)(int how, const sigset_t *set, sigset_t *oldset);
+static int (*libc_pthread_sigmask)(int how, const sigset_t *set, sigset_t *oldset);
 static int (*libc_pthread_create)(pthread_t *, const pthread_attr_t *, void *(*)(void *), void *);
 static int (*libc_pthread_mutex_init)(pthread_mutex_t *, const pthread_mutexattr_t *);
 static int (*libc_pthread_cond_init)(pthread_cond_t *, const pthread_condattr_t *);
@@ -315,6 +354,8 @@ void dw_init_syscall_stubs()
 	libc_memset = dlsym_check(RTLD_NEXT, "memset");
 	libc_memset_chk = dlsym_check(RTLD_NEXT, "__memset_chk");
 	libc_sigaction = dlsym_check(RTLD_NEXT, "sigaction");
+	libc_sigprocmask = dlsym_check(RTLD_NEXT, "sigprocmask");
+	libc_pthread_sigmask = dlsym_check(RTLD_NEXT, "pthread_sigmask");
 	libc_strcpy = dlsym_check(RTLD_NEXT, "strcpy");
 	libc_strcpy_chk = dlsym_check(RTLD_NEXT, "__strcpy_chk");
 	libc_strcat = dlsym_check(RTLD_NEXT, "strcat");
@@ -550,6 +591,74 @@ int dw_libc_sigaction(int signum, const struct sigaction *act)
 {
 	sin();
 	int ret = libc_sigaction(signum, act, NULL);
+	sout();
+	return ret;
+}
+
+/*
+ * Keep the fault signals MallocSan runs on deliverable.
+ *
+ * Tainting works by making pointers non-canonical, so every instrumented access
+ * raises a synchronous SIGSEGV that our handler services. A synchronous fault
+ * whose signal is *blocked* cannot be delivered to a handler at all: the kernel
+ * forces the default action and kills the task outright. The handler never runs,
+ * so there is not even a diagnostic -- the process just dies.
+ *
+ * Applications do block signals wholesale. dash does exactly that around its
+ * vfork(): `sigprocmask(SIG_SETMASK, ~[RTMIN RT_1], NULL)` blocks SIGSEGV, then
+ * vfork()s, and the child is killed by its first tainted access. That made
+ * anything running a shell -- system(), popen() -- die under MallocSan.
+ *
+ * So filter the fault signals out of anything the application tries to block.
+ * SIG_UNBLOCK needs no filtering: unblocking is always safe. This is the same
+ * approach the other sanitizers take, and it is not observable to a correct
+ * program: a process that blocks SIGSEGV has no way to handle a synchronous
+ * fault on it anyway, so the only behaviour we remove is "die without a
+ * diagnostic".
+ *
+ * The reported oldset is the real mask, which therefore never shows the fault
+ * signals as blocked even if the application asked for that. Save/restore
+ * round-trips still work; only a query that expects to read back its own
+ * (impossible) request sees a difference.
+ */
+static inline const sigset_t *dw_filter_fault_signals(int how, const sigset_t *set,
+						      sigset_t *scratch)
+{
+	if (set == NULL || (how != SIG_BLOCK && how != SIG_SETMASK))
+		return set;
+
+	*scratch = *set;
+	sigdelset(scratch, SIGSEGV);
+	sigdelset(scratch, SIGBUS);
+	sigdelset(scratch, SIGTRAP);
+	sigdelset(scratch, SIGILL);
+	return scratch;
+}
+
+int sigprocmask(int how, const sigset_t *set, sigset_t *oldset)
+{
+	sin();
+	sigset_t scratch;
+	const sigset_t *nset = dw_filter_fault_signals(how,
+			(const sigset_t *)dw_unprotect((void *)set), &scratch);
+	sigset_t *nold = oldset ? (sigset_t *)dw_unprotect(oldset) : NULL;
+	if (set) dw_check_access((void *)set, sizeof(sigset_t));
+	if (oldset) dw_check_access(oldset, sizeof(sigset_t));
+	int ret = libc_sigprocmask(how, nset, nold);
+	sout();
+	return ret;
+}
+
+int pthread_sigmask(int how, const sigset_t *set, sigset_t *oldset)
+{
+	sin();
+	sigset_t scratch;
+	const sigset_t *nset = dw_filter_fault_signals(how,
+			(const sigset_t *)dw_unprotect((void *)set), &scratch);
+	sigset_t *nold = oldset ? (sigset_t *)dw_unprotect(oldset) : NULL;
+	if (set) dw_check_access((void *)set, sizeof(sigset_t));
+	if (oldset) dw_check_access(oldset, sizeof(sigset_t));
+	int ret = libc_pthread_sigmask(how, nset, nold);
 	sout();
 	return ret;
 }
@@ -1080,10 +1189,70 @@ char *dcngettext(const char *domainname, const char *msgid, const char *msgid_pl
 wchar_t *wmemcpy(wchar_t *restrict dest, const wchar_t *restrict src, size_t n) { sin(); dw_check_access(dest, n * sizeof(wchar_t)); dw_check_access(src, n * sizeof(wchar_t)); libc_wmemcpy((wchar_t *)dw_unprotect(dest), (wchar_t *)dw_unprotect(src), n); sout(); return dest; }
 char *setlocale(int category, const char *locale) { sin(); char *nlocale = dw_unprotect((void *)locale); if (nlocale) dw_check_access((void *)locale, libc_strlen(nlocale) + 1); char *ret = libc_setlocale(category, nlocale); sout(); return ret; }
 char *textdomain(const char * domainname) { sin(); char *ndomainname = dw_unprotect((void *)domainname); if (ndomainname) dw_check_access((void *)domainname, libc_strlen(ndomainname) + 1); char *ret = libc_textdomain(ndomainname); sout(); return ret; }
-int execve(const char *pathname, char *const argv[], char *const envp[]) { sin(); char *npathname = dw_unprotect((void *) pathname); dw_check_access((void *) pathname, libc_strlen(npathname) + 1); char *const *nargv = (char *const *) dw_unprotect((void *) argv); char *const *nenvp = envp ? (char *const *) dw_unprotect((void *) envp) : NULL; if (nargv) dw_check_access((void *) argv, arglen((char *const *) nargv)); if (nenvp) dw_check_access((void *) envp, arglen((char *const *) nenvp)); int ret = libc_execve(npathname, (char *const *) nargv, (char *const *) nenvp); sout(); return ret; }
-int execv(const char *pathname, char *const argv[]) { sin(); char *npathname = dw_unprotect((void *)pathname); dw_check_access((void *)pathname, libc_strlen(npathname) + 1); char *const *nargv = (char *const *) dw_unprotect((void *) argv); if (nargv) dw_check_access((void *) argv, arglen(nargv)); int ret = libc_execv(npathname, nargv); sout(); return ret; }
-int execvp(const char *file, char *const argv[]) { sin(); char *nfile = (char *) dw_unprotect((void *) file); dw_check_access((void *) file, libc_strlen(nfile) + 1); char *const *nargv = (char *const *) dw_unprotect((void *) argv); if (nargv) dw_check_access((void *) argv, arglen(nargv)); int ret = libc_execvp(nfile, (char *const *) nargv); sout(); return ret; }
-int execvpe(const char *file, char *const argv[], char *const envp[]) { sin(); char *nfile = (char *) dw_unprotect((void *) file); dw_check_access((void *) file, libc_strlen(nfile) + 1); char *const *nargv = (char *const *) dw_unprotect((void *) argv); char *const *nenvp = envp ? (char *const *) dw_unprotect((void *) envp) : NULL; if (nargv) dw_check_access((void *) argv, arglen(nargv)); if (nenvp) dw_check_access((void *) envp, arglen(nenvp)); int ret = libc_execvpe(nfile, (char *const *) nargv, (char *const *) nenvp); sout(); return ret; }
+int execve(const char *pathname, char *const argv[], char *const envp[])
+{
+	sin();
+	char *npathname = dw_unprotect((void *) pathname);
+	dw_check_access((void *) pathname, libc_strlen(npathname) + 1);
+	char *const *nargv = (char *const *) dw_unprotect((void *) argv);
+	char *const *nenvp = envp ? (char *const *) dw_unprotect((void *) envp) : NULL;
+	if (nargv) dw_check_access((void *) argv, arglen(nargv));
+	if (nenvp) dw_check_access((void *) envp, arglen(nenvp));
+	char **argv_owned, **envp_owned;
+	nargv = dw_unprotect_argv(nargv, &argv_owned);
+	nenvp = dw_unprotect_argv(nenvp, &envp_owned);
+	int ret = libc_execve(npathname, nargv, nenvp);
+	free(argv_owned);   /* only reached when exec failed */
+	free(envp_owned);
+	sout();
+	return ret;
+}
+int execv(const char *pathname, char *const argv[])
+{
+	sin();
+	char *npathname = dw_unprotect((void *) pathname);
+	dw_check_access((void *) pathname, libc_strlen(npathname) + 1);
+	char *const *nargv = (char *const *) dw_unprotect((void *) argv);
+	if (nargv) dw_check_access((void *) argv, arglen(nargv));
+	char **argv_owned;
+	nargv = dw_unprotect_argv(nargv, &argv_owned);
+	int ret = libc_execv(npathname, nargv);
+	free(argv_owned);
+	sout();
+	return ret;
+}
+int execvp(const char *file, char *const argv[])
+{
+	sin();
+	char *nfile = (char *) dw_unprotect((void *) file);
+	dw_check_access((void *) file, libc_strlen(nfile) + 1);
+	char *const *nargv = (char *const *) dw_unprotect((void *) argv);
+	if (nargv) dw_check_access((void *) argv, arglen(nargv));
+	char **argv_owned;
+	nargv = dw_unprotect_argv(nargv, &argv_owned);
+	int ret = libc_execvp(nfile, nargv);
+	free(argv_owned);
+	sout();
+	return ret;
+}
+int execvpe(const char *file, char *const argv[], char *const envp[])
+{
+	sin();
+	char *nfile = (char *) dw_unprotect((void *) file);
+	dw_check_access((void *) file, libc_strlen(nfile) + 1);
+	char *const *nargv = (char *const *) dw_unprotect((void *) argv);
+	char *const *nenvp = envp ? (char *const *) dw_unprotect((void *) envp) : NULL;
+	if (nargv) dw_check_access((void *) argv, arglen(nargv));
+	if (nenvp) dw_check_access((void *) envp, arglen(nenvp));
+	char **argv_owned, **envp_owned;
+	nargv = dw_unprotect_argv(nargv, &argv_owned);
+	nenvp = dw_unprotect_argv(nenvp, &envp_owned);
+	int ret = libc_execvpe(nfile, nargv, nenvp);
+	free(argv_owned);
+	free(envp_owned);
+	sout();
+	return ret;
+}
 
 
 typedef struct {
