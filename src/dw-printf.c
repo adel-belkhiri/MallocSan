@@ -75,8 +75,16 @@
 // size of the fixed (on-stack) buffer for printing individual decimal numbers.
 // this must be big enough to hold one converted floating-point value including
 // padded zeros.
+//
+// Sized for the widest %f this implementation can emit: 19 integral digits (the
+// int_fast64_t that holds the integral part saturates just above 1e18, which is
+// what PRINTF_MAX_INTEGRAL_DIGITS_FOR_DECIMAL below is pinned to), plus the
+// decimal point, plus PRINTF_MAX_SUPPORTED_PRECISION (17) fractional digits,
+// plus a sign = 38. Every write into this buffer is already bounds-checked
+// against this macro, so a too-small value silently truncates rather than
+// overflowing -- which is exactly the bug this size avoids.
 #ifndef PRINTF_DECIMAL_BUFFER_SIZE
-#define PRINTF_DECIMAL_BUFFER_SIZE    32
+#define PRINTF_DECIMAL_BUFFER_SIZE    64
 #endif
 
 // Support for the decimal notation floating point conversion specifiers (%f, %F)
@@ -108,8 +116,18 @@
 // integral number in floating-point notation, regardless of length, when using the %f specifier -
 // possibly hundreds of characters, potentially overflowing your buffers. In this implementation,
 // all values beyond this threshold are switched to exponential notation.
+//
+// The upstream default of 9 makes %f silently disagree with the C standard for
+// any value >= 1e9: printf("%f", 28622609920.0) yielded "3e+10" instead of
+// "28622609920.000000". Because MallocSan replaces the application's printf
+// wholesale, that corrupted the *application's* output, not just diagnostics.
+//
+// 18 is the largest safe value: get_components() stores the integral part in an
+// int_fast64_t, so values at or beyond ~9.22e18 would overflow it and print
+// garbage. Values above 1e18 still fall back to exponential notation, matching
+// the upstream design; everything below now matches glibc.
 #ifndef PRINTF_MAX_INTEGRAL_DIGITS_FOR_DECIMAL
-#define PRINTF_MAX_INTEGRAL_DIGITS_FOR_DECIMAL 9
+#define PRINTF_MAX_INTEGRAL_DIGITS_FOR_DECIMAL 18
 #endif
 
 // Support for the long long integral types (with the ll, z and t length modifiers for specifiers
