@@ -33,6 +33,38 @@ static bool patch_q_stop = false;
 static pthread_t worker_tid;
 static atomic_int worker_tid_set = 0;
 
+/*
+ * Serializes every entry into libpatch.
+ *
+ * libpatch's API_ENTRY (core/api.h) takes no lock: the library documents that
+ * "libpatch relies on the caller serializing all API calls" (core/patch.h), and
+ * running two writers concurrently corrupts its RCU-published lists. The patch
+ * worker normally provides that serialization by being the only thread that
+ * calls patch_entry_sync(), but three fallbacks run it on arbitrary faulting
+ * threads instead: before the worker has started, from the worker itself, and
+ * after the queue has been stopped. The last one is genuinely concurrent -- at
+ * shutdown any number of app threads can reach it at once.
+ *
+ * Rather than reason about each fallback, every call goes through
+ * patch_entry_sync_locked() and takes this mutex. It is RECURSIVE because the
+ * worker can fault while already inside patch_entry_sync(), which re-enters
+ * through the worker-self fallback in dw_patch_entry(). That re-entry is
+ * pre-existing behaviour and stays exactly as it was; the lock only prevents
+ * two *different* threads from being inside libpatch simultaneously.
+ */
+static pthread_mutex_t patch_sync_mu;
+static pthread_once_t patch_sync_mu_once = PTHREAD_ONCE_INIT;
+
+static void patch_sync_mu_init(void)
+{
+	pthread_mutexattr_t attr;
+
+	(void)pthread_mutexattr_init(&attr);
+	(void)pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+	(void)pthread_mutex_init(&patch_sync_mu, &attr);
+	(void)pthread_mutexattr_destroy(&attr);
+}
+
 static inline bool patch_q_is_empty(void)
 {
 	return patch_q_head == NULL;
@@ -643,6 +675,81 @@ degrade:
 	return -1;
 }
 
+/*
+ * The only sanctioned way to reach patch_entry_sync(). Holds patch_sync_mu for
+ * the whole libpatch make/enable/commit sequence so no two threads are ever
+ * inside libpatch at once. See the patch_sync_mu comment above.
+ */
+static int patch_entry_sync_locked(struct insn_entry *entry,
+				   const struct post_safe_site_rb *safe_sites)
+{
+	int rc;
+
+	(void)pthread_once(&patch_sync_mu_once, patch_sync_mu_init);
+	(void)pthread_mutex_lock(&patch_sync_mu);
+	rc = patch_entry_sync(entry, safe_sites);
+	(void)pthread_mutex_unlock(&patch_sync_mu);
+	return rc;
+}
+
+/*
+ * fork() handlers.
+ *
+ * fork() clones only the calling thread, so the patch worker does not exist in
+ * the child -- but patch_w_started, worker_tid_set and the queue are all copied
+ * verbatim. Without these handlers the first fault in the child on a not-yet-
+ * patched instruction takes the async path in dw_patch_entry(), queues a
+ * request, and blocks forever on req.done_cv waiting for a thread that is not
+ * there. That is a hard, fully deterministic hang, and because the worker only
+ * ever starts from the pthread_create() wrapper it can only bite multithreaded
+ * programs.
+ *
+ * prepare/parent bracket the fork with patch_q_mu held so the child never
+ * inherits the queue mid-mutation (or the mutex locked by a thread that no
+ * longer exists). The child then resets the worker state so dw_patch_entry()
+ * falls back to patching synchronously on the faulting thread, which is exactly
+ * right: the child is single-threaded, so that fallback trivially satisfies
+ * libpatch's serialization contract. If the child later calls pthread_create(),
+ * dw_patch_worker_start() sees patch_w_started == 0 and spawns a fresh worker.
+ */
+static void dw_patch_atfork_prepare(void)
+{
+	(void)pthread_once(&patch_sync_mu_once, patch_sync_mu_init);
+	/* Order matters: sync before queue, matching every other acquisition. */
+	(void)pthread_mutex_lock(&patch_sync_mu);
+	(void)pthread_mutex_lock(&patch_q_mu);
+}
+
+static void dw_patch_atfork_parent(void)
+{
+	(void)pthread_mutex_unlock(&patch_q_mu);
+	(void)pthread_mutex_unlock(&patch_sync_mu);
+}
+
+static void dw_patch_atfork_child(void)
+{
+	/*
+	 * Drop the inherited queue without completing the requests: their
+	 * requesters are threads that do not exist in this process, and their
+	 * patch_request_t lives on those threads' stacks.
+	 */
+	patch_q_head = NULL;
+	patch_q_tail = NULL;
+	patch_q_stop = false;
+
+	atomic_store_explicit(&patch_w_started, 0, memory_order_release);
+	atomic_store_explicit(&worker_tid_set, 0, memory_order_release);
+
+	/*
+	 * Re-initialize rather than unlock: we hold both locks here, but the
+	 * recursive patch_sync_mu may also carry a non-zero recursion count from
+	 * a patch_entry_sync() this thread was inside when it forked.
+	 */
+	(void)pthread_mutex_init(&patch_q_mu, NULL);
+	(void)pthread_cond_init(&patch_q_cv, NULL);
+	patch_sync_mu_init();
+}
+
 void dw_patch_runtime_init(void)
 {
 	const struct patch_option options[] = {
@@ -653,6 +760,13 @@ void dw_patch_runtime_init(void)
 	};
 
 	(void)patch_init(options, sizeof(options) / sizeof(struct patch_option));
+
+	(void)pthread_once(&patch_sync_mu_once, patch_sync_mu_init);
+	if (pthread_atfork(dw_patch_atfork_prepare, dw_patch_atfork_parent,
+			   dw_patch_atfork_child) != 0)
+		DW_LOG(WARNING, PATCH,
+			   "pthread_atfork registration failed; a forked child that faults on "
+			   "an unpatched instruction will hang\n");
 }
 
 static void *patcher_main(void *arg)
@@ -685,7 +799,7 @@ static void *patcher_main(void *arg)
 		if (r == NULL)
 			continue;
 
-		int rc = patch_entry_sync(r->entry, &r->safe_sites);
+		int rc = patch_entry_sync_locked(r->entry, &r->safe_sites);
 		enum dw_strategies s = r->entry ? (enum dw_strategies)r->entry->strategy : DW_PATCH_UNKNOWN;
 		(void)pthread_mutex_lock(&patch_q_mu);
 		patch_request_complete_locked(r, rc, s);
@@ -711,6 +825,20 @@ void dw_patch_worker_start(void)
 	if (rc != 0) {
 		atomic_store_explicit(&patch_w_started, 0, memory_order_release);
 		DW_LOG(WARNING, PATCH, "Failed to create patch worker thread: %d\n", rc);
+
+		/*
+		 * Clearing patch_w_started only redirects *future* callers to the
+		 * synchronous path. Anything that queued between the CAS above and
+		 * this failure is already parked on its req.done_cv with no worker
+		 * coming, so fail those requests explicitly. dw_patch_entry()
+		 * returns the error and handle_seg_fault() degrades the entry to
+		 * single-stepping, which is the existing graceful-failure path.
+		 */
+		(void)pthread_mutex_lock(&patch_q_mu);
+		for (patch_request_t *r = patch_q_pop_locked(); r != NULL;
+		     r = patch_q_pop_locked())
+			patch_request_complete_locked(r, -rc, DW_PATCH_UNKNOWN);
+		(void)pthread_mutex_unlock(&patch_q_mu);
 	}
 }
 
@@ -737,7 +865,7 @@ int dw_patch_entry(struct insn_entry *entry, const struct post_safe_site_rb *saf
 		return -EINVAL;
 
 	if (!atomic_load_explicit(&patch_w_started, memory_order_acquire))
-		return patch_entry_sync(entry, safe_sites);
+		return patch_entry_sync_locked(entry, safe_sites);
 
 	/*
 	 * A patch request from the worker thread itself must not be queued: it
@@ -748,7 +876,7 @@ int dw_patch_entry(struct insn_entry *entry, const struct post_safe_site_rb *saf
 	    pthread_equal(pthread_self(), worker_tid)) {
 		DW_LOG(WARNING, PATCH,
 			   "Patch requested from the worker thread; patching synchronously.\n");
-		return patch_entry_sync(entry, safe_sites);
+		return patch_entry_sync_locked(entry, safe_sites);
 	}
 
 	patch_request_t req = {
@@ -764,7 +892,7 @@ int dw_patch_entry(struct insn_entry *entry, const struct post_safe_site_rb *saf
 	(void)pthread_mutex_lock(&patch_q_mu);
 	if (patch_q_stop) {
 		(void)pthread_mutex_unlock(&patch_q_mu);
-		return patch_entry_sync(entry, safe_sites);
+		return patch_entry_sync_locked(entry, safe_sites);
 	}
 
 	patch_q_push_locked(&req);

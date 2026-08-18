@@ -1122,11 +1122,19 @@ int pthread_create(pthread_t *t, const pthread_attr_t *attr, void *(*fn)(void *)
 	s->fn  = (void *(*)(void *))dw_unprotect((void *)fn);
 	s->arg = narg;
 
+	/*
+	 * Start the patch worker BEFORE the application thread exists. Starting it
+	 * afterwards leaves a window in which the new thread is already running and
+	 * faulting while patch_w_started is still 0, so it and its creator can both
+	 * take dw_patch_entry()'s synchronous fallback and call into libpatch at the
+	 * same time -- which libpatch forbids (it serializes nothing itself). The
+	 * worker is idempotent and cheap after the first call.
+	 */
+	dw_patch_worker_start();
+
 	int rc = libc_pthread_create(nthread, nattr, pthread_start_trampoline, s);
 	if (rc != 0)
 		free(s);
-	else
-		dw_patch_worker_start();
 	sout();
 	return rc;
 }
